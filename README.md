@@ -80,7 +80,7 @@ thin `cdylib` adapter around it.
 
 Needs a Rust toolchain ([rustup](https://rustup.rs)), and — interim,
 until [busbarAI](https://github.com/GetBusbar/busbar) ships publicly
-— a sibling checkout of `busbarAI` at `../busbarAI` (see
+— a sibling checkout of `busbar` at `../busbar` (see
 [Dependencies](#dependencies) below).
 
 ```sh
@@ -100,12 +100,12 @@ SAME-REPO sibling dependency; only `busbar-api` and `busbar-plugin-sdk`
 test, `busbar-plugin-loader`) still reach into the
 [busbarAI](https://github.com/GetBusbar/busbar) monorepo. Because
 busbarAI is not yet public, both crates' `Cargo.toml`s point at those
-as **local path dependencies** (`../../busbarAI/crates/...`), which
-means this repo expects to be checked out as a sibling of `busbarAI`:
+as **local path dependencies** (`../../busbar/crates/...`), which
+means this repo expects to be checked out as a sibling of `busbar`:
 
 ```
 some-parent-dir/
-├── busbarAI/
+├── busbar/
 └── store-postgres/
     ├── Cargo.toml                 # workspace root
     ├── store-postgres/            # busbar-store-postgres — the real logic crate

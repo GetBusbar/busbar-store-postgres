@@ -1961,17 +1961,23 @@ fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() 
     );
 }
 
-/// The shared `Store` contract conformance suite (`busbar-plugin-testkit`) — the four behaviours the
-/// fleet used to settle differently per backend. Kept in the testkit rather than written out here so
-/// a future ruling reaches every backend at once instead of being hand-copied and drifting again.
+/// The `Store` contract conformance suite — THIS crate's own copy, at `src/tests/store_conformance.rs`.
+/// It used to arrive as `busbar-plugin-testkit`; the owner ruled that crate deleted on 2026-09-22 and
+/// #2/#31 forbid a shared test util between plugins, so every backend owns its copy. See that file's
+/// module doc for the full provenance and for what the shared crate was buying: a new ruling no
+/// longer reaches this backend on a dependency bump, it has to be written in here by hand.
+mod store_conformance;
+
+/// The cross-backend `Store` conformance checks, answered by this backend — the four behaviours the
+/// fleet used to settle differently per backend.
 ///
 /// Every fixture is namespaced by process id and the rows are hard-reset first, for the same reason
 /// `append_audit_is_append_only_and_rejects_a_seq_collision` derives its own seq: this suite runs
 /// against a SHARED live database that is not reset between tests, and CI can have more than one
 /// test binary pointed at it, so a fixed id would make two concurrent runs each other's failure.
 mod conformance {
+    use super::store_conformance as conf;
     use super::{clamp, connect_store_with_retry, live_url, PostgresStore};
-    use busbar_plugin_testkit::store_conformance as conf;
 
     /// A per-process, PER-CHECK namespace. Short enough for every id column in the schema.
     ///

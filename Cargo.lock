@@ -131,18 +131,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "busbar-plugin-testkit"
-version = "1.5.0"
-dependencies = [
- "busbar-api",
-]
-
-[[package]]
 name = "busbar-store-postgres"
 version = "1.0.0"
 dependencies = [
  "busbar-api",
- "busbar-plugin-testkit",
  "postgres",
  "serde_json",
 ]
