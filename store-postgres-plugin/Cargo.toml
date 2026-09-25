@@ -20,8 +20,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # busbar-store-postgres is now a SAME-REPO sibling crate (this plugin brings 100% of what it needs —
-# the real logic lives here, not in busbarAI). Only busbar-api/busbar-plugin-sdk still reach into
-# busbarAI — INTERIM local path dependencies into a sibling checkout, since busbarAI isn't public yet;
+# the real logic lives here, not in busbar). Only busbar-api/busbar-plugin-sdk still reach into
+# busbar — INTERIM local path dependencies into a sibling checkout, since busbar isn't public yet;
 # once it ships publicly these become git (pinned rev/tag) or crates.io dependencies instead.
 busbar-api = { path = "../../busbar/crates/api" }
 busbar-store-postgres = { path = "../store-postgres" }
@@ -29,7 +29,7 @@ busbar-plugin-sdk = { path = "../../busbar/crates/plugin-sdk" }
 serde_json = "1"
 
 [dev-dependencies]
-# INTERIM local path deps into busbarAI, same rationale as above — these are dev-only (the end-to-end
+# INTERIM local path deps into busbar, same rationale as above — these are dev-only (the end-to-end
 # test loads the built cdylib over the real loader ABI seam, and independently re-verifies persistence
 # via the plain PostgresStore — already a normal dependency above — bypassing the cdylib/ABI entirely),
 # never shipped in the plugin artifact itself.
@@ -39,7 +39,7 @@ postgres = "0.19"
 # OUT-OF-PROCESS busbar the same way e2e.rs drives busbar itself -- fully synchronous, no tokio
 # runtime (the plain `postgres` sync client used for independent verification can't be called from
 # inside an async/tokio context; `reqwest::blocking` sidesteps that entirely and keeps this test's
-# style consistent with e2e.rs). Same reqwest/base64 versions busbarAI core's own
+# style consistent with e2e.rs). Same reqwest/base64 versions busbar core's own
 # crates/busbar/src/admin/tests/tests.rs uses, minus the async-only features it needs for its
 # in-process axum server.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json"] }

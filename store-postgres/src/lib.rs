@@ -5,6 +5,9 @@
 //! plugin. Implements `busbar_api::Store` over a mutex-guarded synchronous `postgres` client,
 //! depending only on the `busbar-api` contract (plus the `postgres` driver), never on the engine.
 //!
+//! Schema v10 (busbar 1.6.0): the kind-tagged plane-record tables, the name-keyed usage ledger and
+//! the dated metering key, upgraded IN PLACE from a 1.5.x (v6) database — see `SCHEMA_VERSION`.
+//!
 //! Schema v5 (1.5.0, the generic-credentials redesign): `virtual_keys`/`aws_credentials` are
 //! replaced by `keys` (pure principal attributes, `generation_hash` instead of `key_hash`,
 //! `expires_at`/`deleted_at`/`revision`) and `credentials` (kind-polymorphic row-looked-up
@@ -35,12 +38,14 @@
 //!   added later without another schema bump.
 
 use busbar_api::{
-    AuditRecord, CredentialMeta, CredentialSecret, McpCallRecord, McpDemotionRow, MeteringDelta,
-    MeteringRow, ModelTokens, ScopeRef, SecretForm, Store, StoreError, StoreResult, TaskEventRow,
-    TaskRow, TierTokens, UsageDelta, UsageLedger, VirtualKey,
+    AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
+    PlaneDisposition, PlaneRecord, PlaneSelector, ScopeRef, SecretForm, Store, StoreError,
+    StoreResult, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ, UNIT_CACHE_WRITE,
+    UNIT_INPUT, UNIT_OUTPUT,
 };
 use postgres::types::ToSql;
 use postgres::{Client, NoTls, Row, Transaction};
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 // postgres driver error -> the api's backend-agnostic `StoreError` (the contract crate stays
@@ -220,7 +225,7 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 ///
 /// v6: ONE-TIME, DURABLE backfill of `usage_windows.billable_requests` for any row still shaped
 /// `billable_requests=0, requests>0` at the moment this migration runs. Exists to retire a bug in
-/// busbarAI core's `governance::state::hydrate_budgets`, which used to infer "legacy pre-split
+/// busbar core's `governance::state::hydrate_budgets`, which used to infer "legacy pre-split
 /// row" from that exact counter shape at EVERY boot - but a fully-refunded window (every request
 /// in it non-2xx; `refund_bucket` decrements `billable_requests` but deliberately never
 /// `requests`) produces the identical shape, so hydrate_budgets could not tell "never migrated"
@@ -233,29 +238,44 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 /// store that has already crossed into v6. `hydrate_budgets` itself drops the heuristic entirely
 /// once every store it reads from has passed through this migration.
 ///
-/// v7: the durable MCP TOOL-CALL LOG (`mcp_calls`). PURELY ADDITIVE and needs no backfill arm — the
-/// table is new, so `SCHEMA`'s own `CREATE TABLE IF NOT EXISTS` (executed unconditionally on every
-/// migrate) is the entire migration. Nothing is dropped and no existing row is touched, which is why
-/// there is no `version < 7` block to match the `version < 6` one.
+/// v7-v9 (never released — dev builds of 1.5.x only): the protocol-NAMED durable tables
+/// `mcp_calls`, `tasks`/`task_events`, `mcp_demotions` and `spent_ask_states`, one per typed trait
+/// method busbar 1.6.0 has since deleted. v10 no longer creates, reads or writes them. A database a
+/// dev build carried to v9 keeps them exactly as they were — NOTHING is dropped or rewritten — so
+/// the rows remain on disk for an operator who wants them; the 1.6.0 engine writes its plane records
+/// in its own opaque body format through the tables below instead, and guessing that format for a
+/// row written under the old typed shape would be inventing data, not migrating it.
 ///
-/// v8: the durable A2A TASK STORE (`tasks`, `task_events`). ADDITIVE on exactly the same terms as v7
-/// — two new tables and one new index, all reached by `SCHEMA`'s unconditional
-/// `CREATE TABLE IF NOT EXISTS`, nothing dropped and no existing row touched — so there is no
-/// `version < 8` block either.
-///
-/// v9: the durable TRUST STATE (`mcp_demotions`, `spent_ask_states`) — the recorded quarantine of an
-/// upstream that drifted from what the operator approved, and the ledger that makes a single-use
-/// human approval single-use across a restart and across a fleet. ADDITIVE on exactly the same terms
-/// as v7 and v8 — two new tables reached by `SCHEMA`'s unconditional `CREATE TABLE IF NOT EXISTS`,
-/// nothing dropped, no existing row touched — so there is no `version < 9` block either.
-const SCHEMA_VERSION: i64 = 9;
+/// v10 (busbar 1.6.0 store interface), an IN-PLACE, ADDITIVE upgrade of a v6 (released 1.5.x)
+/// database — no table is dropped and no existing row changes meaning:
+///   * `keys` gains `idp_subject`/`binding_mode`/`minted_by` (NULL for every pre-existing key, which
+///     is exactly what `VirtualKey` reads for a key minted before those fields existed) and
+///     `allowed_scopes_by_kind`, the non-`pool` scope grants (`mcp_server`, `agent`, …) keyed by
+///     kind. `allowed_pools` keeps holding the pool grants byte-for-byte as before, so a pool-only
+///     key reads back unchanged; NULL in both columns is still the omitted-grant wildcard.
+///   * the usage ledger keeps the four reserved token classes in its existing columns and carries
+///     every OPEN unit class (1.6.0 M1b `usage_units`) in the new `usage_ledger_units` table.
+///   * `usage_metering` gains `priced_from_ms` (DEFAULT 0 — the opening rate-card entry, which is
+///     how busbar reads an undated 1.5.x row) and it JOINS the primary key, so a rate-card edit
+///     inside a UTC day opens a second row rather than folding two prices into one (#79). Open unit
+///     classes ride in the new `usage_metering_units` table.
+///   * the kind-tagged PLANE-RECORD verbs get `plane_records` (upserted, keyed `(kind, id)`),
+///     `plane_chain` (appended, keyed `(kind, parent, seq)`) and `plane_tokens` (the single-use
+///     token ledger, keyed `(kind, token)`).
+const SCHEMA_VERSION: i64 = 10;
 
-/// The task states that are TERMINAL, and therefore the only ones `purge_tasks_before` may drop.
-/// A CLOSED set, deliberately: a task state token minted by a NEWER engine than this build is one
-/// this build cannot classify, and the safe direction to be wrong in is "never sweep it". An
-/// interrupted task waiting on a human is exactly the row that legitimately sits still for a long
-/// time, and compacting it is losing the work, not reclaiming space.
-const TERMINAL_TASK_STATES: [&str; 4] = ["completed", "failed", "canceled", "rejected"];
+/// The plane-record kinds whose retention is TERMINAL-ONLY: `purge_plane_records_before` drops a row
+/// of one of these kinds only once its `disposition` sidecar says `Terminal`. An interrupted task
+/// waiting on a human is exactly the row that sits still longest, and sweeping it is losing the
+/// work. Every other kind drops any row older than the cutoff — the same split busbar's reference
+/// backends (`store-memory`, `store-example-plugin`) draw.
+const TERMINAL_ONLY_RETENTION_KINDS: [&str; 1] = ["task"];
+
+/// `(parent kind, child kind)`: purging a parent record takes the child CHAIN hanging off it in the
+/// same transaction. A task's event chain has no retention path of its own, so leaving it behind
+/// would let it grow forever under tasks that no longer exist — the cascade busbar's
+/// `store-example-plugin` makes, and this store made before 1.6.0.
+const PLANE_CHILD_KINDS: [(&str, &str); 1] = [("task", "task_event")];
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS busbar_schema (
@@ -284,6 +304,13 @@ CREATE TABLE IF NOT EXISTS keys (
     -- TOMBSTONE marker. NULL = live. The row is never removed once tombstoned; see delete_key.
     deleted_at      BIGINT,
     revision        BIGINT NOT NULL DEFAULT 0,
+    -- v10 (busbar 1.6.0): attribution/provenance, NULL for every key minted before they existed.
+    idp_subject     TEXT,
+    binding_mode    TEXT,
+    minted_by       TEXT,
+    -- v10: the NON-pool scope grants, a JSON object {kind: [value, ...]}. NULL = none. Pool grants
+    -- stay in allowed_pools; NULL in BOTH columns is the omitted-grant wildcard.
+    allowed_scopes_by_kind TEXT,
     CONSTRAINT keys_tombstone_disabled CHECK (deleted_at IS NULL OR enabled = FALSE)
 );
 CREATE INDEX IF NOT EXISTS idx_keys_revision ON keys (revision);
@@ -329,6 +356,17 @@ CREATE TABLE IF NOT EXISTS usage_ledger (
     tokens_cache_write BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (bucket_id, window_start, model)
 );
+-- v10: every OPEN unit class of a (bucket, window, model) ledger row — the 1.6.0 M1b `usage_units`
+-- keys that are not one of the four reserved token classes above (which keep their columns, so a
+-- 1.5.x ledger row needs no rewrite). Additive on the flush path like the token columns.
+CREATE TABLE IF NOT EXISTS usage_ledger_units (
+    bucket_id    TEXT NOT NULL,
+    window_start BIGINT NOT NULL,
+    model        TEXT NOT NULL,
+    unit         TEXT COLLATE \"C\" NOT NULL,
+    count        BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (bucket_id, window_start, model, unit)
+);
 CREATE TABLE IF NOT EXISTS usage_metering (
     key_id             TEXT NOT NULL,
     bucket             BIGINT NOT NULL,
@@ -342,9 +380,24 @@ CREATE TABLE IF NOT EXISTS usage_metering (
     billable_requests  BIGINT NOT NULL DEFAULT 0,
     key_group_at_use   TEXT NOT NULL DEFAULT '',
     pricing_version    TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (key_id, bucket, model, provider)
+    -- v10: the instant this row's price started (#79). Part of the accrual key.
+    priced_from_ms     BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_metering_bucket ON usage_metering (bucket);
+-- v10: every ledgered class the token columns do not hold (MeteringRow::usage_units), per metering
+-- row. Additive like the token columns.
+CREATE TABLE IF NOT EXISTS usage_metering_units (
+    key_id         TEXT NOT NULL,
+    bucket         BIGINT NOT NULL,
+    model          TEXT NOT NULL,
+    provider       TEXT NOT NULL,
+    priced_from_ms BIGINT NOT NULL DEFAULT 0,
+    unit           TEXT COLLATE \"C\" NOT NULL,
+    count          BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms, unit)
+);
+CREATE INDEX IF NOT EXISTS idx_usage_metering_units_bucket ON usage_metering_units (bucket);
 CREATE TABLE IF NOT EXISTS audit_log (
     seq       BIGINT PRIMARY KEY,
     ts        BIGINT NOT NULL,
@@ -361,161 +414,70 @@ CREATE TABLE IF NOT EXISTS denylist (
     created_at BIGINT NOT NULL DEFAULT 0
 );
 
--- The DURABLE MCP TOOL-CALL LOG. A DIFFERENT POPULATION from audit_log, kept in its own table on
--- purpose: audit_log is the low-rate admin MUTATION log whose engine-side working set is a bounded
--- ring, while a tool call is data-plane traffic at request rate. Pouring one into the other means a
--- busy afternoon of tool calls evicts every admin row from the ring, so the question of who changed
--- a registration becomes unanswerable exactly when an incident makes somebody ask.
+-- THE KIND-TAGGED PLANE RECORDS (v10, busbar 1.6.0). The typed per-protocol tables of v7-v9 are
+-- replaced by one neutral surface: a plane record is an OPAQUE body the engine serialized plus the
+-- typed sidecar columns (kind, id, parent, seq, ts, disposition) that let this store key, order and
+-- retention-sweep without ever decoding the body. This store NEVER decodes a body and never
+-- computes or recomputes a digest inside one: it persists what it was handed and returns it
+-- verbatim.
 --
--- The chain is scoped to the PRINCIPAL, which is why (principal, seq) is the primary key and not a
--- global counter: a global chain would serialise every caller behind one append and would make one
--- caller's evidence unverifiable without possessing every other caller's rows.
---
--- SHAPE: opaque body plus only the columns a query needs. principal and ts are the index columns
--- (scoped read, and the retention sweep's age key). The CHAIN COLUMNS -- seq, prev_hash, hash -- are
--- REAL columns rather than being buried in the body, because the engine establishes durability by
--- READING THE CHAIN BACK and verifying it; a digest reachable only by decoding an opaque payload
--- forces a deserialise per verify and cannot be constrained or indexed by the database. The store
--- NEVER computes or recomputes a digest: it persists what it was handed and returns it verbatim.
-CREATE TABLE IF NOT EXISTS mcp_calls (
-    principal  TEXT NOT NULL,
-    seq        BIGINT NOT NULL,
-    ts         BIGINT NOT NULL,
-    prev_hash  TEXT NOT NULL,
-    hash       TEXT NOT NULL,
-    body       TEXT NOT NULL,
-    -- Carried now, written by nothing yet, and deliberately so: adding a column to a populated table
-    -- later is a rewrite, whereas carrying it from the first migration is free. `version` is the
-    -- compare-and-swap slot an optimistic-concurrency write would test; `expires_at` is the per-row
-    -- sweep deadline. Retention today goes by `ts` (see purge_mcp_calls_before).
-    expires_at BIGINT,
-    version    BIGINT NOT NULL DEFAULT 0,
-    PRIMARY KEY (principal, seq)
-);
--- The retention sweep's access path: purge_mcp_calls_before deletes by ts across every principal.
-CREATE INDEX IF NOT EXISTS mcp_calls_ts_idx ON mcp_calls (ts);
+-- COLLATE \"C\" on every identity column is BYTE-EXACT comparison, stated rather than inherited.
+-- Postgres's default collations are deterministic, so this changes nothing on a normally-created
+-- database — but one created with a NON-DETERMINISTIC ICU collation (case- and accent-insensitive)
+-- would otherwise make two task ids differing only in case COLLIDE on the primary key and silently
+-- upsert onto one row, fold a single-use token onto its case-variant, and let `vk_alice` read
+-- `vk_Alice`'s call chain. A kind, an id, a parent and a token are opaque strings, never words.
 
--- THE DURABLE A2A TASK STORE. A2A is async BY DESIGN: a task spans turns, can sit interrupted
--- waiting on a human, and can outlive the process that started it. An in-memory task table therefore
--- loses every in-flight task on restart, which is the difference between a resume that is real and
--- one that is nominal.
---
--- Every TaskRow field is a REAL column rather than an opaque body, and that is the OPPOSITE of the
--- shape mcp_calls uses, for a reason: mcp_calls is written once and read back whole, whereas these
--- rows are the working set the engine QUERIES — the retention sweep filters on (state, updated_at),
--- the boot rehydrate partitions on state, and a stale artifact_cursor decides whether a resubscribe
--- replays delivered artifacts or skips undelivered ones. A field reachable only by decoding a blob
--- can be neither indexed nor constrained.
---
--- `state` is deliberately UNCONSTRAINED (no CHECK): a task state token minted by a NEWER engine than
--- this schema was written against must store and read back verbatim. Only the retention sweep's
--- TERMINAL_TASK_STATES list is a closed set, and it is closed in the safe direction.
---
--- COLLATE \"C\" on `task_id`, `principal` and `state`, which is BYTE-EXACT comparison stated rather
--- than inherited. Postgres's default collations are deterministic, so `=` is already byte equality
--- on a normally-created database and this changes nothing there — but a database created with a
--- NON-DETERMINISTIC ICU collation (`CREATE DATABASE ... LOCALE_PROVIDER icu ... DETERMINISTIC
--- false`, which is case- and accent-insensitive) silently makes it something else, and this store
--- does not get to choose the database it is pointed at. store-mysql shipped exactly that bug: under
--- its default case-insensitive collation `vk_alice` could read `vk_Alice`'s audit chain. The same
--- shape here would be worse in two ways at once — two task ids differing only in case would COLLIDE
--- ON THE PRIMARY KEY and silently upsert onto one row, losing one of them, and
--- `'Completed' = ANY(TERMINAL_TASK_STATES)` would be TRUE, so the sweep would drop a state token it
--- does not actually recognise. A task id is an opaque protocol-supplied string and a principal is an
--- opaque key id; neither is a word, and nothing in the contract makes `vk_A` and `vk_a` one caller.
--- The remaining columns keep the database default on purpose: this store only ever stores them and
--- returns them verbatim, and never compares one against a literal.
-CREATE TABLE IF NOT EXISTS tasks (
-    task_id         TEXT COLLATE \"C\" PRIMARY KEY,
-    context_id      TEXT NOT NULL DEFAULT '',
-    principal       TEXT COLLATE \"C\" NOT NULL DEFAULT '',
-    direction       TEXT NOT NULL DEFAULT '',
-    state           TEXT COLLATE \"C\" NOT NULL DEFAULT '',
-    agent_id        TEXT NOT NULL DEFAULT '',
-    artifact_cursor BIGINT NOT NULL DEFAULT 0,
-    push_callback   TEXT NOT NULL DEFAULT '',
-    created_at      BIGINT NOT NULL,
-    updated_at      BIGINT NOT NULL
+-- UPSERTED records (a task, a demotion, a push configuration, ...): one current row per (kind, id).
+CREATE TABLE IF NOT EXISTS plane_records (
+    kind        TEXT COLLATE \"C\" NOT NULL,
+    id          TEXT COLLATE \"C\" NOT NULL,
+    parent      TEXT COLLATE \"C\",
+    seq         BIGINT NOT NULL DEFAULT 0,
+    ts          BIGINT NOT NULL,
+    disposition TEXT NOT NULL CHECK (disposition IN ('active', 'terminal')),
+    body        BYTEA NOT NULL,
+    PRIMARY KEY (kind, id)
 );
--- The retention sweep's access path — purge_tasks_before filters on exactly (state, updated_at) — in
--- that column order, because the sweep names a closed set of states and THEN a range on updated_at,
--- and an index is only usable for a range on its last consulted column.
-CREATE INDEX IF NOT EXISTS tasks_state_updated_idx ON tasks (state, updated_at);
+-- The retention sweep's access path: purge_plane_records_before filters on (kind, ts).
+CREATE INDEX IF NOT EXISTS plane_records_kind_ts_idx ON plane_records (kind, ts);
+CREATE INDEX IF NOT EXISTS plane_records_kind_parent_idx ON plane_records (kind, parent);
 
--- PER-TASK PROVENANCE, hash-chained WITHIN a task. Per-task rather than one global chain because
--- tasks are concurrent and long-lived: a global chain would serialise every task transition behind
--- one append and would make one task's provenance unverifiable without possessing every other
--- tenant's events. The chain columns — seq, prev_hash, hash — are REAL columns for the same reason
--- they are in mcp_calls: durability here is established by READING THE CHAIN BACK, and this store
--- NEVER computes or recomputes a digest.
---
--- NO FOREIGN KEY to `tasks`, deliberately, even though the purge cascade is exactly what one would
--- buy. An FK would also impose an ORDER on the writes — no event could be appended before its task
--- row existed — and the engine is under no such obligation: a `task.submitted` event and the first
--- `put_task` are two independent write-throughs and the contract states no ordering between them.
--- The cascade lives in `purge_tasks_before` instead, in the SAME TRANSACTION as the parent delete.
-CREATE TABLE IF NOT EXISTS task_events (
-    task_id    TEXT COLLATE \"C\" NOT NULL,
-    seq        BIGINT NOT NULL,
-    ts         BIGINT NOT NULL,
-    kind       TEXT NOT NULL DEFAULT '',
-    context_id TEXT NOT NULL DEFAULT '',
-    principal  TEXT NOT NULL DEFAULT '',
-    agent_id   TEXT NOT NULL DEFAULT '',
-    state      TEXT NOT NULL DEFAULT '',
-    request_id TEXT NOT NULL DEFAULT '',
-    prev_hash  TEXT NOT NULL DEFAULT '',
-    hash       TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (task_id, seq)
+-- APPENDED chains (a task's event chain, a principal's call log): append-only, keyed by the chain
+-- position (kind, parent, seq). A second record at an occupied position is either the write-through
+-- retrying (identical: Ok) or a fork (different: refused) — never an overwrite.
+CREATE TABLE IF NOT EXISTS plane_chain (
+    kind        TEXT COLLATE \"C\" NOT NULL,
+    parent      TEXT COLLATE \"C\" NOT NULL,
+    seq         BIGINT NOT NULL,
+    id          TEXT COLLATE \"C\" NOT NULL,
+    ts          BIGINT NOT NULL,
+    disposition TEXT NOT NULL CHECK (disposition IN ('active', 'terminal')),
+    body        BYTEA NOT NULL,
+    PRIMARY KEY (kind, parent, seq)
 );
+CREATE INDEX IF NOT EXISTS plane_chain_kind_ts_idx ON plane_chain (kind, ts);
 
--- THE DURABLE MCP DEMOTION RECORD. An engine demotes a registered upstream when the tool list it is
--- currently serving disagrees with what the operator approved. That decision is derived in memory
--- from a LIVE OBSERVATION, and a process that has taken no observation has nothing to derive it
--- from — a server nobody has looked at serves against the digest the operator wrote down, which is
--- the declarative-approval behaviour every deployment without a live refresh depends on. Those two
--- facts together are why this table exists: without it a restart hands a quarantined upstream its
--- approval back until the next unattended sweep looks again.
---
--- ONE ROW PER UPSTREAM, keyed by the operator's local registration id and upserted, so a second
--- demotion of one server replaces the row rather than standing a rival one beside it. Carries no
--- secret: `reason` is an engine-chosen word for an operator to read, never caller text.
---
--- COLLATE \"C\" on `server`, for the reason `tasks.task_id` carries it and then some. This store does
--- not get to choose the database it is pointed at, and one created with a NON-DETERMINISTIC ICU
--- collation (LOCALE_PROVIDER icu ... DETERMINISTIC false) makes `=` case- and accent-insensitive —
--- which here would let two DISTINCT registered upstreams collide on the primary key, so quarantining
--- one would silently overwrite the other's record and clearing one would clear both. A registration
--- id is an opaque operator-chosen string, not a word.
-CREATE TABLE IF NOT EXISTS mcp_demotions (
-    server      TEXT COLLATE \"C\" PRIMARY KEY,
-    reason      TEXT NOT NULL DEFAULT '',
-    recorded_at BIGINT NOT NULL
+-- THE SINGLE-USE TOKEN LEDGER behind redeem_plane_token (an `ask` approval nonce, ...). A sealed
+-- single-use token verifies identically on its second presentation; only a RECORD THAT THE FIRST
+-- HAPPENED tells them apart, and it has to be one ledger for the whole fleet to be true of every
+-- node. Every redemption is a point INSERT on the primary key; expires_at bounds the table.
+CREATE TABLE IF NOT EXISTS plane_tokens (
+    kind       TEXT COLLATE \"C\" NOT NULL,
+    token      TEXT COLLATE \"C\" NOT NULL,
+    expires_at BIGINT NOT NULL,
+    PRIMARY KEY (kind, token)
 );
+";
 
--- THE DURABLE SPENT-APPROVAL LEDGER. A sealed, single-use approval is what makes a confirm-once tool
--- execute once, and the seal itself cannot carry that property: the second presentation of a
--- redeemed approval is byte-identical to the first and verifies just as well. Only a RECORD THAT THE
--- FIRST HAPPENED tells them apart, and in process memory that record dies with the process and is
--- never shared with a second node — while two nodes of one deployment share the signing key, and
--- therefore share the seal. Here it is one ledger for the whole cluster, which is the only place it
--- can live and be true of both.
---
--- COLLATE \"C\" on `nonce` is the sharpest instance of the hazard in this file. Under a
--- non-deterministic collation the primary key stops distinguishing a nonce from its case- or
--- accent-variants, and a ledger whose entire job is telling one approval from another would then
--- REFUSE a genuinely fresh approval (a false positive that breaks the gate for an operator) while
--- folding an attacker's near-miss variants onto one row. Byte-exact is the only correct comparison
--- for a random token, and it is stated rather than inherited.
---
--- No index beyond the primary key, and none is wanted: every redemption is a point lookup on
--- `nonce` (the INSERT's own conflict check), and the only scan is the eviction sweep over a table
--- bounded by one approval-validity window. `expires_at` is what that sweep goes by — an entry
--- recording an approval that can no longer be opened protects nothing.
-CREATE TABLE IF NOT EXISTS spent_ask_states (
-    nonce      TEXT COLLATE \"C\" PRIMARY KEY,
-    expires_at BIGINT NOT NULL
-);
+/// The v10 column additions on tables a 1.5.x database already has. `IF NOT EXISTS`, so a re-run
+/// after a crash part-way through is harmless; `migrate_locked` runs it only when crossing into v10.
+const MIGRATE_V10_COLUMNS: &str = "
+ALTER TABLE keys ADD COLUMN IF NOT EXISTS idp_subject TEXT;
+ALTER TABLE keys ADD COLUMN IF NOT EXISTS binding_mode TEXT;
+ALTER TABLE keys ADD COLUMN IF NOT EXISTS minted_by TEXT;
+ALTER TABLE keys ADD COLUMN IF NOT EXISTS allowed_scopes_by_kind TEXT;
+ALTER TABLE usage_metering ADD COLUMN IF NOT EXISTS priced_from_ms BIGINT NOT NULL DEFAULT 0;
 ";
 
 /// Postgres `Store` backend (durable, shared across a cluster). A single mutex-guarded connection —
@@ -534,6 +496,15 @@ fn clamp(v: u64) -> i64 {
 /// wrapping via `as`.
 fn read_u64(v: i64) -> u64 {
     v.max(0) as u64
+}
+
+/// The four RESERVED unit classes, in the order of the `usage_ledger` token columns
+/// (`tokens_input`, `tokens_output`, `tokens_cache_read`, `tokens_cache_write`). Every other unit
+/// class is an OPEN one and lives in `usage_ledger_units`.
+const RESERVED_COLUMNS: [&str; 4] = [UNIT_INPUT, UNIT_OUTPUT, UNIT_CACHE_READ, UNIT_CACHE_WRITE];
+
+fn is_reserved_unit(unit: &str) -> bool {
+    RESERVED_COLUMNS.contains(&unit)
 }
 
 /// Current Unix time in seconds, 0 if the system clock is before the epoch. The ONE source of
@@ -626,6 +597,16 @@ impl PostgresStore {
                 Err(e) if is_undefined_table(&e) => 0,
                 Err(e) => return Err(StoreError(e.to_string())),
             };
+        // ALREADY CURRENT: run no DDL at all. Every node runs `migrate()` on every connect, and
+        // `SCHEMA`'s `CREATE INDEX IF NOT EXISTS` takes a SHARE lock on its table before it
+        // discovers the index exists — first on `keys`, then on `credentials`. A `delete_key` on
+        // another node writes them in the OTHER order (credentials, then keys), so re-running the
+        // no-op DDL on a current database deadlocked a live key delete against a node merely
+        // connecting (observed: `40P01` on `UPDATE keys ... deleted_at`). A database at (or past)
+        // this build's version has every table and index this build creates.
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
         let mut tx = client.transaction().store()?;
         if version < 5 {
             let legacy: bool = tx
@@ -666,6 +647,30 @@ impl PostgresStore {
             )
             .store()?;
         }
+        // v10 — see SCHEMA_VERSION. `SCHEMA`'s `CREATE TABLE IF NOT EXISTS` never alters a table
+        // that already exists, so on a 1.5.x (v6) database these statements ARE the upgrade.
+        // Nothing is dropped and no existing value is rewritten.
+        //
+        // Crossing INTO v10 only, and that gate is load-bearing rather than tidy: `ALTER TABLE`
+        // takes an ACCESS EXCLUSIVE lock on the table even when `IF NOT EXISTS` turns it into a
+        // no-op, and every node's connect runs `migrate()` — so an unconditional ALTER here locks
+        // `keys` out from under every other node's in-flight transaction on every connect (and
+        // deadlocks against one holding the `store_revision` row this transaction's `SCHEMA` insert
+        // also touches). The whole migration is ONE transaction with the version stamp, so a crash
+        // part-way leaves `version < 10` and the next connect re-runs it from the start.
+        if version < 10 {
+            tx.batch_execute(MIGRATE_V10_COLUMNS).store()?;
+            // The one v10 step that is not a pure addition: `priced_from_ms` joins the metering
+            // primary key. Every existing row carries `priced_from_ms = 0` (the column default),
+            // so the old key `(key_id, bucket, model, provider)` was already unique and the widened
+            // key admits every existing row unchanged.
+            tx.batch_execute(
+                "ALTER TABLE usage_metering DROP CONSTRAINT IF EXISTS usage_metering_pkey;
+                 ALTER TABLE usage_metering ADD CONSTRAINT usage_metering_pkey
+                     PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms);",
+            )
+            .store()?;
+        }
         tx.execute(
             "INSERT INTO busbar_schema (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
             &[&SCHEMA_VERSION],
@@ -699,25 +704,67 @@ fn labels_from_storage(stored: &str) -> std::collections::BTreeMap<String, Strin
     serde_json::from_str(stored).unwrap_or_default()
 }
 
-// Wire/DB storage format is unchanged by the ScopeRef generalization -- still a plain JSON array
-// of bare pool-name strings (or NULL) in the `allowed_pools` TEXT column. Only the Rust-side type
-// at this crate's boundary changed (`Vec<String>` -> `Vec<ScopeRef>`); the conversion happens here,
-// at construction (`ScopeRef::pool(name)`) and at read (`.value`).
-fn pools_to_storage(pools: &Option<Vec<ScopeRef>>) -> Option<String> {
-    pools.as_ref().map(|p| {
-        let names: Vec<&str> = p.iter().map(|s| s.value.as_str()).collect();
-        serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string())
-    })
+// SCOPE STORAGE. `allowed_pools` is unchanged since 1.5.x: a JSON array of bare pool names, or
+// NULL. The v10 `allowed_scopes_by_kind` column carries every NON-pool grant as a JSON object
+// `{kind: [value, ...]}` (NULL when there are none), so a pool-only key is stored byte-identically
+// to what a 1.5.x build wrote, and a pre-v10 row (NULL in the new column) reads back exactly as it
+// did. The partition mirrors the VirtualKey wire (`allowed_pools` + one field per kind):
+//   * `None` (grant omitted = every scope of every kind) -> both columns NULL;
+//   * `Some(list)` (exhaustive across ALL kinds, possibly empty) -> `allowed_pools` is ALWAYS a
+//     JSON array (possibly `[]`), so `Some([])` = no scopes never collapses into `None` = all, and
+//     a grant of only non-pool kinds never reads back as "every pool".
+// A non-pool kind is NEVER folded into `allowed_pools`: that is the pre-1.6.0 defect where an
+// `mcp_server` grant became a POOL grant on a store round-trip.
+type ScopeColumns = (Option<String>, Option<String>);
+
+fn scopes_to_storage(scopes: &Option<Vec<ScopeRef>>) -> ScopeColumns {
+    let Some(list) = scopes else {
+        return (None, None);
+    };
+    let mut pools: Vec<&str> = Vec::new();
+    let mut by_kind: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for s in list {
+        if s.kind == "pool" {
+            pools.push(s.value.as_str());
+        } else {
+            by_kind
+                .entry(s.kind.as_str())
+                .or_default()
+                .push(s.value.as_str());
+        }
+    }
+    let pools = serde_json::to_string(&pools).unwrap_or_else(|_| "[]".to_string());
+    let by_kind = if by_kind.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&by_kind).unwrap_or_else(|_| "{}".to_string()))
+    };
+    (Some(pools), by_kind)
 }
-fn pools_from_storage(stored: Option<String>) -> Option<Vec<ScopeRef>> {
-    let stored = stored?;
-    Some(
-        serde_json::from_str::<Vec<String>>(stored.trim())
-            .unwrap_or_default()
-            .into_iter()
-            .map(ScopeRef::pool)
-            .collect(),
-    )
+
+/// The inverse of [`scopes_to_storage`]: pools first, then every other kind in kind order — the
+/// same canonical order the VirtualKey wire reassembles in.
+fn scopes_from_storage(pools: Option<String>, by_kind: Option<String>) -> Option<Vec<ScopeRef>> {
+    if pools.is_none() && by_kind.is_none() {
+        return None;
+    }
+    let mut out: Vec<ScopeRef> = pools
+        .map(|p| serde_json::from_str::<Vec<String>>(p.trim()).unwrap_or_default())
+        .unwrap_or_default()
+        .into_iter()
+        .map(ScopeRef::pool)
+        .collect();
+    if let Some(by_kind) = by_kind {
+        let map: BTreeMap<String, Vec<String>> =
+            serde_json::from_str(by_kind.trim()).unwrap_or_default();
+        for (kind, values) in map {
+            out.extend(values.into_iter().map(|value| ScopeRef {
+                kind: kind.clone(),
+                value,
+            }));
+        }
+    }
+    Some(out)
 }
 
 fn row_to_key(r: &Row) -> VirtualKey {
@@ -725,7 +772,10 @@ fn row_to_key(r: &Row) -> VirtualKey {
         id: r.get(0),
         generation_hash: r.get(1),
         name: r.get(2),
-        allowed_scopes: pools_from_storage(r.get::<_, Option<String>>(3)),
+        allowed_scopes: scopes_from_storage(
+            r.get::<_, Option<String>>(3),
+            r.get::<_, Option<String>>(14),
+        ),
         enabled: r.get(4),
         created_at: read_u64(r.get::<_, i64>(5)),
         group: r.get(6),
@@ -733,10 +783,13 @@ fn row_to_key(r: &Row) -> VirtualKey {
         expires_at: r.get::<_, Option<i64>>(8).map(read_u64),
         deleted_at: r.get::<_, Option<i64>>(9).map(read_u64),
         revision: read_u64(r.get::<_, i64>(10)),
+        idp_subject: r.get(11),
+        binding_mode: r.get(12),
+        minted_by: r.get(13),
     }
 }
 
-const KEY_COLUMNS: &str = "id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision";
+const KEY_COLUMNS: &str = "id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,idp_subject,binding_mode,minted_by,allowed_scopes_by_kind";
 
 fn secret_form_to_storage(f: SecretForm) -> &'static str {
     match f {
@@ -784,7 +837,7 @@ fn row_to_cred_meta(r: &Row) -> CredentialMeta {
 
 impl Store for PostgresStore {
     fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
-        let pools = pools_to_storage(&key.allowed_scopes);
+        let (pools, by_kind) = scopes_to_storage(&key.allowed_scopes);
         let labels = labels_to_storage(&key.labels);
         let created = clamp(key.created_at);
         let expires = key.expires_at.map(clamp);
@@ -802,18 +855,22 @@ impl Store for PostgresStore {
         // A write that CARRIES a tombstone is unaffected and still applies.
         let changed = tx.execute(
             "INSERT INTO keys
-                (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,
+                 idp_subject,binding_mode,minted_by,allowed_scopes_by_kind)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
              ON CONFLICT (id) DO UPDATE SET
                 generation_hash=EXCLUDED.generation_hash, name=EXCLUDED.name,
                 allowed_pools=EXCLUDED.allowed_pools, enabled=EXCLUDED.enabled,
                 key_group=EXCLUDED.key_group, labels=EXCLUDED.labels,
                 expires_at=EXCLUDED.expires_at, deleted_at=EXCLUDED.deleted_at,
-                revision=EXCLUDED.revision
+                revision=EXCLUDED.revision, idp_subject=EXCLUDED.idp_subject,
+                binding_mode=EXCLUDED.binding_mode, minted_by=EXCLUDED.minted_by,
+                allowed_scopes_by_kind=EXCLUDED.allowed_scopes_by_kind
              WHERE EXCLUDED.deleted_at IS NOT NULL OR keys.deleted_at IS NULL",
             &[
                 &key.id, &key.generation_hash, &key.name, &pools, &key.enabled, &created,
-                &key.group, &labels, &expires, &deleted, &rev,
+                &key.group, &labels, &expires, &deleted, &rev, &key.idp_subject,
+                &key.binding_mode, &key.minted_by, &by_kind,
             ],
         )
         .store()?;
@@ -985,21 +1042,40 @@ impl Store for PostgresStore {
                 &[&bucket_id, &ws],
             )
             .store()?;
+        let unit_rows = tx
+            .query(
+                "SELECT model, unit, count FROM usage_ledger_units
+                 WHERE bucket_id=$1 AND window_start=$2 ORDER BY model, unit",
+                &[&bucket_id, &ws],
+            )
+            .store()?;
         tx.commit().store()?;
+        // One ModelTokens per model, in model order. The four reserved classes come off their
+        // columns and every open class off `usage_ledger_units`, all into the one name-keyed map.
+        // Zero counts are left out, so the map stays sparse the way busbar's own ledger keeps it.
+        let mut models: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+        for r in &rows {
+            let units = models.entry(r.get::<_, String>(0)).or_default();
+            for (i, unit) in RESERVED_COLUMNS.iter().enumerate() {
+                let v = read_u64(r.get::<_, i64>(i + 1));
+                if v != 0 {
+                    units.insert(unit.to_string(), v);
+                }
+            }
+        }
+        for r in &unit_rows {
+            let v = read_u64(r.get::<_, i64>(2));
+            let units = models.entry(r.get::<_, String>(0)).or_default();
+            if v != 0 {
+                units.insert(r.get::<_, String>(1), v);
+            }
+        }
         Ok(UsageLedger {
             requests,
             billable_requests,
-            models: rows
-                .iter()
-                .map(|r| ModelTokens {
-                    model: r.get(0),
-                    tokens: TierTokens {
-                        input: read_u64(r.get::<_, i64>(1)),
-                        output: read_u64(r.get::<_, i64>(2)),
-                        cache_read: read_u64(r.get::<_, i64>(3)),
-                        cache_write: read_u64(r.get::<_, i64>(4)),
-                    },
-                })
+            models: models
+                .into_iter()
+                .map(|(model, usage_units)| ModelTokens { model, usage_units })
                 .collect(),
         })
     }
@@ -1021,6 +1097,11 @@ impl Store for PostgresStore {
         )
         .store()?;
         tx.execute(
+            "DELETE FROM usage_ledger_units WHERE bucket_id=$1 AND window_start=$2",
+            &[&bucket_id, &ws],
+        )
+        .store()?;
+        tx.execute(
             "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
              VALUES ($1,$2,$3,$4)
              ON CONFLICT (bucket_id, window_start) DO UPDATE SET
@@ -1030,17 +1111,10 @@ impl Store for PostgresStore {
         )
         .store()?;
         if !ledger.models.is_empty() {
-            let rows: Vec<(i64, i64, i64, i64)> = ledger
+            let rows: Vec<[i64; 4]> = ledger
                 .models
                 .iter()
-                .map(|m| {
-                    (
-                        clamp(m.tokens.input),
-                        clamp(m.tokens.output),
-                        clamp(m.tokens.cache_read),
-                        clamp(m.tokens.cache_write),
-                    )
-                })
+                .map(|m| RESERVED_COLUMNS.map(|u| clamp(m.tier(u))))
                 .collect();
             let mut sql = String::from(
                 "INSERT INTO usage_ledger \
@@ -1064,12 +1138,48 @@ impl Store for PostgresStore {
                     base + 4
                 ));
                 params.push(&m.model);
-                params.push(&row.0);
-                params.push(&row.1);
-                params.push(&row.2);
-                params.push(&row.3);
+                for v in row {
+                    params.push(v);
+                }
             }
             tx.execute(&sql, &params).store()?;
+
+            // The OPEN unit classes: an absolute set too (the window's rows were cleared above).
+            let opens: Vec<(&String, &String, i64)> = ledger
+                .models
+                .iter()
+                .flat_map(|m| {
+                    m.usage_units
+                        .iter()
+                        .filter(|(u, v)| !is_reserved_unit(u) && **v != 0)
+                        .map(move |(u, v)| (&m.model, u, clamp(*v)))
+                })
+                .collect();
+            if !opens.is_empty() {
+                let mut sql = String::from(
+                    "INSERT INTO usage_ledger_units (bucket_id, window_start, model, unit, count) VALUES ",
+                );
+                let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(2 + opens.len() * 3);
+                params.push(&bucket_id);
+                params.push(&ws);
+                for (i, (model, unit, count)) in opens.iter().enumerate() {
+                    if i > 0 {
+                        sql.push(',');
+                    }
+                    let base = 3 + i * 3;
+                    sql.push_str(&format!("($1,$2,${},${},${})", base, base + 1, base + 2));
+                    params.push(*model);
+                    params.push(*unit);
+                    params.push(count);
+                }
+                // Two ModelTokens entries for one model would name the same unit twice; summed,
+                // the same way `UsageLedger::apply_delta` folds them, rather than a key violation.
+                sql.push_str(
+                    " ON CONFLICT (bucket_id, window_start, model, unit) DO UPDATE SET \
+                     count = usage_ledger_units.count + EXCLUDED.count",
+                );
+                tx.execute(&sql, &params).store()?;
+            }
         }
         tx.commit().store()?;
         Ok(())
@@ -1089,44 +1199,120 @@ impl Store for PostgresStore {
         )
         .store()?;
         if !delta.models.is_empty() {
-            // Batched into ONE multi-row INSERT instead of one round trip per model, mirroring
-            // put_usage's identical multi-row VALUES-list construction above for the same table.
-            let mut sql = String::from(
-                "INSERT INTO usage_ledger \
-                 (bucket_id, window_start, model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write) \
-                 VALUES ",
+            // TWO statements, both batched over every model, and the split is what makes a
+            // NEGATIVE delta (a refund) land. An `INSERT … ON CONFLICT DO UPDATE` can only add
+            // `EXCLUDED.col` on conflict, and EXCLUDED is the row the INSERT would have written —
+            // which has to be floored at 0 for a first-seen model — so a refund against an existing
+            // row added 0 and was silently lost. Instead: make sure every model's row exists (at
+            // zero), then apply the SIGNED deltas to it in one UPDATE, floored at 0 there. A refund
+            // against a fresh row floors to 0, exactly as `UsageLedger::apply_model_delta` does.
+            let deltas: Vec<[i64; 4]> = delta
+                .models
+                .iter()
+                .map(|m| RESERVED_COLUMNS.map(|u| m.usage_units.get(u).copied().unwrap_or(0)))
+                .collect();
+            let mut ensure =
+                String::from("INSERT INTO usage_ledger (bucket_id, window_start, model) VALUES ");
+            let mut update = String::from(
+                "UPDATE usage_ledger u SET \
+                    tokens_input       = GREATEST(0, u.tokens_input + v.di), \
+                    tokens_output      = GREATEST(0, u.tokens_output + v.do_), \
+                    tokens_cache_read  = GREATEST(0, u.tokens_cache_read + v.dcr), \
+                    tokens_cache_write = GREATEST(0, u.tokens_cache_write + v.dcw) \
+                 FROM (VALUES ",
             );
-            let mut params: Vec<&(dyn ToSql + Sync)> =
+            let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
+                Vec::with_capacity(2 + delta.models.len());
+            let mut update_params: Vec<&(dyn ToSql + Sync)> =
                 Vec::with_capacity(2 + delta.models.len() * 5);
-            params.push(&bucket_id);
-            params.push(&ws);
-            for (i, m) in delta.models.iter().enumerate() {
+            ensure_params.push(&bucket_id);
+            ensure_params.push(&ws);
+            update_params.push(&bucket_id);
+            update_params.push(&ws);
+            for (i, (m, d)) in delta.models.iter().zip(deltas.iter()).enumerate() {
                 if i > 0 {
-                    sql.push(',');
+                    ensure.push(',');
+                    update.push(',');
                 }
+                ensure.push_str(&format!("($1,$2,${})", 3 + i));
+                ensure_params.push(&m.model);
                 let base = 3 + i * 5;
-                sql.push_str(&format!(
-                    "($1,$2,${},GREATEST(0,${}::bigint),GREATEST(0,${}::bigint),GREATEST(0,${}::bigint),GREATEST(0,${}::bigint))",
+                update.push_str(&format!(
+                    "(${}::text,${}::bigint,${}::bigint,${}::bigint,${}::bigint)",
                     base,
                     base + 1,
                     base + 2,
                     base + 3,
                     base + 4
                 ));
-                params.push(&m.model);
-                params.push(&m.tokens.input);
-                params.push(&m.tokens.output);
-                params.push(&m.tokens.cache_read);
-                params.push(&m.tokens.cache_write);
+                update_params.push(&m.model);
+                for v in d {
+                    update_params.push(v);
+                }
             }
-            sql.push_str(
-                " ON CONFLICT (bucket_id, window_start, model) DO UPDATE SET \
-                    tokens_input       = GREATEST(0, usage_ledger.tokens_input + EXCLUDED.tokens_input), \
-                    tokens_output      = GREATEST(0, usage_ledger.tokens_output + EXCLUDED.tokens_output), \
-                    tokens_cache_read  = GREATEST(0, usage_ledger.tokens_cache_read + EXCLUDED.tokens_cache_read), \
-                    tokens_cache_write = GREATEST(0, usage_ledger.tokens_cache_write + EXCLUDED.tokens_cache_write)",
+            ensure.push_str(" ON CONFLICT (bucket_id, window_start, model) DO NOTHING");
+            update.push_str(
+                ") AS v(model, di, do_, dcr, dcw) \
+                 WHERE u.bucket_id = $1 AND u.window_start = $2 AND u.model = v.model",
             );
-            tx.execute(&sql, &params).store()?;
+            tx.execute(&ensure, &ensure_params).store()?;
+            tx.execute(&update, &update_params).store()?;
+
+            // The OPEN unit classes, the same ensure-then-signed-update shape.
+            let opens: Vec<(&String, &String, i64)> = delta
+                .models
+                .iter()
+                .flat_map(|m| {
+                    m.usage_units
+                        .iter()
+                        .filter(|(u, _)| !is_reserved_unit(u))
+                        .map(move |(u, d)| (&m.model, u, *d))
+                })
+                .collect();
+            if !opens.is_empty() {
+                let mut ensure = String::from(
+                    "INSERT INTO usage_ledger_units (bucket_id, window_start, model, unit) VALUES ",
+                );
+                let mut update = String::from(
+                    "UPDATE usage_ledger_units u SET count = GREATEST(0, u.count + v.d) FROM (VALUES ",
+                );
+                let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
+                    Vec::with_capacity(2 + opens.len() * 2);
+                let mut update_params: Vec<&(dyn ToSql + Sync)> =
+                    Vec::with_capacity(2 + opens.len() * 3);
+                ensure_params.push(&bucket_id);
+                ensure_params.push(&ws);
+                update_params.push(&bucket_id);
+                update_params.push(&ws);
+                for (i, (model, unit, d)) in opens.iter().enumerate() {
+                    if i > 0 {
+                        ensure.push(',');
+                        update.push(',');
+                    }
+                    let eb = 3 + i * 2;
+                    ensure.push_str(&format!("($1,$2,${},${})", eb, eb + 1));
+                    ensure_params.push(*model);
+                    ensure_params.push(*unit);
+                    let ub = 3 + i * 3;
+                    update.push_str(&format!(
+                        "(${}::text,${}::text,${}::bigint)",
+                        ub,
+                        ub + 1,
+                        ub + 2
+                    ));
+                    update_params.push(*model);
+                    update_params.push(*unit);
+                    update_params.push(d);
+                }
+                ensure.push_str(" ON CONFLICT (bucket_id, window_start, model, unit) DO NOTHING");
+                update.push_str(
+                    ") AS v(model, unit, d) \
+                     WHERE u.bucket_id = $1 AND u.window_start = $2 \
+                       AND u.model = v.model AND u.unit = v.unit",
+                );
+                tx.execute(&ensure, &ensure_params).store()?;
+                tx.execute(&update, &update_params).store()?;
+            }
         }
         tx.commit().store()?;
         Ok(())
@@ -1142,54 +1328,124 @@ impl Store for PostgresStore {
         );
         let requests = clamp(d.requests);
         let brequests = clamp(d.billable_requests);
-        self.lock()
-            .execute(
-                "INSERT INTO usage_metering (key_id, bucket, model, provider,
-                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
-                     requests, billable_requests, key_group_at_use, pricing_version)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-                 ON CONFLICT (key_id, bucket, model, provider) DO UPDATE SET
-                     tokens_input       = usage_metering.tokens_input + EXCLUDED.tokens_input,
-                     tokens_output      = usage_metering.tokens_output + EXCLUDED.tokens_output,
-                     tokens_cache_read  = usage_metering.tokens_cache_read + EXCLUDED.tokens_cache_read,
-                     tokens_cache_write = usage_metering.tokens_cache_write + EXCLUDED.tokens_cache_write,
-                     requests           = usage_metering.requests + EXCLUDED.requests,
-                     billable_requests  = usage_metering.billable_requests + EXCLUDED.billable_requests",
-                &[
-                    &d.key_id, &bucket, &d.model, &d.provider, &ti, &to, &tcr, &tcw, &requests,
-                    &brequests, &d.key_group_at_use, &d.pricing_version,
-                ],
-            )
-            .store()?;
+        let priced_from = clamp(d.priced_from_ms);
+        let mut client = self.lock();
+        let mut tx = client.transaction().store()?;
+        // `priced_from_ms` is part of the accrual key (DECISION #79): a rate-card edit inside the
+        // UTC day opens a SECOND row for that day so each half keeps the card it was earned under,
+        // rather than folding counts earned under two prices into one row readable against one.
+        tx.execute(
+            "INSERT INTO usage_metering (key_id, bucket, model, provider,
+                 tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
+                 requests, billable_requests, key_group_at_use, pricing_version, priced_from_ms)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+             ON CONFLICT (key_id, bucket, model, provider, priced_from_ms) DO UPDATE SET
+                 tokens_input       = usage_metering.tokens_input + EXCLUDED.tokens_input,
+                 tokens_output      = usage_metering.tokens_output + EXCLUDED.tokens_output,
+                 tokens_cache_read  = usage_metering.tokens_cache_read + EXCLUDED.tokens_cache_read,
+                 tokens_cache_write = usage_metering.tokens_cache_write + EXCLUDED.tokens_cache_write,
+                 requests           = usage_metering.requests + EXCLUDED.requests,
+                 billable_requests  = usage_metering.billable_requests + EXCLUDED.billable_requests",
+            &[
+                &d.key_id, &bucket, &d.model, &d.provider, &ti, &to, &tcr, &tcw, &requests,
+                &brequests, &d.key_group_at_use, &d.pricing_version, &priced_from,
+            ],
+        )
+        .store()?;
+        // Every ledgered class the token columns do not hold, additive like them, in the SAME
+        // transaction so a metering row never shows its tokens without its other classes.
+        let units: Vec<(&String, i64)> = d
+            .usage_units
+            .iter()
+            .filter(|(_, v)| **v != 0)
+            .map(|(u, v)| (u, clamp(*v)))
+            .collect();
+        if !units.is_empty() {
+            let mut sql = String::from(
+                "INSERT INTO usage_metering_units \
+                 (key_id, bucket, model, provider, priced_from_ms, unit, count) VALUES ",
+            );
+            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(5 + units.len() * 2);
+            params.push(&d.key_id);
+            params.push(&bucket);
+            params.push(&d.model);
+            params.push(&d.provider);
+            params.push(&priced_from);
+            for (i, (unit, count)) in units.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                let base = 6 + i * 2;
+                sql.push_str(&format!("($1,$2,$3,$4,$5,${},${})", base, base + 1));
+                params.push(*unit);
+                params.push(count);
+            }
+            sql.push_str(
+                " ON CONFLICT (key_id, bucket, model, provider, priced_from_ms, unit) DO UPDATE SET \
+                 count = usage_metering_units.count + EXCLUDED.count",
+            );
+            tx.execute(&sql, &params).store()?;
+        }
+        tx.commit().store()?;
         Ok(())
     }
 
     fn list_metering(&self, bucket: u64) -> StoreResult<Vec<MeteringRow>> {
         let b = clamp(bucket);
-        let rows = self
-            .lock()
+        let mut client = self.lock();
+        // ONE snapshot for both reads, so a row's open classes are never read from a different
+        // moment than its token columns.
+        let mut tx = Self::snapshot_consistent_tx(&mut client)?;
+        let rows = tx
             .query(
                 "SELECT key_id, model, provider,
                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
-                    requests, billable_requests, key_group_at_use, pricing_version
-                 FROM usage_metering WHERE bucket=$1",
+                    requests, billable_requests, key_group_at_use, pricing_version, priced_from_ms
+                 FROM usage_metering WHERE bucket=$1
+                 ORDER BY key_id, model, provider, priced_from_ms",
                 &[&b],
             )
             .store()?;
+        let unit_rows = tx
+            .query(
+                "SELECT key_id, model, provider, priced_from_ms, unit, count
+                 FROM usage_metering_units WHERE bucket=$1",
+                &[&b],
+            )
+            .store()?;
+        tx.commit().store()?;
+        type RowKey = (String, String, String, i64);
+        let mut units: std::collections::HashMap<RowKey, BTreeMap<String, u64>> =
+            std::collections::HashMap::new();
+        for r in &unit_rows {
+            let v = read_u64(r.get::<_, i64>(5));
+            if v == 0 {
+                continue;
+            }
+            units
+                .entry((r.get(0), r.get(1), r.get(2), r.get(3)))
+                .or_default()
+                .insert(r.get(4), v);
+        }
         Ok(rows
             .iter()
-            .map(|r| MeteringRow {
-                key_id: r.get(0),
-                model: r.get(1),
-                provider: r.get(2),
-                tokens_input: read_u64(r.get::<_, i64>(3)),
-                tokens_output: read_u64(r.get::<_, i64>(4)),
-                tokens_cache_read: read_u64(r.get::<_, i64>(5)),
-                tokens_cache_write: read_u64(r.get::<_, i64>(6)),
-                requests: read_u64(r.get::<_, i64>(7)),
-                billable_requests: read_u64(r.get::<_, i64>(8)),
-                key_group_at_use: r.get(9),
-                pricing_version: r.get(10),
+            .map(|r| {
+                let key: RowKey = (r.get(0), r.get(1), r.get(2), r.get(11));
+                MeteringRow {
+                    usage_units: units.remove(&key).unwrap_or_default(),
+                    key_id: key.0,
+                    model: key.1,
+                    provider: key.2,
+                    tokens_input: read_u64(r.get::<_, i64>(3)),
+                    tokens_output: read_u64(r.get::<_, i64>(4)),
+                    tokens_cache_read: read_u64(r.get::<_, i64>(5)),
+                    tokens_cache_write: read_u64(r.get::<_, i64>(6)),
+                    requests: read_u64(r.get::<_, i64>(7)),
+                    billable_requests: read_u64(r.get::<_, i64>(8)),
+                    key_group_at_use: r.get(9),
+                    pricing_version: r.get(10),
+                    priced_from_ms: read_u64(key.3),
+                }
             })
             .collect())
     }
@@ -1203,6 +1459,11 @@ impl Store for PostgresStore {
             .store()?;
         tx.execute("DELETE FROM usage_ledger WHERE window_start < $1", &[&b])
             .store()?;
+        tx.execute(
+            "DELETE FROM usage_ledger_units WHERE window_start < $1",
+            &[&b],
+        )
+        .store()?;
         tx.commit().store()?;
         Ok(n1)
     }
@@ -1216,10 +1477,14 @@ impl Store for PostgresStore {
                 "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
             ))
         })?;
-        let n = self
-            .lock()
+        let mut client = self.lock();
+        let mut tx = client.transaction().store()?;
+        let n = tx
             .execute("DELETE FROM usage_metering WHERE bucket=$1", &[&b])
             .store()?;
+        tx.execute("DELETE FROM usage_metering_units WHERE bucket=$1", &[&b])
+            .store()?;
+        tx.commit().store()?;
         Ok(n)
     }
 
@@ -1237,7 +1502,7 @@ impl Store for PostgresStore {
         secret: &CredentialSecret,
     ) -> StoreResult<()> {
         // ATOMIC mint: the bearer key and its credential commit together or not at all.
-        let pools = pools_to_storage(&key.allowed_scopes);
+        let (pools, by_kind) = scopes_to_storage(&key.allowed_scopes);
         let labels = labels_to_storage(&key.labels);
         let created = clamp(key.created_at);
         let expires = key.expires_at.map(clamp);
@@ -1255,17 +1520,21 @@ impl Store for PostgresStore {
         // guard here is simply "the stored row must not be a tombstone".
         let changed = tx.execute(
             "INSERT INTO keys
-                (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10)
+                (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,
+                 idp_subject,binding_mode,minted_by,allowed_scopes_by_kind)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10,$11,$12,$13,$14)
              ON CONFLICT (id) DO UPDATE SET
                 generation_hash=EXCLUDED.generation_hash, name=EXCLUDED.name,
                 allowed_pools=EXCLUDED.allowed_pools, enabled=EXCLUDED.enabled,
                 key_group=EXCLUDED.key_group, labels=EXCLUDED.labels,
-                expires_at=EXCLUDED.expires_at, revision=EXCLUDED.revision
+                expires_at=EXCLUDED.expires_at, revision=EXCLUDED.revision,
+                idp_subject=EXCLUDED.idp_subject, binding_mode=EXCLUDED.binding_mode,
+                minted_by=EXCLUDED.minted_by, allowed_scopes_by_kind=EXCLUDED.allowed_scopes_by_kind
              WHERE keys.deleted_at IS NULL",
             &[
                 &key.id, &key.generation_hash, &key.name, &pools, &key.enabled, &created,
-                &key.group, &labels, &expires, &rev,
+                &key.group, &labels, &expires, &rev, &key.idp_subject, &key.binding_mode,
+                &key.minted_by, &by_kind,
             ],
         )
         .store()?;
@@ -1523,335 +1792,335 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn append_mcp_call(&self, record: &McpCallRecord) -> StoreResult<()> {
-        let body = mcp_call_body(record);
-        let (seq, ts) = (clamp(record.seq), clamp(record.ts));
-        // ON CONFLICT DO NOTHING makes the insert atomic against a concurrent writer. Reading the
-        // incumbent AFTERWARDS is safe without a transaction precisely because this table is never
-        // rewritten: a row that exists cannot change under us, so what we read is what collided.
-        let inserted = self
-            .lock()
-            .execute(
-                "INSERT INTO mcp_calls (principal, seq, ts, prev_hash, hash, body)
-                 VALUES ($1,$2,$3,$4,$5,$6)
-                 ON CONFLICT (principal, seq) DO NOTHING",
-                &[
-                    &record.principal,
-                    &seq,
-                    &ts,
-                    &record.prev_hash,
-                    &record.hash,
-                    &body,
-                ],
-            )
-            .store()?;
-        if inserted == 1 {
-            return Ok(());
-        }
-        let existing = self
-            .lock()
-            .query_opt(
-                "SELECT ts, prev_hash, hash, body FROM mcp_calls WHERE principal = $1 AND seq = $2",
-                &[&record.principal, &seq],
-            )
-            .store()?;
-        if let Some(r) = existing {
-            let (e_ts, e_prev, e_hash, e_body): (i64, String, String, String) =
-                (r.get(0), r.get(1), r.get(2), r.get(3));
-            // BYTE-IDENTICAL is the at-least-once retry and is success. DIFFERENT is a forked or
-            // tampered log and is an error: overwriting would destroy exactly the case worth
-            // reporting, and this store never restates a digest it was handed.
-            if e_ts == ts && e_prev == record.prev_hash && e_hash == record.hash && e_body == body {
-                return Ok(());
-            }
-        }
-        // Names the sequence and nothing else — it must not echo stored (or caller) content back.
-        Err(StoreError(format!(
-            "mcp call log fork: a different record is already persisted at sequence {} for this principal",
-            record.seq
-        )))
-    }
-
-    fn list_mcp_calls(&self, principal: &str) -> StoreResult<Vec<McpCallRecord>> {
-        let sql =
-            format!("SELECT {MCP_CALL_COLUMNS} FROM mcp_calls WHERE principal = $1 ORDER BY seq");
-        let rows = self.lock().query(&sql, &[&principal]).store()?;
-        Ok(rows.iter().map(row_to_mcp_call).collect())
-    }
-
-    fn list_mcp_call_principals(&self) -> StoreResult<Vec<String>> {
-        let rows = self
-            .lock()
-            .query(
-                "SELECT DISTINCT principal FROM mcp_calls ORDER BY principal",
-                &[],
-            )
-            .store()?;
-        Ok(rows.iter().map(|r| r.get(0)).collect())
-    }
-
-    fn purge_mcp_calls_before(&self, before: u64) -> StoreResult<u64> {
-        // STRICTLY less-than, matching the contract's wording: a row exactly at the cutoff is kept.
-        // `execute` returns the rows actually removed, so the count reported is one performed.
-        let removed = self
-            .lock()
-            .execute("DELETE FROM mcp_calls WHERE ts < $1", &[&clamp(before)])
-            .store()?;
-        Ok(removed)
-    }
-
-    fn put_task(&self, task: &TaskRow) -> StoreResult<()> {
-        // REFUSED rather than clamped, which is where this deliberately parts company with the
-        // `clamp` every other u64 in this crate goes through. `clamp` pins a value above i64::MAX to
-        // i64::MAX, so the row read back is NOT the row written — and here the value that silently
-        // changes is the ARTIFACT CURSOR, i.e. how much of a stream has been durably relayed. A
-        // mangled cursor either replays delivered artifacts or skips undelivered ones, and does it
-        // without an error ever having been reported. Postgres has no unsigned BIGINT to store the
-        // full range in (store-mysql's answer), so refusing is the only honest one left.
-        let cursor = as_storable_i64("put_task", "artifact_cursor", task.artifact_cursor)?;
-        let created = as_storable_i64("put_task", "created_at", task.created_at)?;
-        let updated = as_storable_i64("put_task", "updated_at", task.updated_at)?;
-        // UPSERT BY task_id: the engine writes through on EVERY state transition, so a second write
-        // for one task must REPLACE the row, never append a second one for the same id.
-        self.lock()
-            .execute(
-                "INSERT INTO tasks (task_id, context_id, principal, direction, state, agent_id,
-                    artifact_cursor, push_callback, created_at, updated_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-                 ON CONFLICT (task_id) DO UPDATE SET
-                    context_id=EXCLUDED.context_id, principal=EXCLUDED.principal,
-                    direction=EXCLUDED.direction, state=EXCLUDED.state,
-                    agent_id=EXCLUDED.agent_id, artifact_cursor=EXCLUDED.artifact_cursor,
-                    push_callback=EXCLUDED.push_callback, created_at=EXCLUDED.created_at,
-                    updated_at=EXCLUDED.updated_at",
-                &[
-                    &task.task_id,
-                    &task.context_id,
-                    &task.principal,
-                    &task.direction,
-                    &task.state,
-                    &task.agent_id,
-                    &cursor,
-                    &task.push_callback,
-                    &created,
-                    &updated,
-                ],
-            )
-            .store()?;
-        Ok(())
-    }
-
-    fn get_task(&self, task_id: &str) -> StoreResult<Option<TaskRow>> {
-        // No principal filter, deliberately: the contract puts the caller-scoping check ENGINE-side,
-        // because an authorization check living in the backend is one an unauthorized reader
-        // bypasses by configuring a different backend.
-        let sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE task_id = $1");
-        let row = self.lock().query_opt(&sql, &[&task_id]).store()?;
-        Ok(row.as_ref().map(row_to_task))
-    }
-
-    fn list_tasks(&self) -> StoreResult<Vec<TaskRow>> {
-        // UNFILTERED, terminal rows included. The boot rehydrate wants the active rows, the
-        // retention sweep wants the terminal ones and the scoped listing wants one principal's; a
-        // store that pre-filtered for any one of those would break the other two.
-        let sql = format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY task_id");
-        let rows = self.lock().query(&sql, &[]).store()?;
-        Ok(rows.iter().map(row_to_task).collect())
-    }
-
-    fn purge_tasks_before(&self, before: u64) -> StoreResult<u64> {
-        // TERMINAL ONLY, and STRICTLY older than the cutoff — see TERMINAL_TASK_STATES for why the
-        // set is closed and why that is the safe direction.
-        //
-        // The events go with the task, in the SAME TRANSACTION as the parent delete. That cascade is
-        // load-bearing rather than tidiness: `purge_tasks_before` is the ONLY retention method the
-        // contract gives this data, so a purge that left the events behind would leave `task_events`
-        // with no bound anywhere in the trait. It is done here rather than with an ON DELETE CASCADE
-        // foreign key because an FK would also impose a write ORDER the contract never states (see
-        // the `task_events` DDL). One transaction is what makes the pair atomic anyway — a crash
-        // between the two statements cannot leave a task whose chain has been half-swept.
-        let cutoff = clamp(before);
-        let terminal: Vec<&str> = TERMINAL_TASK_STATES.to_vec();
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
-        tx.execute(
-            "DELETE FROM task_events te USING tasks t
-             WHERE te.task_id = t.task_id AND t.updated_at < $1 AND t.state = ANY($2)",
-            &[&cutoff, &terminal],
-        )
-        .store()?;
-        // `execute` returns the rows this statement actually removed, so the count reported is one
-        // performed, never an estimate.
-        let removed = tx
-            .execute(
-                "DELETE FROM tasks WHERE updated_at < $1 AND state = ANY($2)",
-                &[&cutoff, &terminal],
-            )
-            .store()?;
-        tx.commit().store()?;
-        Ok(removed)
-    }
-
-    fn append_task_event(&self, event: &TaskEventRow) -> StoreResult<()> {
-        let seq = as_storable_i64("append_task_event", "seq", event.seq)?;
-        let ts = as_storable_i64("append_task_event", "ts", event.ts)?;
-        // UPSERT ON (task_id, seq), and this is where the task-event contract genuinely DIFFERS from
-        // `append_mcp_call`'s: that one treats an occupied slot holding a DIFFERENT record as a fork
-        // and refuses it, while this one is specified to upsert so the engine's write-through is
-        // idempotent on replay — "rejecting or duplicating a replayed `seq` breaks the chain the
-        // engine will verify on read". Copying the call log's fork check here would be wrong in a
-        // way that looks right, so it is stated rather than left to be inferred from the SQL.
-        //
-        // The digests ride through verbatim: this store never computes or recomputes one, because a
-        // digest a store could recompute is a digest a compromised store could forge consistently.
-        self.lock()
-            .execute(
-                "INSERT INTO task_events (task_id, seq, ts, kind, context_id, principal, agent_id,
-                    state, request_id, prev_hash, hash)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-                 ON CONFLICT (task_id, seq) DO UPDATE SET
-                    ts=EXCLUDED.ts, kind=EXCLUDED.kind, context_id=EXCLUDED.context_id,
-                    principal=EXCLUDED.principal, agent_id=EXCLUDED.agent_id,
-                    state=EXCLUDED.state, request_id=EXCLUDED.request_id,
-                    prev_hash=EXCLUDED.prev_hash, hash=EXCLUDED.hash",
-                &[
-                    &event.task_id,
-                    &seq,
-                    &ts,
-                    &event.kind,
-                    &event.context_id,
-                    &event.principal,
-                    &event.agent_id,
-                    &event.state,
-                    &event.request_id,
-                    &event.prev_hash,
-                    &event.hash,
-                ],
-            )
-            .store()?;
-        Ok(())
-    }
-
-    fn list_task_events(&self, task_id: &str) -> StoreResult<Vec<TaskEventRow>> {
-        // Oldest-first by seq — the order the engine's chain verifier reads — and the scope is the
-        // one task, because the chain is per-task.
-        let sql =
-            format!("SELECT {TASK_EVENT_COLUMNS} FROM task_events WHERE task_id = $1 ORDER BY seq");
-        let rows = self.lock().query(&sql, &[&task_id]).store()?;
-        Ok(rows.iter().map(row_to_task_event).collect())
-    }
-
     fn list_denylist(&self) -> StoreResult<Vec<String>> {
         let rows = self.lock().query("SELECT sub FROM denylist", &[]).store()?;
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    fn put_mcp_demotion(&self, row: &McpDemotionRow) -> StoreResult<()> {
-        // Refused rather than clamped, on the same reasoning `put_task` gives: `clamp` would pin a
-        // value above i64::MAX to i64::MAX and the row read back would not be the row written, with
-        // no error ever reported.
-        let recorded = as_storable_i64("put_mcp_demotion", "recorded_at", row.recorded_at)?;
-        // UPSERT BY server, as the trait requires: a second demotion of one upstream REPLACES the
-        // row rather than appending a rival one, so the boot read cannot come back holding two
-        // answers about one server.
+    // ── THE KIND-TAGGED PLANE-RECORD VERBS (busbar 1.6.0) ────────────────────────────────────
+    //
+    // Generic over `kind`: this store names no plane and decodes no body. An UPSERTED record lives
+    // in `plane_records` keyed `(kind, id)`; an APPENDED one in `plane_chain` keyed
+    // `(kind, parent, seq)`. Identity, ordering and retention read only the typed sidecar columns.
+
+    fn upsert_plane_record(&self, record: &PlaneRecord) -> StoreResult<()> {
+        // REFUSED rather than clamped: `clamp` pins a value above i64::MAX, so the row read back
+        // would not be the row written and nothing would ever report it.
+        let seq = as_storable_i64("upsert_plane_record", "seq", record.seq)?;
+        let ts = as_storable_i64("upsert_plane_record", "ts", record.ts)?;
+        // UPSERT BY (kind, id): the engine writes through on EVERY transition, so a second write
+        // for one id REPLACES the row — the sidecar columns included, which is how a terminal
+        // transition reaches the retention sweep and the liveness check.
         self.lock()
             .execute(
-                "INSERT INTO mcp_demotions (server, reason, recorded_at) VALUES ($1,$2,$3)
-                 ON CONFLICT (server) DO UPDATE SET
-                    reason=EXCLUDED.reason, recorded_at=EXCLUDED.recorded_at",
-                &[&row.server, &row.reason, &recorded],
+                "INSERT INTO plane_records (kind, id, parent, seq, ts, disposition, body)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7)
+                 ON CONFLICT (kind, id) DO UPDATE SET
+                    parent=EXCLUDED.parent, seq=EXCLUDED.seq, ts=EXCLUDED.ts,
+                    disposition=EXCLUDED.disposition, body=EXCLUDED.body",
+                &[
+                    &record.kind,
+                    &record.id,
+                    &record.parent,
+                    &seq,
+                    &ts,
+                    &disposition_to_storage(record.disposition),
+                    &record.body,
+                ],
             )
             .store()?;
         Ok(())
     }
 
-    fn list_mcp_demotions(&self) -> StoreResult<Vec<McpDemotionRow>> {
-        // The boot read that puts a demotion back in force before the first request is served. An
-        // EMPTY answer means "no upstream is recorded as demoted" and never "we could not tell" — a
-        // read failure surfaces as an Err, because a server with no row is a server nobody demoted,
-        // which is a different fact from a server that drifted, and conflating them would quarantine
-        // every declaratively-approved deployment at boot.
-        let rows = self
+    fn get_plane_record(&self, kind: &str, id: &str) -> StoreResult<Option<Vec<u8>>> {
+        // No principal filter, deliberately: caller scoping is ENGINE-side, because an
+        // authorization check living in the backend is one an unauthorized reader bypasses by
+        // configuring a different backend.
+        let row = self
             .lock()
-            .query(
-                "SELECT server, reason, recorded_at FROM mcp_demotions ORDER BY server",
-                &[],
+            .query_opt(
+                "SELECT body FROM plane_records WHERE kind=$1 AND id=$2",
+                &[&kind, &id],
             )
             .store()?;
-        Ok(rows
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    fn append_plane_record(&self, record: &PlaneRecord) -> StoreResult<()> {
+        let seq = as_storable_i64("append_plane_record", "seq", record.seq)?;
+        let ts = as_storable_i64("append_plane_record", "ts", record.ts)?;
+        // The chain a child record hangs off: its parent, or (a parentless append) its own id —
+        // the same identity busbar's reference backends key a chain by.
+        let parent = record.parent.as_deref().unwrap_or(record.id.as_str());
+        let disposition = disposition_to_storage(record.disposition);
+        // APPEND-ONLY, never an overwrite. A record arriving on an occupied (kind, parent, seq) is
+        // settled by comparing the two, the same way `append_audit` settles a duplicate seq:
+        // IDENTICAL is the write-through retrying after a timeout (Ok, the common case), DIFFERENT
+        // is a forked or tampered chain (an error — overwriting would destroy exactly the case
+        // worth reporting, and this store never restates a digest it was handed).
+        //
+        // The INSERT and the read-back share ONE transaction and the read takes `FOR SHARE`, so the
+        // conflicting row cannot be purged out from under the comparison; the bounded loop covers
+        // the row vanishing before the share lock lands (the position is then free, so insert). No
+        // path returns Ok without the record being stored.
+        const MAX_ATTEMPTS: u32 = 3;
+        for _ in 0..MAX_ATTEMPTS {
+            let mut client = self.lock();
+            let mut tx = client.transaction().store()?;
+            let inserted = tx
+                .execute(
+                    "INSERT INTO plane_chain (kind, parent, seq, id, ts, disposition, body)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7)
+                     ON CONFLICT (kind, parent, seq) DO NOTHING",
+                    &[
+                        &record.kind,
+                        &parent,
+                        &seq,
+                        &record.id,
+                        &ts,
+                        &disposition,
+                        &record.body,
+                    ],
+                )
+                .store()?;
+            if inserted == 1 {
+                tx.commit().store()?;
+                return Ok(());
+            }
+            let stored = tx
+                .query_opt(
+                    "SELECT id, ts, disposition, body FROM plane_chain
+                     WHERE kind=$1 AND parent=$2 AND seq=$3 FOR SHARE",
+                    &[&record.kind, &parent, &seq],
+                )
+                .store()?;
+            match stored {
+                Some(r) => {
+                    let identical = r.get::<_, String>(0) == record.id
+                        && r.get::<_, i64>(1) == ts
+                        && r.get::<_, String>(2) == disposition
+                        && r.get::<_, Vec<u8>>(3) == record.body;
+                    if identical {
+                        tx.commit().store()?;
+                        return Ok(());
+                    }
+                    // Names the position and nothing else — it must not echo stored (or caller)
+                    // content back.
+                    return Err(StoreError(format!(
+                        "append_plane_record: kind '{}' parent '{}' seq {} is already occupied by \
+                         another record; the chain has forked",
+                        record.kind, parent, record.seq
+                    )));
+                }
+                None => drop(tx),
+            }
+        }
+        Err(StoreError(format!(
+            "append_plane_record: kind '{}' seq {} kept being freed between the insert and the \
+             read-back after {MAX_ATTEMPTS} attempts; something is deleting chain rows \
+             concurrently and the record was NOT stored",
+            record.kind, record.seq
+        )))
+    }
+
+    fn list_plane_records(
+        &self,
+        kind: &str,
+        selector: &PlaneSelector,
+    ) -> StoreResult<Vec<Vec<u8>>> {
+        let mut client = self.lock();
+        // One snapshot across both tables.
+        let mut tx = Self::snapshot_consistent_tx(&mut client)?;
+        let (records, chain) = match selector {
+            PlaneSelector::All => (
+                tx.query(
+                    "SELECT body FROM plane_records WHERE kind=$1 ORDER BY seq, id",
+                    &[&kind],
+                )
+                .store()?,
+                tx.query(
+                    "SELECT body FROM plane_chain WHERE kind=$1 ORDER BY parent, seq",
+                    &[&kind],
+                )
+                .store()?,
+            ),
+            // Oldest-first by seq — the order the engine's chain verifier reads a parent's chain.
+            PlaneSelector::Parent(p) => (
+                tx.query(
+                    "SELECT body FROM plane_records WHERE kind=$1 AND parent=$2 ORDER BY seq, id",
+                    &[&kind, p],
+                )
+                .store()?,
+                tx.query(
+                    "SELECT body FROM plane_chain WHERE kind=$1 AND parent=$2 ORDER BY seq",
+                    &[&kind, p],
+                )
+                .store()?,
+            ),
+        };
+        tx.commit().store()?;
+        Ok(records
             .iter()
-            .map(|r| McpDemotionRow {
-                server: r.get(0),
-                reason: r.get(1),
-                recorded_at: read_u64(r.get::<_, i64>(2)),
-            })
+            .chain(chain.iter())
+            .map(|r| r.get::<_, Vec<u8>>(0))
             .collect())
     }
 
-    fn clear_mcp_demotion(&self, server: &str) -> StoreResult<()> {
-        // Removing a row that is not there is a NO-OP, not an error: the engine clears on every
-        // observation that agrees with the operator's approval rather than tracking whether it had
-        // demoted, so the overwhelmingly common call is one against no row at all.
-        self.lock()
-            .execute("DELETE FROM mcp_demotions WHERE server = $1", &[&server])
+    fn list_plane_record_parents(&self, kind: &str) -> StoreResult<Vec<String>> {
+        // The boot enumeration a restart resumes chains from: every parent holding a record of
+        // `kind`, each exactly once.
+        let rows = self
+            .lock()
+            .query(
+                "SELECT parent FROM plane_chain WHERE kind=$1
+                 UNION
+                 SELECT parent FROM plane_records WHERE kind=$1 AND parent IS NOT NULL
+                 ORDER BY 1",
+                &[&kind],
+            )
             .store()?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    fn purge_plane_records_before(&self, kind: &str, before: u64) -> StoreResult<u64> {
+        // STRICTLY older than the cutoff: a row exactly at `before` is kept. WHICH rows go is the
+        // kind's own contract, read off the typed `disposition` column and never out of the body —
+        // see TERMINAL_ONLY_RETENTION_KINDS.
+        let cutoff = clamp(before);
+        let terminal_only = TERMINAL_ONLY_RETENTION_KINDS.contains(&kind);
+        let mut client = self.lock();
+        let mut tx = client.transaction().store()?;
+        let purged: Vec<String> = tx
+            .query(
+                "DELETE FROM plane_records
+                 WHERE kind=$1 AND ts < $2 AND (NOT $3 OR disposition = 'terminal')
+                 RETURNING id",
+                &[&kind, &cutoff, &terminal_only],
+            )
+            .store()?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        let chain = tx
+            .execute(
+                "DELETE FROM plane_chain WHERE kind=$1 AND ts < $2",
+                &[&kind, &cutoff],
+            )
+            .store()?;
+        // CASCADE, in the SAME transaction: a purged parent's child chain goes with it, and only
+        // the chains under a record that actually went — so this can never be a second, wider
+        // retention rule in disguise.
+        if !purged.is_empty() {
+            for (_, child) in PLANE_CHILD_KINDS.iter().filter(|(p, _)| *p == kind) {
+                tx.execute(
+                    "DELETE FROM plane_chain WHERE kind=$1 AND parent = ANY($2)",
+                    &[child, &purged],
+                )
+                .store()?;
+            }
+        }
+        tx.commit().store()?;
+        // `execute`/`RETURNING` report the rows actually removed, so the count is one performed.
+        Ok(purged.len() as u64 + chain)
+    }
+
+    fn delete_plane_record(&self, kind: &str, id: &str) -> StoreResult<()> {
+        // Absent is a NO-OP, not an error: the engine clears on every observation that agrees with
+        // the operator rather than tracking whether it had written one. A chain whose parent is
+        // `id` goes too, so deleting a record cannot leave part of its chain behind.
+        let mut client = self.lock();
+        let mut tx = client.transaction().store()?;
+        tx.execute(
+            "DELETE FROM plane_records WHERE kind=$1 AND id=$2",
+            &[&kind, &id],
+        )
+        .store()?;
+        tx.execute(
+            "DELETE FROM plane_chain WHERE kind=$1 AND parent=$2",
+            &[&kind, &id],
+        )
+        .store()?;
+        tx.commit().store()?;
         Ok(())
     }
 
-    fn redeem_ask_state(&self, nonce: &str, expires_at: u64, now: u64) -> StoreResult<bool> {
+    fn redeem_plane_token(
+        &self,
+        kind: &str,
+        token: &str,
+        expires_at: u64,
+        now: u64,
+    ) -> StoreResult<bool> {
         // REFUSED rather than clamped, and this is the sharpest instance of that choice in the
-        // crate. `clamp` pins a `u64` above i64::MAX to i64::MAX; a `now` clamped that way would
-        // sweep the ENTIRE ledger below and then report the insert as a first redemption — i.e. one
-        // out-of-range argument would silently reopen every spent approval in the deployment. The
-        // engine's call site turns a store error into a REFUSED redemption, so an error is the
-        // direction to fail in, and a clamp is the direction that must never be taken here.
-        let expires = as_storable_i64("redeem_ask_state", "expires_at", expires_at)?;
-        let cutoff = as_storable_i64("redeem_ask_state", "now", now)?;
-
+        // crate: a `now` clamped to i64::MAX would sweep the kind's ENTIRE ledger below and then
+        // report the insert as a first redemption — one out-of-range argument silently reopening
+        // every spent token. An error is refused by the engine, so it is the direction to fail in.
+        let expires = as_storable_i64("redeem_plane_token", "expires_at", expires_at)?;
+        let cutoff = as_storable_i64("redeem_plane_token", "now", now)?;
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
-        // The eviction sweep the redemption carries, so the table is bounded by one approval-validity
-        // window rather than growing forever: an entry recording an approval that can no longer be
-        // opened protects nothing. STRICTLY less-than, so an entry expiring exactly at `now` is kept
-        // — the same boundary convention every retention method in this crate uses. It runs BEFORE
-        // the insert, matching the reference implementation: sweeping afterwards could delete the
-        // row this very call just recorded.
+        // The eviction sweep the redemption carries, bounding the ledger by one validity window: an
+        // entry recording a token that can no longer be presented protects nothing. STRICTLY
+        // less-than (an entry expiring exactly at `now` is kept), and BEFORE the insert, so it can
+        // never delete the row this very call records.
         tx.execute(
-            "DELETE FROM spent_ask_states WHERE expires_at < $1",
-            &[&cutoff],
+            "DELETE FROM plane_tokens WHERE kind=$1 AND expires_at < $2",
+            &[&kind, &cutoff],
         )
         .store()?;
-        // THE TEST AND SET, as ONE statement. `execute` returns the rows this INSERT actually wrote,
-        // so 1 means THIS call is the one that recorded the redemption and 0 means the row was
-        // already there. Reading the table and then writing it would tell BOTH halves of a race they
-        // were first — two nodes behind a load balancer, or two requests to one node — and that is
-        // precisely the shape this method is specified not to have.
+        // THE TEST AND SET, as ONE statement: `execute` returns the rows this INSERT wrote, so 1
+        // means THIS call recorded the redemption and 0 means it was already there. A read then a
+        // write would tell BOTH halves of a race — two nodes, or two requests to one — they were
+        // first.
         let inserted = tx
             .execute(
-                "INSERT INTO spent_ask_states (nonce, expires_at) VALUES ($1,$2)
-                 ON CONFLICT (nonce) DO NOTHING",
-                &[&nonce, &expires],
+                "INSERT INTO plane_tokens (kind, token, expires_at) VALUES ($1,$2,$3)
+                 ON CONFLICT (kind, token) DO NOTHING",
+                &[&kind, &token, &expires],
             )
             .store()?;
         tx.commit().store()?;
         Ok(inserted == 1)
     }
+
+    fn plane_token_live(
+        &self,
+        kind: &str,
+        token: &str,
+        expires_at: u64,
+        now: u64,
+    ) -> StoreResult<bool> {
+        // MULTI-use and SPENDS NOTHING: a plain read of the `(kind, token)` upserted record. Live
+        // only while the record is present AND its disposition is still Active AND `now` has not
+        // passed `expires_at`; a missing record, a terminal one and a lapsed deadline each answer
+        // false. Asking twice answers the same twice.
+        if now > expires_at {
+            return Ok(false);
+        }
+        let row = self
+            .lock()
+            .query_opt(
+                "SELECT disposition FROM plane_records WHERE kind=$1 AND id=$2",
+                &[&kind, &token],
+            )
+            .store()?;
+        Ok(row.is_some_and(|r| r.get::<_, &str>(0) == "active"))
+    }
 }
 
 const AUDIT_COLUMNS: &str = "seq, ts, action, resource, outcome, principal, prev_hash, hash";
 
-const MCP_CALL_COLUMNS: &str = "principal, seq, ts, prev_hash, hash, body";
-
-const TASK_COLUMNS: &str = "task_id, context_id, principal, direction, state, agent_id, \
-                            artifact_cursor, push_callback, created_at, updated_at";
-
-const TASK_EVENT_COLUMNS: &str = "task_id, seq, ts, kind, context_id, principal, agent_id, state, \
-                                  request_id, prev_hash, hash";
+fn disposition_to_storage(d: PlaneDisposition) -> &'static str {
+    match d {
+        PlaneDisposition::Active => "active",
+        PlaneDisposition::Terminal => "terminal",
+    }
+}
 
 /// Reject a `u64` a signed BIGINT cannot hold, naming the method and the field. The crate-wide
 /// `clamp` would pin it to `i64::MAX` instead, so the row read back would not be the row written and
-/// nothing would ever have reported an error — see `put_task` for why that is unacceptable on this
-/// particular surface and tolerable on the counters `clamp` still serves.
+/// nothing would ever have reported an error — tolerable on the counters `clamp` still serves, not on
+/// a plane record's chain position or a token ledger's clock.
 fn as_storable_i64(method: &str, field: &str, v: u64) -> StoreResult<i64> {
     i64::try_from(v).map_err(|_| {
         StoreError(format!(
@@ -1859,81 +2128,6 @@ fn as_storable_i64(method: &str, field: &str, v: u64) -> StoreResult<i64> {
              that would not read back as itself"
         ))
     })
-}
-
-fn row_to_task(r: &Row) -> TaskRow {
-    TaskRow {
-        task_id: r.get(0),
-        context_id: r.get(1),
-        principal: r.get(2),
-        direction: r.get(3),
-        state: r.get(4),
-        agent_id: r.get(5),
-        artifact_cursor: read_u64(r.get::<_, i64>(6)),
-        push_callback: r.get(7),
-        created_at: read_u64(r.get::<_, i64>(8)),
-        updated_at: read_u64(r.get::<_, i64>(9)),
-    }
-}
-
-fn row_to_task_event(r: &Row) -> TaskEventRow {
-    TaskEventRow {
-        task_id: r.get(0),
-        seq: read_u64(r.get::<_, i64>(1)),
-        ts: read_u64(r.get::<_, i64>(2)),
-        kind: r.get(3),
-        context_id: r.get(4),
-        principal: r.get(5),
-        agent_id: r.get(6),
-        state: r.get(7),
-        request_id: r.get(8),
-        prev_hash: r.get(9),
-        hash: r.get(10),
-    }
-}
-
-/// The non-indexed payload of a call record, as stored in `mcp_calls.body`. `principal`, `seq`,
-/// `ts`, `prev_hash` and `hash` are deliberately NOT duplicated here: they are real columns, and a
-/// value stored in two places is a value that can disagree with itself. `serde_json`'s object keys
-/// are ordered, so this encoding is deterministic — which is what makes the byte comparison in
-/// `append_mcp_call`'s replay check meaningful.
-fn mcp_call_body(record: &McpCallRecord) -> String {
-    serde_json::json!({
-        "server": record.server,
-        "tool": record.tool,
-        "outcome": record.outcome,
-        "reason": record.reason,
-        "tool_digest": record.tool_digest,
-        "pin_generation": record.pin_generation,
-        "request_id": record.request_id,
-    })
-    .to_string()
-}
-
-/// Rebuild a record from its columns plus its opaque body. The CHAIN comes from the columns, which
-/// is the point of their being columns: what the engine verifies is what the database holds in a
-/// field it can constrain, not a value recovered by decoding a payload.
-fn row_to_mcp_call(r: &Row) -> McpCallRecord {
-    let body: String = r.get(5);
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
-    let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-    McpCallRecord {
-        principal: r.get(0),
-        seq: r.get::<_, i64>(1) as u64,
-        ts: r.get::<_, i64>(2) as u64,
-        prev_hash: r.get(3),
-        hash: r.get(4),
-        server: s("server"),
-        tool: s("tool"),
-        outcome: s("outcome"),
-        reason: s("reason"),
-        tool_digest: s("tool_digest"),
-        pin_generation: v
-            .get("pin_generation")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0),
-        request_id: s("request_id"),
-    }
 }
 
 fn row_to_audit(r: &Row) -> AuditRecord {
@@ -1959,6 +2153,38 @@ impl PostgresStore {
     fn put_credential_tx(tx: &mut Transaction<'_>, secret: &CredentialSecret) -> StoreResult<()> {
         let m = &secret.meta;
         let rev = Self::next_revision(tx)?;
+        // The owning key must EXIST and be LIVE (`put_credential`'s precondition, pinned by the
+        // conformance suite). `delete_key` cascades a key's credentials away precisely so the
+        // secret material stops resolving; accepting a mint afterwards puts it back under a key an
+        // operator just revoked. Checked AFTER `next_revision`, and that ordering is what makes it
+        // atomic rather than a read-then-write: every mutating transaction (delete_key included)
+        // takes the single `store_revision` row lock first and holds it to commit, so a concurrent
+        // `delete_key` has either fully committed before this read — which then sees the tombstone
+        // — or cannot start its cascade until this mint has committed, and then removes it.
+        let owner_live: Option<bool> = tx
+            .query_opt(
+                "SELECT deleted_at IS NULL FROM keys WHERE id=$1",
+                &[&m.key_id],
+            )
+            .store()?
+            .map(|r| r.get(0));
+        match owner_live {
+            None => {
+                return Err(StoreError(format!(
+                    "put_credential: owning key '{}' does not exist; refusing a credential that \
+                     hangs off nothing",
+                    m.key_id
+                )))
+            }
+            Some(false) => {
+                return Err(StoreError(format!(
+                    "put_credential: owning key '{}' is tombstoned; refusing to mint a credential \
+                     under a revoked key",
+                    m.key_id
+                )))
+            }
+            Some(true) => {}
+        }
         let form = secret_form_to_storage(m.secret_form);
         let secret_val = if m.secret_form == SecretForm::None {
             None

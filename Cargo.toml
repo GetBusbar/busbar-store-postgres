@@ -2,8 +2,8 @@
 #
 # This repo brings 100% of what it needs: the real Postgres store logic (store-postgres) and the thin
 # dlopen ABI adapter that packages it as a busbar plugin (store-postgres-plugin) both live here, as a
-# same-repo Cargo workspace — not split across this repo and busbarAI. Only busbar-api/busbar-plugin-sdk
-# (and, for the adapter's dev-dependencies, busbar-plugin-loader) still reach into a sibling busbarAI
+# same-repo Cargo workspace — not split across this repo and busbar. Only busbar-api/busbar-plugin-sdk
+# (and, for the adapter's dev-dependencies, busbar-plugin-loader) still reach into a sibling busbar
 # checkout, since those are core-engine contracts every plugin depends on the same way.
 [workspace]
 resolver = "2"

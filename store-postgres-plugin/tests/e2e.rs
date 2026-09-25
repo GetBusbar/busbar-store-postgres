@@ -299,7 +299,7 @@ fn set_referenced_secret_envs(cmd: &mut Command, config_text: &str) {
 }
 
 /// The sibling busbar checkout's root (same convention this repo already uses for its path deps).
-fn busbarai_root() -> PathBuf {
+fn busbar_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../busbar")
         .canonicalize()
@@ -310,27 +310,40 @@ fn busbarai_root() -> PathBuf {
 /// `busbar-plugin-pack` binary, both from the sibling busbar checkout — never a fixture, never a
 /// stub, the exact binaries a real release ships.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
-    let root = busbarai_root();
-    let status = Command::new("cargo")
-        .args([
+    let root = busbar_root();
+    // busbar 1.6.0 folded `busbar-plugin-pack` into `busbar-plugin-sdk` as a feature-gated [[bin]]
+    // (the same build line busbar's own plugin-ci.yml uses). Two invocations, because `--features`
+    // applies to the one package it names.
+    for args in [
+        &["build", "--release", "-p", "busbar", "--bin", "busbar"][..],
+        &[
             "build",
             "--release",
             "-p",
-            "busbar",
-            "-p",
+            "busbar-plugin-sdk",
+            "--features",
+            "pack",
+            "--bin",
             "busbar-plugin-pack",
-        ])
-        .current_dir(&root)
-        .status()
-        .expect("run cargo build for busbar + busbar-plugin-pack");
-    assert!(
-        status.success(),
-        "building the real busbar + busbar-plugin-pack binaries must succeed"
-    );
-    (
-        root.join("target/release/busbar"),
-        root.join("target/release/busbar-plugin-pack"),
-    )
+        ][..],
+    ] {
+        let status = Command::new("cargo")
+            .args(args)
+            .current_dir(&root)
+            .status()
+            .expect("run cargo build for busbar + busbar-plugin-pack");
+        assert!(
+            status.success(),
+            "building the real busbar + busbar-plugin-pack binaries must succeed ({args:?})"
+        );
+    }
+    // The nested `cargo build` inherits this process's environment, so a CARGO_TARGET_DIR set for
+    // the test run redirects THAT build too; look where it actually put the binaries.
+    let release = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target"))
+        .join("release");
+    (release.join("busbar"), release.join("busbar-plugin-pack"))
 }
 
 /// THE REAL END-TO-END INSTALL PROOF: pack the plugin, drop it in a real `plugins.dir`, run the real
@@ -592,35 +605,36 @@ fn refuses_non_plugin() {
     assert!(err.contains("failed to load plugin"), "got: {err}");
 }
 
-/// THE DURABILITY PROOF FOR THE FOUR MCP CALL-LOG METHODS, OVER THE REAL PLUGIN PATH.
+/// Serialize a stand-in plane-record body. The store never decodes a body, so the shape only has to
+/// be something THIS test can decode again on the way back.
+fn plane_body(v: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&v).expect("serialize a stand-in body")
+}
+
+fn plane_decode(b: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(b).expect("a body this test wrote decodes")
+}
+
+/// THE DURABILITY PROOF FOR THE `call` PLANE KIND (the MCP call log), OVER THE REAL PLUGIN PATH.
 ///
-/// This repo ships `feat/durable-mcp-call-log` — `append_mcp_call`/`list_mcp_calls`/
-/// `list_mcp_call_principals`/`purge_mcp_calls_before` against a real Postgres. Every existing test
-/// of those four calls `PostgresStore` DIRECTLY, in-process, and NONE of them can see the failure
-/// that actually matters in production, because in production this backend is ONLY ever reached as a
-/// plugin: conformance boots the in-process RAM store, so the plugin seam is the only path a real
-/// deployment takes and was, until this test, the one path with zero coverage of these methods.
-///
-/// `busbar_api::Store` DEFAULTS all ten task/call-log methods to accept-and-keep-nothing. A plugin
-/// seam that does not RELAY them silently substitutes those defaults: every `append_mcp_call`
-/// returns `Ok`, every `list_mcp_calls` answers empty, and a deployment loses every tool-call record
-/// while reporting success. That is not hypothetical — the ABI once carried four store methods while
-/// the trait carried ten, so exactly this happened. A unit test passing while the ABI drops every
-/// write is the precise shape this test exists to make impossible.
+/// busbar 1.6.0 replaced the four protocol-named call-log methods with the kind-tagged plane-record
+/// verbs, and every one of those verbs DEFAULTS to accept-and-keep-nothing. A plugin seam that does
+/// not RELAY them silently substitutes those defaults: every append returns `Ok`, every listing
+/// answers empty, and a deployment loses every tool-call record while reporting success. That is not
+/// hypothetical — the ABI once carried four store methods while the trait carried ten, so exactly
+/// this happened. Every in-process test of `PostgresStore` is blind to it, because in production this
+/// backend is ONLY ever reached as a plugin.
 ///
 /// So it goes through `busbar_plugin_loader::load_store`: a REAL `dlopen` of the built cdylib, the
 /// real C ABI, the real `DynStore`. It writes AT ARITY > 1 (three chained records for one principal
 /// and one for a second), DROPS the handle — which runs `busbar_close` and UNLOADS the library, so
 /// nothing this process still holds can answer the reads — then `dlopen`s AGAIN over the same file
-/// and reads everything back. A restart is what proves durability; a single-row same-session round
-/// trip would not distinguish a relayed method from a lucky trait default, and a multi-row one
-/// across an unload/reload cannot be faked by either.
-///
-/// A third leg reads the same rows through the plain `PostgresStore`, never touching the cdylib, the
-/// C ABI or the loader — so a plugin that answered from its own in-process cache still fails here.
+/// and reads everything back. A third leg reads the same rows through the plain `PostgresStore`,
+/// never touching the cdylib, the C ABI or the loader — so a plugin that answered from its own
+/// in-process cache still fails here.
 #[test]
 fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_api::{McpCallRecord, Store};
+    use busbar_api::{PlaneDisposition, PlaneRecord, PlaneSelector, Store};
 
     let path = plugin_path();
     let Some(url) = postgres_url() else {
@@ -628,17 +642,17 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
     let cfg = cfg(&url);
 
-    // Start from an EMPTY call log. `list_mcp_call_principals` and `purge_mcp_calls_before` are
-    // GLOBAL, not per-principal, so against a re-used database a leftover chain from an earlier run
-    // would make both of their exact assertions below meaningless. `purge_mcp_calls_before(MAX)` is
-    // the store's own contract-level wipe, so this needs no raw-SQL knowledge of the schema. No
-    // other test in this file touches `mcp_calls`.
+    // Start from an EMPTY call log. The parent enumeration and the purge are GLOBAL per kind, so
+    // against a re-used database a leftover chain from an earlier run would make their exact
+    // assertions below meaningless. A purge at the top of the range is the store's own
+    // contract-level wipe, so this needs no raw-SQL knowledge of the schema. No other test in this
+    // binary touches the `call` kind.
     let direct = PostgresStore::connect(&url).expect("connect directly to clean up and verify");
-    Store::purge_mcp_calls_before(&direct, u64::MAX).expect("wipe the call log before this run");
+    Store::purge_plane_records_before(&direct, "call", i64::MAX as u64)
+        .expect("wipe the call log before this run");
 
     // Per-run principal ids: a read that only THIS run's writes can answer. Two of them, because one
-    // principal's chain leaking into another's is a real defect class and a single-principal test is
-    // blind to it.
+    // principal's chain leaking into another's is a real defect class.
     let stamp = format!(
         "{}_{}",
         std::process::id(),
@@ -650,19 +664,34 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let p_main = format!("vk_abi_main_{stamp}");
     let p_other = format!("vk_abi_other_{stamp}");
 
-    let call = |principal: &str, seq: u64, prev: &str, hash: &str| McpCallRecord {
-        principal: principal.to_string(),
+    let call = |principal: &str, seq: u64, prev: &str, hash: &str| PlaneRecord {
+        kind: "call".into(),
+        id: principal.into(),
+        parent: Some(principal.into()),
         seq,
         ts: 2_000 + seq,
-        server: "srv".to_string(),
-        tool: "srv_read_file".to_string(),
-        outcome: "dispatched".to_string(),
-        reason: String::new(),
-        tool_digest: format!("sha256:tool{seq}"),
-        pin_generation: 3,
-        request_id: format!("req-{seq}"),
-        prev_hash: prev.to_string(),
-        hash: hash.to_string(),
+        disposition: PlaneDisposition::Active,
+        body: plane_body(serde_json::json!({
+            "seq": seq,
+            "prev_hash": prev,
+            "hash": hash,
+            "content": {
+                "server": "srv",
+                "tool": "srv_read_file",
+                "outcome": "dispatched",
+                "tool_digest": format!("sha256:tool{seq}"),
+                "pin_generation": 3,
+                "request_id": format!("req-{seq}"),
+            },
+        })),
+    };
+    let chain = |store: &dyn Store, principal: &str| -> Vec<serde_json::Value> {
+        store
+            .list_plane_records("call", &PlaneSelector::Parent(principal.to_string()))
+            .expect("list_plane_records over the ABI")
+            .iter()
+            .map(|b| plane_decode(b))
+            .collect()
     };
 
     {
@@ -671,12 +700,12 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
             .expect("the postgres plugin must load over the real ABI");
         for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
             store
-                .append_mcp_call(&call(&p_main, seq, prev, hash))
-                .expect("append_mcp_call over the ABI");
+                .append_plane_record(&call(&p_main, seq, prev, hash))
+                .expect("append_plane_record over the ABI");
         }
         store
-            .append_mcp_call(&call(&p_other, 1, "", "o1"))
-            .expect("append_mcp_call over the ABI");
+            .append_plane_record(&call(&p_other, 1, "", "o1"))
+            .expect("append_plane_record over the ABI");
         // Dropping the boxed store drops the loader's `Library` handle: `busbar_close` runs and the
         // dylib is UNLOADED. Nothing this process still holds can be answering the reads below.
         drop(store);
@@ -687,9 +716,12 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let store = busbar_plugin_loader::load_store(&path, &cfg)
         .expect("the postgres plugin must load again over the real ABI");
 
-    let calls = store.list_mcp_calls(&p_main).expect("list_mcp_calls");
+    let calls = chain(store.as_ref(), &p_main);
     assert_eq!(
-        calls.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        calls
+            .iter()
+            .map(|c| c["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
         vec![1, 2, 3],
         "the per-principal call chain must survive the unload/reload over the plugin ABI in chain \
          order; got {} record(s) back, which is the accept-and-keep-nothing shape of the trait \
@@ -698,31 +730,36 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     );
     for w in calls.windows(2) {
         assert_eq!(
-            w[1].prev_hash, w[0].hash,
-            "the chain must still link after the reload: seq {} carries prev_hash {:?} but seq {} \
-             persisted hash {:?}",
-            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
+            w[1]["prev_hash"], w[0]["hash"],
+            "the chain must still link after the reload"
         );
     }
-    // Every non-indexed field rides the `body` column; a relay that dropped it would still satisfy a
-    // seq-only check.
-    assert_eq!(calls[2].tool_digest, "sha256:tool3");
-    assert_eq!(calls[2].request_id, "req-3");
-    assert_eq!(calls[2].tool, "srv_read_file");
-    assert_eq!(calls[2].outcome, "dispatched");
-    assert_eq!(calls[1].pin_generation, 3);
+    // The whole opaque body rides the seam; a relay that dropped it would still satisfy a seq check.
+    assert_eq!(calls[2]["content"]["tool_digest"], "sha256:tool3");
+    assert_eq!(calls[2]["content"]["request_id"], "req-3");
+    assert_eq!(calls[2]["content"]["outcome"], "dispatched");
+    assert_eq!(calls[1]["content"]["pin_generation"], 3);
     assert_eq!(
-        store
-            .list_mcp_calls(&p_other)
-            .expect("list_mcp_calls")
-            .len(),
+        chain(store.as_ref(), &p_other).len(),
         1,
         "one principal's chain must not carry another's records"
     );
 
+    // An identical replay is the retry and crosses the ABI as Ok; a different record at an occupied
+    // position is a fork and crosses the ABI as an error.
+    store
+        .append_plane_record(&call(&p_main, 3, "h2", "h3"))
+        .expect("an identical replay is Ok over the ABI");
+    assert!(
+        store
+            .append_plane_record(&call(&p_main, 3, "h2", "FORKED"))
+            .is_err(),
+        "a forked chain must surface as an error across the ABI, not be swallowed"
+    );
+
     let principals = store
-        .list_mcp_call_principals()
-        .expect("list_mcp_call_principals");
+        .list_plane_record_parents("call")
+        .expect("list_plane_record_parents");
     assert_eq!(
         principals,
         vec![p_main.clone(), p_other.clone()],
@@ -732,22 +769,18 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // Retention crosses the ABI too, COUNT AND ALL — checked for the number it ACTUALLY removed,
     // because a relay that dropped the return value would read as 0 and look like a no-op sweep.
     assert_eq!(
-        store.purge_mcp_calls_before(2_002).expect("purge"),
+        store
+            .purge_plane_records_before("call", 2_002)
+            .expect("purge"),
         2,
         "both records at ts 2001 go (one per principal); the one sitting exactly at the cutoff stays"
     );
-    assert_eq!(
-        store.list_mcp_calls(&p_main).expect("list_mcp_calls").len(),
-        2
-    );
-    assert!(store
-        .list_mcp_calls(&p_other)
-        .expect("list_mcp_calls")
-        .is_empty());
+    assert_eq!(chain(store.as_ref(), &p_main).len(), 2);
+    assert!(chain(store.as_ref(), &p_other).is_empty());
     assert_eq!(
         store
-            .list_mcp_call_principals()
-            .expect("list_mcp_call_principals"),
+            .list_plane_record_parents("call")
+            .expect("list_plane_record_parents"),
         vec![p_main.clone()],
         "a principal whose chain the sweep emptied must leave the enumeration, or a boot keeps \
          resuming a chain with nothing in it"
@@ -755,43 +788,37 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     drop(store);
 
     // LEG 3 — read the surviving rows through the plain `PostgresStore`, a code path that never
-    // touches the cdylib, the C ABI or the loader. A plugin answering the reads above out of its own
-    // in-process state (rather than Postgres) passes both boots and fails here.
-    let direct_calls =
-        Store::list_mcp_calls(&direct, &p_main).expect("list_mcp_calls via the direct connection");
+    // touches the cdylib, the C ABI or the loader.
+    let direct_calls = chain(&direct, &p_main);
     assert_eq!(
-        direct_calls.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        direct_calls
+            .iter()
+            .map(|c| c["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
         vec![2, 3],
         "the records must be physically present in Postgres, not just cached in-process by the plugin"
     );
-    assert_eq!(direct_calls[1].hash, "h3");
+    assert_eq!(direct_calls[1]["hash"], "h3");
 
-    Store::purge_mcp_calls_before(&direct, u64::MAX).expect("clean up this run's records");
+    Store::purge_plane_records_before(&direct, "call", i64::MAX as u64)
+        .expect("clean up this run's records");
 }
 
-/// THE DURABILITY PROOF FOR THE SIX A2A TASK-STORE METHODS, OVER THE REAL PLUGIN PATH.
+/// THE DURABILITY PROOF FOR THE `task` / `task_event` PLANE KINDS (the A2A task store), OVER THE REAL
+/// PLUGIN PATH.
 ///
-/// The sibling proof above does this for the MCP call log; this one exists because the task methods
-/// are a SEPARATE half of the same defaulted seam and half the fleet used to be missing them.
-/// `busbar_api::Store` defaults `put_task` to `Ok(())`, `get_task` to `Ok(None)` and `list_tasks` to
-/// `Ok(vec![])`: a backend that does not override them ACCEPTS EVERY WRITE AND REPORTS SUCCESS while
-/// keeping nothing. An operator would find "task state survives a restart" false on their own
-/// deployment, which is the worst place to discover it.
+/// The sibling proof above does this for the call log; this one exists because the task records are
+/// a SEPARATE half of the same defaulted seam: the upsert defaults to `Ok(())`, the point-read to
+/// `Ok(None)` and the listing to `Ok(vec![])`, so a seam that does not relay them ACCEPTS EVERY WRITE
+/// AND REPORTS SUCCESS while keeping nothing, and an operator finds "task state survives a restart"
+/// false on their own deployment.
 ///
-/// The conformance suite cannot see this: it boots the in-process RAM store, where those defaults
-/// ARE the honest answer and nothing looks wrong. The plugin seam is the ONLY path a real Postgres
-/// deployment takes, so it is the only path worth proving on. A unit test against `PostgresStore`
-/// proves the function compiles and works in-process; it does not prove the plugin path reaches it.
-///
-/// So: a REAL `dlopen` of the built cdylib, the real C ABI, the real `DynStore`. Write at arity > 1
-/// (two tasks, one of them UPSERTED a second time, plus two independent provenance chains), DROP the
-/// handle — `busbar_close` runs and the library is unloaded, so nothing this process still holds can
-/// answer the reads — then `dlopen` again and read everything back. A third leg reads the same rows
-/// through the plain `PostgresStore`, never touching the cdylib, so a plugin answering out of its own
-/// in-process cache still fails.
+/// A REAL `dlopen`, the real C ABI, the real `DynStore`. Write at arity > 1 (two tasks, one of them
+/// UPSERTED a second time, plus two independent provenance chains), DROP the handle, `dlopen` again
+/// and read everything back; a third leg reads through the plain `PostgresStore`.
 #[test]
 fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_api::{Store, TaskEventRow, TaskRow};
+    use busbar_api::{PlaneDisposition, PlaneRecord, PlaneSelector, Store};
 
     let path = plugin_path();
     let Some(url) = postgres_url() else {
@@ -799,12 +826,12 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
     let cfg = cfg(&url);
 
-    // Start from an EMPTY task table. `purge_tasks_before` is GLOBAL and terminal-only, and the
-    // count it returns is asserted exactly below, so a leftover terminal row from an earlier run
-    // would make that assertion meaningless. `purge_tasks_before(MAX)` is the store's own
-    // contract-level wipe of exactly that population, so this needs no raw-SQL knowledge.
+    // Start from no TERMINAL tasks. The task purge is GLOBAL and terminal-only, and its count is
+    // asserted exactly below, so a leftover terminal row from an earlier run would make that
+    // assertion meaningless. The store's own contract-level sweep of exactly that population.
     let direct = PostgresStore::connect(&url).expect("connect directly to clean up and verify");
-    Store::purge_tasks_before(&direct, u64::MAX).expect("wipe terminal tasks before this run");
+    Store::purge_plane_records_before(&direct, "task", i64::MAX as u64)
+        .expect("wipe terminal tasks before this run");
 
     let stamp = format!(
         "{}_{}",
@@ -814,233 +841,234 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
             .unwrap()
             .as_nanos()
     );
-    // Per-run ids, so every read below can only be answered by THIS run's writes.
     let t_live = format!("task_abi_live_{stamp}");
     let t_done = format!("task_abi_done_{stamp}");
-
-    // A timestamp BAND well above any plausible leftover, so the purge cutoff picked below names
-    // this run's rows and nothing else.
     const BASE_TS: u64 = 4_000_000_000;
 
-    let task = |id: &str, state: &str, updated_at: u64, cursor: u64| TaskRow {
-        task_id: id.to_string(),
-        context_id: format!("ctx-{id}"),
-        principal: "vk_task_abi".to_string(),
-        direction: "inbound".to_string(),
-        state: state.to_string(),
-        agent_id: "agent-7".to_string(),
-        artifact_cursor: cursor,
-        push_callback: "https://callback.example/hook".to_string(),
-        created_at: BASE_TS,
-        updated_at,
+    let task = |id: &str, state: &str, ts: u64, cursor: u64, d: PlaneDisposition| PlaneRecord {
+        kind: "task".into(),
+        id: id.into(),
+        parent: None,
+        seq: 0,
+        ts,
+        disposition: d,
+        body: plane_body(serde_json::json!({
+            "task_id": id,
+            "context_id": format!("ctx-{id}"),
+            "principal": "vk_task_abi",
+            "state": state,
+            "artifact_cursor": cursor,
+            "updated_at": ts,
+        })),
     };
-    let event = |id: &str, seq: u64, kind: &str, prev: &str, hash: &str| TaskEventRow {
-        task_id: id.to_string(),
+    let event = |id: &str, seq: u64, kind: &str, prev: &str, hash: &str| PlaneRecord {
+        kind: "task_event".into(),
+        id: id.into(),
+        parent: Some(id.into()),
         seq,
         ts: BASE_TS + seq,
-        kind: kind.to_string(),
-        context_id: format!("ctx-{id}"),
-        principal: "vk_task_abi".to_string(),
-        agent_id: "agent-7".to_string(),
-        state: "working".to_string(),
-        request_id: format!("req-{seq}"),
-        prev_hash: prev.to_string(),
-        hash: hash.to_string(),
+        disposition: PlaneDisposition::Active,
+        body: plane_body(serde_json::json!({
+            "seq": seq, "prev_hash": prev, "hash": hash,
+            "content": { "kind": kind, "request_id": format!("req-{seq}") },
+        })),
     };
+    let events = |store: &dyn Store, id: &str| -> Vec<serde_json::Value> {
+        store
+            .list_plane_records("task_event", &PlaneSelector::Parent(id.to_string()))
+            .expect("list_plane_records over the ABI")
+            .iter()
+            .map(|b| plane_decode(b))
+            .collect()
+    };
+    let interrupted = task(
+        &t_live,
+        "input-required",
+        BASE_TS + 200,
+        9,
+        PlaneDisposition::Active,
+    );
 
     {
         // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
         let store = busbar_plugin_loader::load_store(&path, &cfg)
             .expect("the postgres plugin must load over the real ABI");
         store
-            .put_task(&task(&t_live, "working", BASE_TS + 100, 3))
-            .expect("put_task over the ABI");
-        // The SECOND write for the same id: the engine writes through on every state transition, so
-        // this must REPLACE the row, never append a second one. An interrupted task waiting on a
-        // human is exactly what a restart has to find.
+            .upsert_plane_record(&task(
+                &t_live,
+                "working",
+                BASE_TS + 100,
+                3,
+                PlaneDisposition::Active,
+            ))
+            .expect("upsert_plane_record over the ABI");
+        // The SECOND write for the same id must REPLACE the row, never append a second one. An
+        // interrupted task waiting on a human is exactly what a restart has to find.
         store
-            .put_task(&task(&t_live, "input-required", BASE_TS + 200, 9))
-            .expect("put_task over the ABI");
+            .upsert_plane_record(&interrupted)
+            .expect("upsert_plane_record over the ABI");
         store
-            .put_task(&task(&t_done, "completed", BASE_TS + 50, 1))
-            .expect("put_task over the ABI");
-        // Two INDEPENDENT chains: per-task provenance that leaked across tasks is a real defect
-        // class, and a single-chain test is blind to it.
+            .upsert_plane_record(&task(
+                &t_done,
+                "completed",
+                BASE_TS + 50,
+                1,
+                PlaneDisposition::Terminal,
+            ))
+            .expect("upsert_plane_record over the ABI");
         for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
             store
-                .append_task_event(&event(&t_live, seq, "task.working", prev, hash))
-                .expect("append_task_event over the ABI");
+                .append_plane_record(&event(&t_live, seq, "task.working", prev, hash))
+                .expect("append_plane_record over the ABI");
         }
         store
-            .append_task_event(&event(&t_done, 1, "task.completed", "", "d1"))
-            .expect("append_task_event over the ABI");
-        // Dropping the boxed store drops the loader's `Library` handle: `busbar_close` runs and the
-        // dylib is UNLOADED. Nothing this process still holds can be answering the reads below.
+            .append_plane_record(&event(&t_done, 1, "task.completed", "", "d1"))
+            .expect("append_plane_record over the ABI");
         drop(store);
     }
 
-    // BOOT 2 — a second, independent dlopen over the same file, a fresh `busbar_open`, a fresh
-    // connection inside the plugin.
+    // BOOT 2 — a second, independent dlopen over the same file.
     let store = busbar_plugin_loader::load_store(&path, &cfg)
         .expect("the postgres plugin must load again over the real ABI");
 
-    let got = store.get_task(&t_live).expect("get_task").expect(
-        "an in-flight task must survive the unload/reload over the plugin ABI; got None back, \
-         which is exactly the accept-and-keep-nothing shape of the trait default an unimplemented \
-         backend (or an unrelayed seam) substitutes",
-    );
+    let got = store
+        .get_plane_record("task", &t_live)
+        .expect("get_plane_record")
+        .expect(
+            "an in-flight task must survive the unload/reload over the plugin ABI; got None back, \
+             which is exactly the accept-and-keep-nothing shape of the trait default",
+        );
     assert_eq!(
-        got,
-        task(&t_live, "input-required", BASE_TS + 200, 9),
-        "every field must round-trip, and the row read back must be the SECOND write: put_task \
-         upserts by task_id"
+        got, interrupted.body,
+        "the body must round-trip byte-for-byte, and it must be the SECOND write: the upsert keys \
+         on (kind, id)"
     );
     assert!(
         store
-            .get_task(&format!("task_abi_nonexistent_{stamp}"))
-            .expect("get_task on an unknown id is not an error")
+            .get_plane_record("task", &format!("task_abi_nonexistent_{stamp}"))
+            .expect("a point-read of an unknown id is not an error")
             .is_none(),
         "an unknown task id reads back None, not an error"
     );
 
-    let listed = store.list_tasks().expect("list_tasks");
-    let mine = listed
+    let mut mine: Vec<String> = store
+        .list_plane_records("task", &PlaneSelector::All)
+        .expect("list_plane_records")
         .iter()
-        .filter(|t| t.task_id == t_live || t.task_id == t_done)
-        .map(|t| t.task_id.clone())
-        .collect::<Vec<_>>();
+        .map(|b| {
+            plane_decode(b)["task_id"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        })
+        .filter(|id| *id == t_live || *id == t_done)
+        .collect();
+    mine.sort();
     assert_eq!(
         mine,
         vec![t_done.clone(), t_live.clone()],
-        "list_tasks is UNFILTERED — the terminal row is returned too — and the upserted task \
-         appears exactly ONCE; got {} of this run's rows back",
-        mine.len()
+        "the listing is UNFILTERED — the terminal row is returned too — and the upserted task \
+         appears exactly ONCE"
     );
 
-    let events = store.list_task_events(&t_live).expect("list_task_events");
+    let chain = events(store.as_ref(), &t_live);
     assert_eq!(
-        events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        chain
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
         vec![1, 2, 3],
-        "the per-task provenance chain must survive the reload, oldest-first by seq; got {} \
-         event(s), the empty shape of the trait default",
-        events.len()
+        "the per-task provenance chain must survive the reload, oldest-first by seq"
     );
-    for w in events.windows(2) {
-        assert_eq!(
-            w[1].prev_hash, w[0].hash,
-            "the chain must still link after the reload: seq {} carries prev_hash {:?} but seq {} \
-             persisted hash {:?}",
-            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
-        );
+    for w in chain.windows(2) {
+        assert_eq!(w[1]["prev_hash"], w[0]["hash"], "the chain must still link");
     }
-    assert_eq!(events[2].kind, "task.working");
-    assert_eq!(events[2].request_id, "req-3");
+    assert_eq!(chain[2]["content"]["request_id"], "req-3");
     assert_eq!(
-        store
-            .list_task_events(&t_done)
-            .expect("list_task_events")
-            .len(),
+        events(store.as_ref(), &t_done).len(),
         1,
         "one task's chain must not carry another's events"
     );
 
-    // The task-event contract UPSERTS on (task_id, seq) — the engine's write-through is idempotent
-    // on replay, and rejecting or duplicating a replayed seq breaks the chain it will verify.
-    let mut replayed = event(&t_live, 3, "task.working", "h2", "h3");
-    replayed.state = "input-required".to_string();
+    // 1.6.0: the append is FORK-DETECTING for every kind — an identical replay is the retry (Ok),
+    // a different record at an occupied (task, seq) is refused rather than silently overwriting.
     store
-        .append_task_event(&replayed)
-        .expect("a replayed (task_id, seq) upserts rather than erroring");
-    let events = store.list_task_events(&t_live).expect("list_task_events");
-    assert_eq!(
-        events.len(),
-        3,
-        "a replayed seq must not append a 4th event"
-    );
-    assert_eq!(events[2].state, "input-required");
+        .append_plane_record(&event(&t_live, 3, "task.working", "h2", "h3"))
+        .expect("an identical replay is Ok");
+    assert!(store
+        .append_plane_record(&event(&t_live, 3, "task.working", "h2", "rewritten"))
+        .is_err());
+    assert_eq!(events(store.as_ref(), &t_live).len(), 3, "no 4th event");
 
-    // Retention crosses the ABI too, COUNT AND ALL — checked for the number it ACTUALLY removed,
-    // because a relay that dropped the return value would read as 0 and look like a no-op sweep.
+    // Retention crosses the ABI too, COUNT AND ALL.
     assert_eq!(
         store
-            .purge_tasks_before(BASE_TS + 100)
-            .expect("purge_tasks_before"),
+            .purge_plane_records_before("task", BASE_TS + 100)
+            .expect("purge_plane_records_before"),
         1,
-        "only the TERMINAL row older than the cutoff goes; the interrupted task is never swept no \
-         matter how old, because an interrupt waiting on a human is exactly the row that \
-         legitimately sits still"
+        "only the TERMINAL row older than the cutoff goes; an active task is never swept no matter \
+         how old"
     );
+    assert!(store
+        .get_plane_record("task", &t_done)
+        .expect("get_plane_record")
+        .is_none());
+    assert!(store
+        .get_plane_record("task", &t_live)
+        .expect("get_plane_record")
+        .is_some());
     assert!(
-        store.get_task(&t_done).expect("get_task").is_none(),
-        "the purged task is gone"
-    );
-    assert!(
-        store.get_task(&t_live).expect("get_task").is_some(),
-        "a non-terminal task is never purged"
-    );
-    assert!(
-        store
-            .list_task_events(&t_done)
-            .expect("list_task_events")
-            .is_empty(),
-        "the purge is the ONLY retention method the contract gives task_events, so a swept task's \
-         chain must go with it or it is unbounded forever"
+        events(store.as_ref(), &t_done).is_empty(),
+        "a swept task's chain must go with it or it is unbounded forever"
     );
     drop(store);
 
-    // LEG 3 — read the surviving row through the plain `PostgresStore`, a code path that never
-    // touches the cdylib, the C ABI or the loader. A plugin answering the reads above out of its own
-    // in-process state (rather than Postgres) passes both boots and fails here.
-    let direct_task = Store::get_task(&direct, &t_live)
-        .expect("get_task via the direct connection")
+    // LEG 3 — the surviving rows through the plain `PostgresStore`.
+    let direct_task = Store::get_plane_record(&direct, "task", &t_live)
+        .expect("get_plane_record via the direct connection")
         .expect("the task must be physically present in Postgres, not just cached in-process");
-    assert_eq!(direct_task.artifact_cursor, 9);
-    assert_eq!(direct_task.state, "input-required");
-    assert_eq!(
-        Store::list_task_events(&direct, &t_live)
-            .expect("list_task_events via the direct connection")
-            .len(),
-        3
-    );
+    let direct_task = plane_decode(&direct_task);
+    assert_eq!(direct_task["artifact_cursor"], 9);
+    assert_eq!(direct_task["state"], "input-required");
+    assert_eq!(events(&direct, &t_live).len(), 3);
 
     // Clean up this run's rows through the contract: mark the survivor terminal, then sweep.
-    Store::put_task(&direct, &task(&t_live, "canceled", BASE_TS + 200, 9))
-        .expect("clean up this run's task");
-    Store::purge_tasks_before(&direct, u64::MAX).expect("clean up this run's rows");
+    Store::upsert_plane_record(
+        &direct,
+        &task(
+            &t_live,
+            "canceled",
+            BASE_TS + 200,
+            9,
+            PlaneDisposition::Terminal,
+        ),
+    )
+    .expect("clean up this run's task");
+    Store::purge_plane_records_before(&direct, "task", i64::MAX as u64)
+        .expect("clean up this run's rows");
 }
 
-/// THE DURABILITY PROOF FOR THE FOUR TRUST-STATE METHODS, OVER THE REAL PLUGIN PATH.
+/// THE DURABILITY PROOF FOR THE TRUST STATE — the `demotion` kind and the single-use `ask` token
+/// ledger — OVER THE REAL PLUGIN PATH.
 ///
-/// Same reasoning as the task-store test above, and a sharper cost. `busbar_api::Store` defaults
-/// `put_mcp_demotion`/`list_mcp_demotions`/`clear_mcp_demotion` to accept-and-keep-nothing and
-/// `redeem_ask_state` to `Ok(true)` — "yes, this call is the first redemption" — so a seam that does
-/// not RELAY them substitutes two security failures, both silent and both green:
+/// A seam that does not RELAY these substitutes two security failures, both silent: a demotion is
+/// written, reported successful and DISCARDED (a restart hands a quarantined upstream the operator's
+/// approval back), and every redeemer of one single-use approval is told the trait default's answer.
+/// Two simultaneous loads are the fleet; a drop and a reload is the restart; a third leg reads
+/// through the plain `PostgresStore`.
 ///
-///   * a demotion is written, reported successful and DISCARDED, so a restart hands a quarantined
-///     upstream the operator's approval back; and
-///   * every redeemer of one single-use approval is told it is the first, so a confirm-once tool an
-///     operator gated because it moves money executes once per node and once per restart.
-///
-/// A real Postgres deployment reaches this backend ONLY over the plugin seam, so that is the path
-/// worth proving on: a real `dlopen`, the real C ABI, the real `DynStore`. Two simultaneous loads
-/// are the fleet; a drop and a reload is the restart; and a third leg reads through the plain
-/// `PostgresStore`, never touching the cdylib, so a plugin answering out of its own in-process state
-/// still fails.
-///
-/// PANICS rather than skipping when no Postgres is configured. These are the only over-the-ABI
-/// coverage of two properties whose unimplemented form is silently green, and a case that can skip
-/// is a case that will skip on the day it matters.
+/// PANICS rather than skipping when no Postgres is configured: these are the only over-the-ABI
+/// coverage of two properties whose unimplemented form is silently green.
 #[test]
 fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_api::{McpDemotionRow, Store};
+    use busbar_api::{PlaneDisposition, PlaneRecord, PlaneSelector, Store};
 
     let path = plugin_path();
     let url = std::env::var("BUSBAR_TEST_POSTGRES_URL").unwrap_or_else(|_| {
         panic!(
             "BUSBAR_TEST_POSTGRES_URL is unset, and this case must not skip: it is the only \
              over-the-ABI proof that a demotion and a spent approval survive a restart on this \
-             backend, and both fail SILENTLY when unrelayed — the trait defaults answer `Ok(())` to \
-             a demotion and `true` to every redemption"
+             backend, and both fail SILENTLY when unrelayed"
         )
     });
     let cfg = cfg(&url);
@@ -1053,8 +1081,6 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
             .unwrap()
             .as_nanos()
     );
-    // Per-run ids, so every read below can only be answered by THIS run's writes, and so two runs
-    // against one shared Postgres cannot redeem each other's approvals.
     let srv_demoted = format!("srv_abi_demoted_{stamp}");
     let srv_cleared = format!("srv_abi_cleared_{stamp}");
     let nonce_restart = format!("nonce_abi_restart_{stamp}");
@@ -1062,10 +1088,30 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let nonce_fresh = format!("nonce_abi_fresh_{stamp}");
     const NOW: u64 = 4_000_000_000;
 
-    let demotion = |server: &str, reason: &str, at: u64| McpDemotionRow {
-        server: server.to_string(),
-        reason: reason.to_string(),
-        recorded_at: at,
+    let demotion = |server: &str, reason: &str, at: u64| PlaneRecord {
+        kind: "demotion".into(),
+        id: server.into(),
+        parent: None,
+        seq: 0,
+        ts: at,
+        disposition: PlaneDisposition::Active,
+        body: plane_body(serde_json::json!({
+            "server": server, "reason": reason, "recorded_at": at,
+        })),
+    };
+    let demotions = |store: &dyn Store| -> Vec<(String, String)> {
+        store
+            .list_plane_records("demotion", &PlaneSelector::All)
+            .expect("list_plane_records")
+            .iter()
+            .map(|b| plane_decode(b))
+            .map(|v| {
+                (
+                    v["server"].as_str().unwrap_or("").to_string(),
+                    v["reason"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
     };
 
     {
@@ -1073,26 +1119,23 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         let store = busbar_plugin_loader::load_store(&path, &cfg)
             .expect("the postgres plugin must load over the real ABI");
         store
-            .put_mcp_demotion(&demotion(&srv_demoted, "tool-drift", NOW))
-            .expect("put_mcp_demotion");
-        // The UPSERT path crosses the ABI too: a second demotion of one upstream replaces the row.
+            .upsert_plane_record(&demotion(&srv_demoted, "tool-drift", NOW))
+            .expect("upsert_plane_record");
         store
-            .put_mcp_demotion(&demotion(&srv_demoted, "digest-mismatch", NOW + 10))
-            .expect("put_mcp_demotion");
+            .upsert_plane_record(&demotion(&srv_demoted, "digest-mismatch", NOW + 10))
+            .expect("upsert_plane_record");
         store
-            .put_mcp_demotion(&demotion(&srv_cleared, "tool-drift", NOW + 20))
-            .expect("put_mcp_demotion");
+            .upsert_plane_record(&demotion(&srv_cleared, "tool-drift", NOW + 20))
+            .expect("upsert_plane_record");
         store
-            .clear_mcp_demotion(&srv_cleared)
+            .delete_plane_record("demotion", &srv_cleared)
             .expect("a later agreeing observation clears the quarantine");
         assert!(
             store
-                .redeem_ask_state(&nonce_restart, NOW + 900, NOW)
-                .expect("redeem_ask_state"),
+                .redeem_plane_token("ask", &nonce_restart, NOW + 900, NOW)
+                .expect("redeem_plane_token"),
             "the FIRST redemption must be answered `true`, or nothing below is about single use"
         );
-        // Dropping the boxed store runs `busbar_close` and unloads the library, so nothing this
-        // process still holds can be answering the reads below.
         drop(store);
     }
 
@@ -1100,78 +1143,61 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let store = busbar_plugin_loader::load_store(&path, &cfg)
         .expect("the postgres plugin must load again over the real ABI");
 
-    let rows = store.list_mcp_demotions().expect("list_mcp_demotions");
-    let mine = rows
-        .iter()
-        .filter(|r| r.server == srv_demoted || r.server == srv_cleared)
-        .cloned()
-        .collect::<Vec<_>>();
+    let mine: Vec<(String, String)> = demotions(store.as_ref())
+        .into_iter()
+        .filter(|(s, _)| *s == srv_demoted || *s == srv_cleared)
+        .collect();
     assert_eq!(
         mine,
-        vec![demotion(&srv_demoted, "digest-mismatch", NOW + 10)],
+        vec![(srv_demoted.clone(), "digest-mismatch".to_string())],
         "the boot read must put the recorded quarantine back in force — at its LATEST reason, and \
-         without the one a later agreeing observation cleared. An empty answer here is the \
-         accept-and-keep-nothing trait default an unrelayed seam substitutes, and it means a \
-         restart hands a demoted upstream the operator's approval back"
+         without the one a later agreeing observation cleared"
     );
 
     assert!(
         !store
-            .redeem_ask_state(&nonce_restart, NOW + 900, NOW + 1)
-            .expect("redeem_ask_state"),
-        "a restart handed a spent approval back over the plugin ABI. The approval has not lapsed — \
-         outliving a restart is the point of it — so the only thing that changed is that the \
-         process which recorded the redemption is gone"
+            .redeem_plane_token("ask", &nonce_restart, NOW + 900, NOW + 1)
+            .expect("redeem_plane_token"),
+        "a restart handed a spent approval back over the plugin ABI"
     );
 
-    // THE FLEET. A second, simultaneous dlopen against the same database is what a second node of
-    // one deployment is: it shares the signing key, so it shares the seal, and every check but this
-    // one passes on both.
+    // THE FLEET: a second, simultaneous dlopen against the same database.
     let node_b = busbar_plugin_loader::load_store(&path, &cfg)
         .expect("a second node loads the same plugin against the same database");
     assert!(store
-        .redeem_ask_state(&nonce_fleet, NOW + 900, NOW + 2)
-        .expect("redeem_ask_state"));
+        .redeem_plane_token("ask", &nonce_fleet, NOW + 900, NOW + 2)
+        .expect("redeem_plane_token"));
     assert!(
         !node_b
-            .redeem_ask_state(&nonce_fleet, NOW + 900, NOW + 3)
-            .expect("redeem_ask_state"),
-        "a second node redeemed an approval the first already spent, which is one operator \
-         confirmation executing once per node"
+            .redeem_plane_token("ask", &nonce_fleet, NOW + 900, NOW + 3)
+            .expect("redeem_plane_token"),
+        "a second node redeemed an approval the first already spent"
     );
-    // THE CONTROL: a ledger that refused everything would satisfy both cases above and would have
-    // deleted the feature.
+    // THE CONTROL: a ledger that refused everything would satisfy both cases above.
     assert!(
         node_b
-            .redeem_ask_state(&nonce_fresh, NOW + 900, NOW + 4)
-            .expect("redeem_ask_state"),
-        "a freshly minted approval is not the one that was spent; refusing it would make the shared \
-         ledger a blanket refusal of every confirmation after the first"
+            .redeem_plane_token("ask", &nonce_fresh, NOW + 900, NOW + 4)
+            .expect("redeem_plane_token"),
+        "a freshly minted approval is not the one that was spent"
     );
 
-    // LEG 3 — the same rows through the plain `PostgresStore`, a path that never touches the cdylib,
-    // the C ABI or the loader. A plugin answering the reads above out of its own in-process state
-    // passes both boots and fails here.
+    // LEG 3 — the same rows through the plain `PostgresStore`.
     let direct = PostgresStore::connect(&url).expect("connect directly to verify and clean up");
     assert!(
-        Store::list_mcp_demotions(&direct)
-            .expect("list_mcp_demotions via the direct connection")
+        demotions(&direct)
             .iter()
-            .any(|r| r.server == srv_demoted && r.reason == "digest-mismatch"),
+            .any(|(s, r)| *s == srv_demoted && r == "digest-mismatch"),
         "the demotion must be physically present in Postgres, not merely cached in the plugin"
     );
     assert!(
-        !Store::redeem_ask_state(&direct, &nonce_restart, NOW + 900, NOW + 5)
-            .expect("redeem_ask_state via the direct connection"),
-        "the spent-approval row must be physically present in Postgres: a direct connection that \
-         never loaded the plugin has to see the redemption the plugin recorded"
+        !Store::redeem_plane_token(&direct, "ask", &nonce_restart, NOW + 900, NOW + 5)
+            .expect("redeem_plane_token via the direct connection"),
+        "the spent-token row must be physically present in Postgres"
     );
 
-    // Clean up this run's demotion through the contract. The three ledger entries are left where
-    // they are ON PURPOSE: the contract gives the ledger no delete, only the expiry sweep that a
-    // redemption carries, and firing that sweep here with a far-future `now` would evict every row
-    // any CONCURRENT test process is relying on — which is exactly the "one node's cleanup breaks
-    // another node's ledger" failure this table exists to prevent. The ids are per-run unique, so
-    // they cannot affect a later run, and a real deployment's own sweep bounds them.
-    Store::clear_mcp_demotion(&direct, &srv_demoted).expect("clean up this run's demotion");
+    // Clean up this run's demotion through the contract. The ledger entries are left ON PURPOSE:
+    // the contract gives the ledger no delete, only the expiry sweep a redemption carries, and
+    // firing that with a far-future `now` would evict rows a CONCURRENT test process relies on.
+    Store::delete_plane_record(&direct, "demotion", &srv_demoted)
+        .expect("clean up this run's demotion");
 }
