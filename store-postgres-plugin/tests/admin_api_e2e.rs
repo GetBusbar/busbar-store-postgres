@@ -229,16 +229,16 @@ fn plugin_path() -> PathBuf {
     fresh
 }
 
-/// The sibling busbarAI checkout's root (same convention `e2e.rs` already uses for its path deps).
+/// The sibling busbar checkout's root (same convention `e2e.rs` already uses for its path deps).
 fn busbarai_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../busbarAI")
+        .join("../../busbar")
         .canonicalize()
-        .expect("sibling busbarAI checkout must exist (see Cargo.toml path deps)")
+        .expect("sibling busbar checkout must exist (see Cargo.toml path deps)")
 }
 
 /// Build (once, cached by cargo) and return the real `busbar` and `busbar-plugin-pack` binaries,
-/// both from the sibling busbarAI checkout — never a fixture, never a stub.
+/// both from the sibling busbar checkout — never a fixture, never a stub.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbarai_root();
     let status = Command::new("cargo")
