@@ -7,9 +7,60 @@
 
 use super::*;
 use busbar_api::{
-    CredentialMeta, CredentialSecret, McpCallRecord, McpDemotionRow, ModelTokensDelta, SecretForm,
-    TaskEventRow, TaskRow, TierTokensDelta,
+    CredentialMeta, CredentialSecret, ModelTokensDelta, PlaneDisposition, PlaneRecord,
+    PlaneSelector, SecretForm,
 };
+
+/// One model's ledger row from the four RESERVED token classes (zero classes left out, the way the
+/// store reads them back).
+fn mt(
+    model: impl Into<String>,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+) -> ModelTokens {
+    let mut usage_units = BTreeMap::new();
+    for (u, v) in [
+        (UNIT_INPUT, input),
+        (UNIT_OUTPUT, output),
+        (UNIT_CACHE_READ, cache_read),
+        (UNIT_CACHE_WRITE, cache_write),
+    ] {
+        if v != 0 {
+            usage_units.insert(u.to_string(), v);
+        }
+    }
+    ModelTokens {
+        model: model.into(),
+        usage_units,
+    }
+}
+
+/// The signed twin of [`mt`], for `add_usage`.
+fn mtd(
+    model: impl Into<String>,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+) -> ModelTokensDelta {
+    let mut usage_units = BTreeMap::new();
+    for (u, v) in [
+        (UNIT_INPUT, input),
+        (UNIT_OUTPUT, output),
+        (UNIT_CACHE_READ, cache_read),
+        (UNIT_CACHE_WRITE, cache_write),
+    ] {
+        if v != 0 {
+            usage_units.insert(u.to_string(), v);
+        }
+    }
+    ModelTokensDelta {
+        model: model.into(),
+        usage_units,
+    }
+}
 
 /// Drift guard, no live DB needed: `CRED_SECRET_COLUMN_INDEX` must stay in sync with
 /// `CRED_META_COLUMNS`' own column count, since `str::split` isn't const-evaluable and the constant
@@ -154,6 +205,8 @@ fn hard_reset(store: &PostgresStore, id: &str) {
     let _ = client.execute("DELETE FROM usage_metering WHERE key_id=$1", &[&id]);
     let _ = client.execute("DELETE FROM usage_windows WHERE bucket_id=$1", &[&id]);
     let _ = client.execute("DELETE FROM usage_ledger WHERE bucket_id=$1", &[&id]);
+    let _ = client.execute("DELETE FROM usage_ledger_units WHERE bucket_id=$1", &[&id]);
+    let _ = client.execute("DELETE FROM usage_metering_units WHERE key_id=$1", &[&id]);
 }
 
 /// Serialises the tests that write to the SHARED `audit_log` table.
@@ -182,6 +235,7 @@ fn sample_key(id: &str) -> VirtualKey {
         expires_at: None,
         deleted_at: None,
         revision: 0,
+        ..Default::default()
     }
 }
 
@@ -796,15 +850,7 @@ fn get_usage_snapshot_does_not_observe_a_concurrent_add_usage_between_its_two_re
             &UsageLedger {
                 requests: 10,
                 billable_requests: 10,
-                models: vec![ModelTokens {
-                    model: "seed-model".into(),
-                    tokens: TierTokens {
-                        input: 1,
-                        output: 1,
-                        cache_read: 0,
-                        cache_write: 0,
-                    },
-                }],
+                models: vec![mt("seed-model", 1, 1, 0, 0)],
             },
         )
         .unwrap();
@@ -837,15 +883,7 @@ fn get_usage_snapshot_does_not_observe_a_concurrent_add_usage_between_its_two_re
             &UsageDelta {
                 requests: 5,
                 billable_requests: 5,
-                models: vec![ModelTokensDelta {
-                    model: "concurrent-writer-model".into(),
-                    tokens: TierTokensDelta {
-                        input: 1,
-                        output: 1,
-                        cache_read: 0,
-                        cache_write: 0,
-                    },
-                }],
+                models: vec![mtd("concurrent-writer-model", 1, 1, 0, 0)],
             },
         )
         .unwrap();
@@ -903,6 +941,8 @@ fn metering_roundtrip_new_fields() {
             billable_requests: 2,
             key_group_at_use: "growth".into(),
             pricing_version: "2026-07".into(),
+            priced_from_ms: 0,
+            usage_units: Default::default(),
         })
         .unwrap();
     let rows = store.list_metering(bucket).unwrap();
@@ -1051,33 +1091,9 @@ fn put_usage_and_add_usage_batch_multiple_models_correctly() {
                 requests: 3,
                 billable_requests: 2,
                 models: vec![
-                    ModelTokens {
-                        model: "model-a".into(),
-                        tokens: TierTokens {
-                            input: 10,
-                            output: 20,
-                            cache_read: 1,
-                            cache_write: 2,
-                        },
-                    },
-                    ModelTokens {
-                        model: "model-b".into(),
-                        tokens: TierTokens {
-                            input: 30,
-                            output: 40,
-                            cache_read: 3,
-                            cache_write: 4,
-                        },
-                    },
-                    ModelTokens {
-                        model: "model-c".into(),
-                        tokens: TierTokens {
-                            input: 50,
-                            output: 60,
-                            cache_read: 5,
-                            cache_write: 6,
-                        },
-                    },
+                    mt("model-a", 10, 20, 1, 2),
+                    mt("model-b", 30, 40, 3, 4),
+                    mt("model-c", 50, 60, 5, 6),
                 ],
             },
         )
@@ -1092,14 +1108,14 @@ fn put_usage_and_add_usage_batch_multiple_models_correctly() {
         "all three model rows must land as three distinct, correctly delimited rows"
     );
     assert_eq!(models[0].model, "model-a");
-    assert_eq!(models[0].tokens.input, 10);
-    assert_eq!(models[0].tokens.output, 20);
+    assert_eq!(models[0].tier(UNIT_INPUT), 10);
+    assert_eq!(models[0].tier(UNIT_OUTPUT), 20);
     assert_eq!(models[1].model, "model-b");
-    assert_eq!(models[1].tokens.input, 30);
-    assert_eq!(models[1].tokens.cache_write, 4);
+    assert_eq!(models[1].tier(UNIT_INPUT), 30);
+    assert_eq!(models[1].tier(UNIT_CACHE_WRITE), 4);
     assert_eq!(models[2].model, "model-c");
-    assert_eq!(models[2].tokens.cache_read, 5);
-    assert_eq!(models[2].tokens.cache_write, 6);
+    assert_eq!(models[2].tier(UNIT_CACHE_READ), 5);
+    assert_eq!(models[2].tier(UNIT_CACHE_WRITE), 6);
 
     store
         .add_usage(
@@ -1108,26 +1124,7 @@ fn put_usage_and_add_usage_batch_multiple_models_correctly() {
             &UsageDelta {
                 requests: 1,
                 billable_requests: 1,
-                models: vec![
-                    ModelTokensDelta {
-                        model: "model-x".into(),
-                        tokens: TierTokensDelta {
-                            input: 7,
-                            output: 8,
-                            cache_read: 0,
-                            cache_write: 0,
-                        },
-                    },
-                    ModelTokensDelta {
-                        model: "model-y".into(),
-                        tokens: TierTokensDelta {
-                            input: 9,
-                            output: 11,
-                            cache_read: 0,
-                            cache_write: 0,
-                        },
-                    },
-                ],
+                models: vec![mtd("model-x", 7, 8, 0, 0), mtd("model-y", 9, 11, 0, 0)],
             },
         )
         .unwrap();
@@ -1140,9 +1137,9 @@ fn put_usage_and_add_usage_batch_multiple_models_correctly() {
         "both delta model rows must land distinctly"
     );
     assert_eq!(models2[0].model, "model-x");
-    assert_eq!(models2[0].tokens.input, 7);
+    assert_eq!(models2[0].tier(UNIT_INPUT), 7);
     assert_eq!(models2[1].model, "model-y");
-    assert_eq!(models2[1].tokens.output, 11);
+    assert_eq!(models2[1].tier(UNIT_OUTPUT), 11);
 }
 
 /// `append_audit`'s append-only contract: a seq collision must be rejected, never silently
@@ -1362,15 +1359,7 @@ fn purge_windows_and_metering_delete_only_what_is_older_than_the_boundary() {
     let ledger = |model: &str| UsageLedger {
         requests: 1,
         billable_requests: 1,
-        models: vec![ModelTokens {
-            model: model.into(),
-            tokens: TierTokens {
-                input: 1,
-                output: 1,
-                cache_read: 0,
-                cache_write: 0,
-            },
-        }],
+        models: vec![mt(model, 1, 1, 0, 0)],
     };
     store
         .put_usage(&bucket, old_ws, &ledger("old-model"))
@@ -1428,6 +1417,8 @@ fn purge_windows_and_metering_delete_only_what_is_older_than_the_boundary() {
         billable_requests: 1,
         key_group_at_use: String::new(),
         pricing_version: String::new(),
+        priced_from_ms: 0,
+        usage_units: Default::default(),
     };
     let meter_bucket = 20_270_601u64;
     let older_bucket = meter_bucket - 1;
@@ -1968,14 +1959,16 @@ fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() 
 /// longer reaches this backend on a dependency bump, it has to be written in here by hand.
 mod store_conformance;
 
-/// The cross-backend `Store` conformance checks, answered by this backend — the four behaviours the
-/// fleet used to settle differently per backend.
+/// The cross-backend `Store` conformance checks, answered by this backend — EVERY check the suite
+/// offers: the key/credential/audit rulings the fleet used to settle differently per backend, and
+/// the 1.6.0 plane-record battery.
 ///
 /// Every fixture is namespaced by process id and the rows are hard-reset first, for the same reason
 /// `append_audit_is_append_only_and_rejects_a_seq_collision` derives its own seq: this suite runs
 /// against a SHARED live database that is not reset between tests, and CI can have more than one
 /// test binary pointed at it, so a fixed id would make two concurrent runs each other's failure.
 mod conformance {
+    use super::plane_records::lock_plane_purge;
     use super::store_conformance as conf;
     use super::{clamp, connect_store_with_retry, live_url, PostgresStore};
 
@@ -1989,7 +1982,8 @@ mod conformance {
     }
 
     /// Delete every row this suite is about to write, so a rerun (or a crashed prior run that left
-    /// rows behind) starts from the same state as a first run.
+    /// rows behind) starts from the same state as a first run. Plane rows are matched on the
+    /// EXACT `{ns}_` prefix every plane fixture id carries (not `LIKE`, whose `_` is a wildcard).
     fn reset(store: &PostgresStore, ns: &str, seq: u64) {
         let mut client = store.lock();
         for id in conf::key_ids(ns) {
@@ -2000,6 +1994,20 @@ mod conformance {
             let _ = client.execute("DELETE FROM credentials WHERE id=$1", &[&id]);
         }
         let _ = client.execute("DELETE FROM audit_log WHERE seq=$1", &[&clamp(seq)]);
+        let prefix = format!("{ns}_");
+        let n = prefix.chars().count() as i32;
+        let _ = client.execute(
+            "DELETE FROM plane_records WHERE left(id, $2) = $1",
+            &[&prefix, &n],
+        );
+        let _ = client.execute(
+            "DELETE FROM plane_chain WHERE left(parent, $2) = $1",
+            &[&prefix, &n],
+        );
+        let _ = client.execute(
+            "DELETE FROM plane_tokens WHERE left(token, $2) = $1",
+            &[&prefix, &n],
+        );
     }
 
     fn setup(check: &str, seq: u64) -> Option<(PostgresStore, String)> {
@@ -2035,6 +2043,22 @@ mod conformance {
     }
 
     #[test]
+    fn put_credential_requires_a_live_key() {
+        let Some((store, ns)) = setup("live", 0) else {
+            return;
+        };
+        conf::assert_put_credential_requires_a_live_key(&store, &ns);
+    }
+
+    #[test]
+    fn put_key_with_credential_is_atomic() {
+        let Some((store, ns)) = setup("atom", 0) else {
+            return;
+        };
+        conf::assert_put_key_with_credential_is_atomic(&store, &ns);
+    }
+
+    #[test]
     fn append_audit_duplicate_seq_is_ok_when_identical_and_an_error_when_different() {
         // Same derivation as the hand-written collision test above, offset so the two cannot pick
         // the same seq within one process.
@@ -2044,6 +2068,66 @@ mod conformance {
         };
         let _audit_guard = super::lock_audit_table();
         conf::assert_append_audit_duplicate_seq(&store, seq);
+    }
+
+    #[test]
+    fn plane_task_upsert_get_list() {
+        let Some((store, ns)) = setup("ptask", 0) else {
+            return;
+        };
+        conf::assert_plane_task_upsert_get_list(&store, &ns);
+    }
+
+    #[test]
+    fn plane_event_chain_is_ordered_by_seq() {
+        let Some((store, ns)) = setup("pchain", 0) else {
+            return;
+        };
+        conf::assert_plane_event_chain_is_ordered_by_seq(&store, &ns);
+    }
+
+    #[test]
+    fn plane_call_parents_enumerated() {
+        let Some((store, ns)) = setup("pprin", 0) else {
+            return;
+        };
+        conf::assert_plane_call_parents_enumerated(&store, &ns);
+    }
+
+    #[test]
+    fn plane_demotion_upsert_list_delete() {
+        let Some((store, ns)) = setup("pdem", 0) else {
+            return;
+        };
+        conf::assert_plane_demotion_upsert_list_delete(&store, &ns);
+    }
+
+    #[test]
+    fn plane_purge_honours_the_cutoff() {
+        let Some((store, ns)) = setup("pcut", 0) else {
+            return;
+        };
+        // This binary's own purge tests sweep the same kinds with a HIGHER cutoff, which would
+        // reach this check's newer-than-cutoff survivor; they hold the same lock.
+        let _guard = lock_plane_purge();
+        conf::assert_plane_purge_honours_the_cutoff(&store, &ns);
+    }
+
+    #[test]
+    fn plane_purge_task_keeps_active_rows() {
+        let Some((store, ns)) = setup("pkeep", 0) else {
+            return;
+        };
+        let _guard = lock_plane_purge();
+        conf::assert_plane_purge_task_keeps_active_rows(&store, &ns);
+    }
+
+    #[test]
+    fn plane_token_is_single_use() {
+        let Some((store, ns)) = setup("ptok", 0) else {
+            return;
+        };
+        conf::assert_plane_token_is_single_use(&store, &ns);
     }
 }
 
@@ -2139,1100 +2223,13 @@ fn append_audit_never_reports_success_for_a_record_it_did_not_store() {
     let _ = client.execute("DELETE FROM audit_log WHERE seq=$1", &[&clamp(seq)]);
 }
 
-// ── THE DURABLE MCP TOOL-CALL LOG ────────────────────────────────────────────────────────────
+// ── THE KIND-TAGGED PLANE RECORDS (busbar 1.6.0) ────────────────────────────────────────────
 //
-// The property under test is not "the write returned Ok" — the trait's default `append_mcp_call`
-// returns `Ok(())` and keeps nothing, so a write's return value is worthless as evidence of
-// durability. The only honest way to know a deployment has durable call evidence is to READ IT
-// BACK, and the only honest way to know it survives a deploy is to read it back on a NEW
-// CONNECTION after the writing one is gone.
-
-fn sample_call(principal: &str, seq: u64, ts: u64, prev_hash: &str, hash: &str) -> McpCallRecord {
-    McpCallRecord {
-        principal: principal.to_string(),
-        seq,
-        ts,
-        server: "srv".to_string(),
-        tool: "srv_read_file".to_string(),
-        outcome: "dispatched".to_string(),
-        reason: String::new(),
-        tool_digest: format!("sha256:tool{seq}"),
-        pin_generation: 3,
-        request_id: format!("req-{seq}"),
-        prev_hash: prev_hash.to_string(),
-        hash: hash.to_string(),
-    }
-}
-
-/// Live Postgres is SHARED across tests, so each test owns its own principal ids and clears them
-/// first — the same isolation-by-unique-id discipline the key tests in this file use.
-fn reset_calls(store: &PostgresStore, principals: &[&str]) {
-    for p in principals {
-        store
-            .lock()
-            .execute("DELETE FROM mcp_calls WHERE principal = $1", &[p])
-            .expect("clear this test's own rows");
-    }
-}
-
-/// THE TEST THAT MATTERS. A round-trip on one live handle cannot distinguish a backend that wrote
-/// to the server from one holding a HashMap behind the same trait. So this DROPS the store — closing
-/// its connection entirely — then connects a genuinely new one and verifies the per-principal hash
-/// chain still links from the rows the server hands back.
-#[test]
-fn an_mcp_call_chain_survives_dropping_the_connection_and_reconnecting() {
-    let Some(url) = live_url() else { return };
-    let p = "vk_mcp_restart";
-    {
-        let store = connect_store_with_retry(&url).expect("connect");
-        reset_calls(&store, &[p]);
-        store
-            .append_mcp_call(&sample_call(p, 1, 2_000_000_100, "", "h1"))
-            .unwrap();
-        store
-            .append_mcp_call(&sample_call(p, 2, 2_000_000_200, "h1", "h2"))
-            .unwrap();
-        store
-            .append_mcp_call(&sample_call(p, 3, 2_000_000_300, "h2", "h3"))
-            .unwrap();
-        drop(store);
-    }
-
-    // A genuinely new connection — nothing carried over in this process.
-    let reopened = connect_store_with_retry(&url).expect("reconnect");
-    let got = reopened.list_mcp_calls(p).unwrap();
-
-    assert_eq!(
-        got.len(),
-        3,
-        "the call log must survive a reconnect; got {} records back, which is the \
-         accept-and-keep-nothing behaviour this backend exists to replace",
-        got.len()
-    );
-    assert_eq!(
-        got[0].prev_hash, "",
-        "seq 1 opens the chain with an empty prev_hash"
-    );
-    for w in got.windows(2) {
-        assert_eq!(
-            w[1].prev_hash, w[0].hash,
-            "the per-principal chain must still link after a reconnect: seq {} carries prev_hash \
-             {:?} but seq {} persisted hash {:?}",
-            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
-        );
-    }
-    assert_eq!(got.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
-    // The non-indexed payload must round-trip verbatim too.
-    assert_eq!(got[2].tool_digest, "sha256:tool3");
-    assert_eq!(got[2].request_id, "req-3");
-    assert_eq!(got[1].tool, "srv_read_file");
-    assert_eq!(got[1].pin_generation, 3);
-    reset_calls(&reopened, &[p]);
-}
-
-/// The boot enumeration: a restart has to resume a chain for a principal this process has not yet
-/// seen, so the store must be able to name every principal holding records.
-#[test]
-fn mcp_call_principals_are_enumerable_after_a_reconnect() {
-    let Some(url) = live_url() else { return };
-    let (a, b) = ("vk_mcp_enum_a", "vk_mcp_enum_b");
-    {
-        let store = connect_store_with_retry(&url).expect("connect");
-        reset_calls(&store, &[a, b]);
-        store
-            .append_mcp_call(&sample_call(a, 1, 2_000_000_100, "", "a1"))
-            .unwrap();
-        store
-            .append_mcp_call(&sample_call(b, 1, 2_000_000_100, "", "b1"))
-            .unwrap();
-        store
-            .append_mcp_call(&sample_call(a, 2, 2_000_000_101, "a1", "a2"))
-            .unwrap();
-        drop(store);
-    }
-    let reopened = connect_store_with_retry(&url).expect("reconnect");
-    let principals = reopened.list_mcp_call_principals().unwrap();
-    for want in [a, b] {
-        assert_eq!(
-            principals.iter().filter(|p| p.as_str() == want).count(),
-            1,
-            "{want} must be enumerable after a reconnect, exactly once"
-        );
-    }
-    // The chain scope is the principal: a scoped read returns only its own.
-    assert_eq!(reopened.list_mcp_calls(a).unwrap().len(), 2);
-    assert_eq!(reopened.list_mcp_calls(b).unwrap().len(), 1);
-    assert!(
-        reopened
-            .list_mcp_calls("vk_mcp_nonexistent")
-            .unwrap()
-            .is_empty(),
-        "a principal with no records reads back empty, not an error"
-    );
-    reset_calls(&reopened, &[a, b]);
-}
-
-/// Retention must ACTUALLY DELETE and report a real count — a purge that returns a number it did
-/// not perform is worse than one that reports nothing purged.
-#[test]
-fn purge_mcp_calls_before_deletes_and_returns_a_real_count() {
-    let Some(url) = live_url() else { return };
-    let store = connect_store_with_retry(&url).expect("connect");
-    let p = "vk_mcp_purge";
-    reset_calls(&store, &[p]);
-    // Retention is GLOBAL by `ts` — it is not scoped to a principal, and cannot be. Against the
-    // SHARED live database that means this test's cutoffs would delete every other test's rows if
-    // the timestamps overlapped, so the suite bands them: this test owns the low band and every
-    // other test sits ABOVE the highest cutoff used here. Caught by exactly that cross-deletion.
-    // A far-future ts keeps this test's rows clear of any other principal's in the shared DB, and
-    // the purge below is scoped by counting only this principal's survivors.
-    store
-        .append_mcp_call(&sample_call(p, 1, 1_000_000_100, "", "h1"))
-        .unwrap();
-    store
-        .append_mcp_call(&sample_call(p, 2, 1_000_000_200, "h1", "h2"))
-        .unwrap();
-    store
-        .append_mcp_call(&sample_call(p, 3, 1_000_000_300, "h2", "h3"))
-        .unwrap();
-
-    let purged = store.purge_mcp_calls_before(1_000_000_200).unwrap();
-    assert!(
-        purged >= 1,
-        "purge must report the rows it actually removed; got {purged}"
-    );
-    assert_eq!(
-        store
-            .list_mcp_calls(p)
-            .unwrap()
-            .iter()
-            .map(|r| r.seq)
-            .collect::<Vec<_>>(),
-        vec![2, 3],
-        "rows at or after the cutoff must remain — `before` is strictly less-than, so the row \
-         exactly at the cutoff is kept"
-    );
-    // The count is real: purging past everything clears this principal's remainder.
-    let rest = store.purge_mcp_calls_before(1_000_001_000).unwrap();
-    assert!(
-        rest >= 2,
-        "the remaining two rows must actually be removed; got {rest}"
-    );
-    assert!(store.list_mcp_calls(p).unwrap().is_empty());
-}
-
-/// A record arriving on a `(principal, seq)` that already has one is settled the way the contract
-/// settles it: BYTE-IDENTICAL is the retry and succeeds; DIFFERENT is a forked or tampered log and
-/// is an error. Overwriting would destroy the second case instead of reporting it.
-#[test]
-fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
-    let Some(url) = live_url() else { return };
-    let store = connect_store_with_retry(&url).expect("connect");
-    let p = "vk_mcp_replay";
-    reset_calls(&store, &[p]);
-
-    let rec = sample_call(p, 1, 2_000_000_100, "", "h1");
-    store.append_mcp_call(&rec).unwrap();
-    store
-        .append_mcp_call(&rec)
-        .expect("an identical replay is the at-least-once retry and must succeed");
-    assert_eq!(
-        store.list_mcp_calls(p).unwrap().len(),
-        1,
-        "a replay must not duplicate the row"
-    );
-
-    let forked = sample_call(p, 1, 2_000_000_100, "", "DIFFERENT");
-    let err = store
-        .append_mcp_call(&forked)
-        .expect_err("a different record at an occupied (principal, seq) is a fork and must error");
-    assert!(
-        !format!("{err}").contains("DIFFERENT"),
-        "the error must not echo stored content back"
-    );
-    assert_eq!(
-        store.list_mcp_calls(p).unwrap()[0].hash,
-        "h1",
-        "the refused fork must not have overwritten the record already on record"
-    );
-
-    // A differing non-indexed payload under an identical digest is a fork too, not a silent accept.
-    let mut tampered = sample_call(p, 1, 2_000_000_100, "", "h1");
-    tampered.tool = "srv_other_tool".to_string();
-    store
-        .append_mcp_call(&tampered)
-        .expect_err("a payload that differs under an identical digest is a fork and must error");
-    reset_calls(&store, &[p]);
-}
-
-// ── THE DURABLE A2A TASK STORE ────────────────────────────────────────────────────────────────
-//
-// A2A is async by design: a task spans turns, can sit interrupted waiting on a human, and can
-// outlive the process that started it. So the property under test is never "put_task returned Ok" —
-// the trait's default `put_task` returns `Ok(())` and keeps nothing, `get_task` answers `None` for
-// everything and `list_tasks` answers empty, which is a backend that accepts every in-flight task
-// and loses all of them on restart while reporting success. Every test below therefore DROPS the
-// store (closing its connection entirely) and reads back through a genuinely new one, or asserts a
-// count the defaults could never produce.
-
-/// Timestamps are BANDED, for the same reason the MCP call-log tests band theirs. `purge_tasks_before`
-/// is GLOBAL by `(state, updated_at)` and cannot be scoped to a task or a principal, so against the
-/// SHARED live database a purge test's cutoff would delete every other test's terminal rows if the
-/// timestamps overlapped. Everything below the top of this band belongs to the purge tests; every
-/// other task test writes ABOVE it.
-const TASK_PURGE_BAND_TOP: u64 = 1_000_100_000;
-const TASK_LIVE_TS: u64 = 2_000_000_000;
-
-/// The two purge tests share the low band and both assert EXACT counts, so they cannot run at the
-/// same time as each other. One lock held by the handful of tests that care keeps the rest of the
-/// suite parallel.
-static TASK_PURGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn lock_task_purge() -> std::sync::MutexGuard<'static, ()> {
-    TASK_PURGE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn sample_task(task_id: &str, state: &str, updated_at: u64) -> TaskRow {
-    TaskRow {
-        task_id: task_id.to_string(),
-        context_id: format!("ctx-{task_id}"),
-        principal: "vk_a".to_string(),
-        direction: "inbound".to_string(),
-        state: state.to_string(),
-        agent_id: "planner".to_string(),
-        artifact_cursor: 4,
-        push_callback: "https://caller.example/push".to_string(),
-        created_at: TASK_LIVE_TS,
-        updated_at,
-    }
-}
-
-fn sample_event(task_id: &str, seq: u64, kind: &str, prev_hash: &str, hash: &str) -> TaskEventRow {
-    TaskEventRow {
-        task_id: task_id.to_string(),
-        seq,
-        ts: TASK_LIVE_TS + seq,
-        kind: kind.to_string(),
-        context_id: format!("ctx-{task_id}"),
-        principal: "vk_a".to_string(),
-        agent_id: "planner".to_string(),
-        state: "working".to_string(),
-        request_id: format!("req-{seq}"),
-        prev_hash: prev_hash.to_string(),
-        hash: hash.to_string(),
-    }
-}
-
-/// The live database is SHARED across tests, so each test owns its own task ids and clears them
-/// first — the same isolation-by-unique-id discipline every other live test in this file uses.
-fn reset_tasks(store: &PostgresStore, task_ids: &[&str]) {
-    for id in task_ids {
-        let mut c = store.lock();
-        c.execute("DELETE FROM task_events WHERE task_id = $1", &[id])
-            .expect("clear this test's own events");
-        c.execute("DELETE FROM tasks WHERE task_id = $1", &[id])
-            .expect("clear this test's own tasks");
-    }
-}
-
-/// Own the whole low band: a previous run's leftovers would otherwise be counted by the exact-count
-/// assertions the purge tests make.
-fn clear_purge_band(store: &PostgresStore) {
-    let mut c = store.lock();
-    c.execute(
-        "DELETE FROM task_events te USING tasks t
-         WHERE te.task_id = t.task_id AND t.updated_at < $1",
-        &[&clamp(TASK_PURGE_BAND_TOP)],
-    )
-    .expect("clear the purge band's events");
-    c.execute(
-        "DELETE FROM tasks WHERE updated_at < $1",
-        &[&clamp(TASK_PURGE_BAND_TOP)],
-    )
-    .expect("clear the purge band");
-}
-
-/// THE TEST THAT MATTERS. A round-trip on one live handle cannot distinguish a backend that wrote to
-/// the server from one holding a HashMap behind the same trait — nor from the trait default, which
-/// answers `Ok(())` to the write. So this DROPS the store, closing its connection entirely, then
-/// connects a genuinely new one and reads the task back off the server.
-#[test]
-fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
-    let Some(url) = live_url() else { return };
-    let (t1, t2) = ("t_restart_1", "t_restart_2");
-    {
-        let store = connect_store_with_retry(&url).expect("connect");
-        reset_tasks(&store, &[t1, t2]);
-        store
-            .put_task(&sample_task(t1, "working", TASK_LIVE_TS + 200))
-            .unwrap();
-        // The state transition the durability actually exists for: a live task becoming an interrupted
-        // one — an interrupted task waiting on a human is what a restart has to find.
-        let mut interrupted = sample_task(t1, "input-required", TASK_LIVE_TS + 300);
-        interrupted.artifact_cursor = 11;
-        store.put_task(&interrupted).unwrap();
-        store
-            .put_task(&sample_task(t2, "submitted", TASK_LIVE_TS + 210))
-            .unwrap();
-        drop(store);
-    }
-
-    let reopened = connect_store_with_retry(&url).expect("reconnect");
-    let got = reopened.get_task(t1).unwrap().expect(
-        "an in-flight task must survive a restart; got None back after reconnecting, which is the \
-         accept-and-keep-nothing shape of the trait default this backend exists to replace",
-    );
-    assert_eq!(
-        got,
-        {
-            let mut expect = sample_task(t1, "input-required", TASK_LIVE_TS + 300);
-            expect.artifact_cursor = 11;
-            expect
-        },
-        "every field must round-trip, and the row read back must be the SECOND write"
-    );
-
-    // UPSERT, not append: two writes for one task_id leave ONE row.
-    let mut ids = reopened
-        .list_tasks()
-        .unwrap()
-        .into_iter()
-        .filter(|t| t.task_id == t1 || t.task_id == t2)
-        .map(|t| t.task_id)
-        .collect::<Vec<_>>();
-    ids.sort();
-    assert_eq!(
-        ids,
-        vec![t1, t2],
-        "put_task upserts by task_id; a second write for the same id must replace, never append"
-    );
-    assert!(
-        reopened.get_task("t_nonexistent_task").unwrap().is_none(),
-        "an unknown task id reads back None, not an error"
-    );
-    reset_tasks(&reopened, &[t1, t2]);
-}
-
-/// `list_tasks` is deliberately UNFILTERED. The boot rehydrate wants the active rows, the retention
-/// sweep wants the terminal ones and the scoped listing wants one principal's; a store that
-/// pre-filtered for any one of those would break the other two.
-#[test]
-fn list_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
-    let Some(url) = live_url() else { return };
-    let ids = [
-        "t_list_working",
-        "t_list_interrupted",
-        "t_list_completed",
-        "t_list_failed",
-    ];
-    {
-        let store = connect_store_with_retry(&url).expect("connect");
-        reset_tasks(&store, &ids);
-        for (id, state) in ids
-            .iter()
-            .zip(["working", "input-required", "completed", "failed"])
-        {
-            store
-                .put_task(&sample_task(id, state, TASK_LIVE_TS + 200))
-                .unwrap();
-        }
-        drop(store);
-    }
-    let reopened = connect_store_with_retry(&url).expect("reconnect");
-    let mut mine = reopened
-        .list_tasks()
-        .unwrap()
-        .into_iter()
-        .filter(|t| ids.contains(&t.task_id.as_str()))
-        .map(|t| t.task_id)
-        .collect::<Vec<_>>();
-    mine.sort();
-    let mut expect = ids.to_vec();
-    expect.sort();
-    assert_eq!(
-        mine, expect,
-        "list_tasks is unfiltered: terminal rows are returned too, and every row survives a \
-         reconnect"
-    );
-    reset_tasks(&reopened, &ids);
-}
-
-/// The per-task provenance chain, read back off the server after a reconnect. Per-TASK rather than
-/// one global chain, so the scope of a read is one task and the links have to hold within it.
-///
-/// Note what this test does NOT do: it never calls `put_task`. That is deliberate. A `task.submitted`
-/// event and the first `put_task` are two independent write-throughs and the contract states no
-/// ordering between them, so appending an event for a task with no row yet has to WORK — which is
-/// why `task_events` carries no foreign key to `tasks` (see the schema).
-#[test]
-fn a_task_event_chain_survives_a_reconnect_and_still_links() {
-    let Some(url) = live_url() else { return };
-    let (t1, t2) = ("t_chain_1", "t_chain_2");
-    {
-        let store = connect_store_with_retry(&url).expect("connect");
-        reset_tasks(&store, &[t1, t2]);
-        store
-            .append_task_event(&sample_event(t1, 1, "task.submitted", "", "e1"))
-            .unwrap();
-        store
-            .append_task_event(&sample_event(t1, 2, "task.working", "e1", "e2"))
-            .unwrap();
-        store
-            .append_task_event(&sample_event(t1, 3, "task.interrupted", "e2", "e3"))
-            .unwrap();
-        // A second task's chain is independent — it must not leak into the first one's read.
-        store
-            .append_task_event(&sample_event(t2, 1, "task.submitted", "", "f1"))
-            .unwrap();
-        drop(store);
-    }
-    let reopened = connect_store_with_retry(&url).expect("reconnect");
-    let got = reopened.list_task_events(t1).unwrap();
-    assert_eq!(
-        got.len(),
-        3,
-        "the provenance chain must survive a reconnect; got {} event(s) back, which is the \
-         accept-and-keep-nothing default this backend exists to replace",
-        got.len()
-    );
-    assert_eq!(
-        got.iter().map(|e| e.seq).collect::<Vec<_>>(),
-        vec![1, 2, 3],
-        "oldest-first by seq, which is the order the chain verifier reads"
-    );
-    assert_eq!(got[0].prev_hash, "", "seq 1 opens the chain");
-    for w in got.windows(2) {
-        assert_eq!(
-            w[1].prev_hash, w[0].hash,
-            "the per-task chain must still link after a reconnect: seq {} carries prev_hash {:?} \
-             but seq {} persisted hash {:?}",
-            w[1].seq, w[1].prev_hash, w[0].seq, w[0].hash
-        );
-    }
-    // Every field round-trips, including the join key that is deliberately NOT chained.
-    assert_eq!(got[2].kind, "task.interrupted");
-    assert_eq!(got[2].request_id, "req-3");
-    assert_eq!(got[1].context_id, format!("ctx-{t1}"));
-    assert_eq!(got[1].principal, "vk_a");
-    assert_eq!(got[1].agent_id, "planner");
-    assert_eq!(got[1].state, "working");
-    assert_eq!(got[1].ts, TASK_LIVE_TS + 2);
-    // The scope of a read is one task.
-    assert_eq!(reopened.list_task_events(t2).unwrap().len(), 1);
-    assert!(
-        reopened
-            .list_task_events("t_unknown_chain")
-            .unwrap()
-            .is_empty(),
-        "a task with no events reads back empty, not an error"
-    );
-    reset_tasks(&reopened, &[t1, t2]);
-}
-
-/// A replayed `(task_id, seq)` UPSERTS. This is where the task-event contract genuinely DIFFERS from
-/// `append_mcp_call`'s, and a backend that copied the call log's fork check would be wrong in a way
-/// that looks right: the contract says a store "must upsert on that pair — the write-through is
-/// idempotent on replay, and rejecting or duplicating a replayed `seq` breaks the chain the engine
-/// will verify on read". So neither a duplicate row nor an error, on either an identical replay or a
-/// corrected one.
-#[test]
-fn a_replayed_task_event_upserts_rather_than_duplicating_or_erroring() {
-    let Some(url) = live_url() else { return };
-    let store = connect_store_with_retry(&url).expect("connect");
-    let t = "t_replay_event";
-    reset_tasks(&store, &[t]);
-
-    let e = sample_event(t, 1, "task.submitted", "", "e1");
-    store.append_task_event(&e).unwrap();
-    store
-        .append_task_event(&e)
-        .expect("an identical replay must succeed, not be rejected as a fork");
-    assert_eq!(
-        store.list_task_events(t).unwrap().len(),
-        1,
-        "a replay must not duplicate the row"
-    );
-
-    let mut corrected = sample_event(t, 1, "task.submitted", "", "e1-corrected");
-    corrected.state = "submitted".to_string();
-    store.append_task_event(&corrected).unwrap();
-    let got = store.list_task_events(t).unwrap();
-    assert_eq!(got.len(), 1, "an upsert replaces; it does not append");
-    assert_eq!(got[0].hash, "e1-corrected");
-    assert_eq!(got[0].state, "submitted");
-    reset_tasks(&store, &[t]);
-}
-
-/// Retention drops TERMINAL rows only, strictly older than the cutoff, and returns a count it
-/// actually performed. An interrupted task waiting on a human is exactly the row that legitimately
-/// sits still for a long time; compacting it is losing the work, not reclaiming space.
-#[test]
-fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
-    let Some(url) = live_url() else { return };
-    let _guard = lock_task_purge();
-    let store = connect_store_with_retry(&url).expect("connect");
-    clear_purge_band(&store);
-
-    let old = 1_000_000_100;
-    for state in ["completed", "failed", "canceled", "rejected"] {
-        store
-            .put_task(&sample_task(&format!("t_purge_old_{state}"), state, old))
-            .unwrap();
-    }
-    // Old, and NOT terminal — never dropped, no matter how old. `unrecognised-state` stands in for a
-    // token a NEWER engine emits that this build has never heard of: the terminal set is CLOSED, so
-    // an unknown token is kept rather than swept. `Completed` (capital C) is NOT the terminal token
-    // `completed`, and the difference has to survive the SQL — under a non-deterministic
-    // (case-insensitive) database collation `'Completed' = ANY(...)` would be TRUE and the sweep
-    // would drop a state token it never recognised, which is what COLLATE "C" on `tasks.state`
-    // exists to stop.
-    for state in [
-        "input-required",
-        "auth-required",
-        "working",
-        "submitted",
-        "unrecognised-state",
-        "Completed",
-    ] {
-        store
-            .put_task(&sample_task(&format!("t_purge_old_{state}"), state, old))
-            .unwrap();
-    }
-    // Terminal but at the cutoff exactly, and terminal but newer — both kept.
-    store
-        .put_task(&sample_task(
-            "t_purge_at_cutoff",
-            "completed",
-            1_000_000_200,
-        ))
-        .unwrap();
-    store
-        .put_task(&sample_task("t_purge_newer", "completed", 1_000_000_300))
-        .unwrap();
-
-    let purged = store.purge_tasks_before(1_000_000_200).unwrap();
-    assert_eq!(
-        purged, 4,
-        "only the four TERMINAL rows strictly older than the cutoff go, and the count must be one \
-         actually performed rather than a guess"
-    );
-    let mut left = store
-        .list_tasks()
-        .unwrap()
-        .into_iter()
-        .filter(|t| t.updated_at < TASK_PURGE_BAND_TOP)
-        .map(|t| t.task_id)
-        .collect::<Vec<_>>();
-    left.sort();
-    assert_eq!(
-        left,
-        vec![
-            "t_purge_at_cutoff",
-            "t_purge_newer",
-            "t_purge_old_Completed",
-            "t_purge_old_auth-required",
-            "t_purge_old_input-required",
-            "t_purge_old_submitted",
-            "t_purge_old_unrecognised-state",
-            "t_purge_old_working",
-        ],
-        "an active or interrupted task is never dropped by retention, an unrecognised state token \
-         is never dropped at all (`Completed` is not `completed`), and `before` is strictly \
-         less-than so a row exactly at the cutoff is kept"
-    );
-    assert_eq!(
-        store.purge_tasks_before(1_000_000_200).unwrap(),
-        0,
-        "re-running the same purge removes nothing"
-    );
-    clear_purge_band(&store);
-}
-
-/// Retention has to bound the EVENT table too. The trait offers no `purge_task_events_before`, so if
-/// purging a task left its provenance behind, `task_events` would grow without any bound the
-/// contract provides a way to apply. Dropping a task therefore drops the chain that belongs to it —
-/// and drops nothing belonging to any other task.
-#[test]
-fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
-    let Some(url) = live_url() else { return };
-    let _guard = lock_task_purge();
-    let store = connect_store_with_retry(&url).expect("connect");
-    clear_purge_band(&store);
-
-    let (gone, stays) = ("t_cascade_gone", "t_cascade_stays");
-    store
-        .put_task(&sample_task(gone, "completed", 1_000_000_100))
-        .unwrap();
-    store
-        .put_task(&sample_task(stays, "working", 1_000_000_100))
-        .unwrap();
-    store
-        .append_task_event(&sample_event(gone, 1, "task.submitted", "", "g1"))
-        .unwrap();
-    store
-        .append_task_event(&sample_event(gone, 2, "task.completed", "g1", "g2"))
-        .unwrap();
-    store
-        .append_task_event(&sample_event(stays, 1, "task.submitted", "", "s1"))
-        .unwrap();
-
-    assert_eq!(
-        store.purge_tasks_before(1_000_000_200).unwrap(),
-        1,
-        "exactly the one terminal task in this band is swept, and the count must be one actually \
-         performed — 0 here is the accept-and-keep-nothing default this backend exists to replace"
-    );
-    assert!(
-        store.list_task_events(gone).unwrap().is_empty(),
-        "the purged task's events go with it; otherwise task_events grows unbounded, because the \
-         contract offers no other way to purge them"
-    );
-    assert_eq!(
-        store.list_task_events(stays).unwrap().len(),
-        1,
-        "another task's chain must be untouched by that purge"
-    );
-    reset_tasks(&store, &[gone, stays]);
-    clear_purge_band(&store);
-}
-
-/// Two task ids differing ONLY IN CASE are two tasks, and the same for two chains. This is the class
-/// of bug store-mysql shipped and then fixed on its audit chain, where a case-insensitive collation
-/// let `vk_alice` read `vk_Alice`'s rows. Here the consequence would be worse in both directions:
-/// the two ids collide on the PRIMARY KEY, so one task silently upserts over the other and one of
-/// them is simply lost. Postgres's default collations are deterministic so this passes without the
-/// explicit `COLLATE "C"` too — the point of pinning it is that this store does not get to choose
-/// the database it is pointed at, and a database created with a non-deterministic ICU collation
-/// would otherwise turn every `=` in this file into a case-insensitive match.
-#[test]
-fn task_ids_differing_only_in_case_are_distinct_tasks() {
-    let Some(url) = live_url() else { return };
-    let store = connect_store_with_retry(&url).expect("connect");
-    let (lower, upper) = ("t_case_fold", "T_CASE_FOLD");
-    reset_tasks(&store, &[lower, upper]);
-
-    store
-        .put_task(&sample_task(lower, "working", TASK_LIVE_TS + 400))
-        .unwrap();
-    store
-        .put_task(&sample_task(upper, "completed", TASK_LIVE_TS + 400))
-        .unwrap();
-
-    let a = store
-        .get_task(lower)
-        .unwrap()
-        .expect("the lower-case id must still resolve");
-    let b = store
-        .get_task(upper)
-        .unwrap()
-        .expect("the upper-case id is a DIFFERENT task, not the same row");
-    assert_eq!(a.task_id, lower, "an exact-match lookup must not case-fold");
-    assert_eq!(b.task_id, upper);
-    assert_eq!(
-        a.state, "working",
-        "the second write must not have upserted over the first: they are two tasks"
-    );
-    assert_eq!(b.state, "completed");
-
-    store
-        .append_task_event(&sample_event(lower, 1, "task.submitted", "", "l1"))
-        .unwrap();
-    store
-        .append_task_event(&sample_event(upper, 1, "task.submitted", "", "u1"))
-        .unwrap();
-    assert_eq!(store.list_task_events(lower).unwrap()[0].hash, "l1");
-    assert_eq!(
-        store.list_task_events(upper).unwrap()[0].hash,
-        "u1",
-        "one task's chain must not answer for another's"
-    );
-    reset_tasks(&store, &[lower, upper]);
-}
-
-/// A `u64` a signed BIGINT cannot hold is REFUSED, not clamped. `clamp` — which every other u64 in
-/// this crate goes through — would pin it to `i64::MAX`, so the row read back would not be the row
-/// written and nothing would ever have reported an error. On this surface the value that silently
-/// changes is the ARTIFACT CURSOR, i.e. how much of a stream has been durably relayed: a mangled
-/// cursor either replays delivered artifacts or skips undelivered ones. Postgres has no unsigned
-/// BIGINT to store the full range in (store-mysql's answer), so refusing is the only honest one.
-#[test]
-fn a_task_field_beyond_the_storable_range_is_refused_rather_than_clamped() {
-    let Some(url) = live_url() else { return };
-    let store = connect_store_with_retry(&url).expect("connect");
-    let t = "t_out_of_range";
-    reset_tasks(&store, &[t]);
-
-    let mut task = sample_task(t, "working", TASK_LIVE_TS + 500);
-    task.artifact_cursor = u64::MAX;
-    let err = store
-        .put_task(&task)
-        .expect_err("a cursor above i64::MAX must be refused, never silently clamped");
-    assert!(
-        format!("{err}").contains("artifact_cursor"),
-        "the refusal must name the field that could not be stored; got {err}"
-    );
-    assert!(
-        store.get_task(t).unwrap().is_none(),
-        "a refused write must leave no row behind"
-    );
-
-    let mut event = sample_event(t, 1, "task.submitted", "", "e1");
-    event.seq = u64::MAX;
-    store
-        .append_task_event(&event)
-        .expect_err("a seq above i64::MAX must be refused too");
-    assert!(store.list_task_events(t).unwrap().is_empty());
-
-    // The largest value that DOES fit round-trips exactly, so the guard is a ceiling and not a
-    // blanket refusal of large values.
-    let mut ok = sample_task(t, "working", TASK_LIVE_TS + 500);
-    ok.artifact_cursor = i64::MAX as u64;
-    store.put_task(&ok).unwrap();
-    assert_eq!(
-        store.get_task(t).unwrap().unwrap().artifact_cursor,
-        i64::MAX as u64,
-        "the cursor must not wrap or clamp at the top of the storable range"
-    );
-    reset_tasks(&store, &[t]);
-}
-
-// ── THE DURABLE MCP DEMOTION RECORD AND THE SPENT-APPROVAL LEDGER ────────────────────────────
-//
-// Both are security state, and both arrived with the same hole: `busbar_api::Store` defaults
-// `put_mcp_demotion`/`list_mcp_demotions`/`clear_mcp_demotion` to accept-and-keep-nothing and
-// `redeem_ask_state` to `Ok(true)` — "yes, this is the first redemption" — so a backend that
-// implements neither compiles, ships and reports every write successful while discarding it. What
-// that costs is a quarantined upstream that gets the operator's approval back at the next restart,
-// and a single-use human approval that a second node of the fleet redeems again.
-//
-// Every case below reads the state back through a RECONNECTED store, and the ledger cases include a
-// second, genuinely independent connection — which is what a second node of one deployment is.
-
-/// THE LIVE URL, OR A FAILURE. Deliberately NOT `live_url()`, whose `None` arm lets a case return
-/// green having tested nothing: a store method that keeps no ledger and a test that never ran are
-/// the same green, and these two properties are exactly the ones where that costs an operator
-/// something. A test that can skip is a test that will skip on the day it matters.
-fn require_live_url() -> String {
-    std::env::var("BUSBAR_TEST_POSTGRES_URL").unwrap_or_else(|_| {
-        panic!(
-            "BUSBAR_TEST_POSTGRES_URL is unset. These cases are the ONLY coverage of the durable \
-             MCP demotion record and the spent-approval ledger on this backend, and both of them \
-             fail SILENTLY when unimplemented — the trait defaults answer `Ok(())` to a demotion \
-             and `true` to every redemption. Skipping them reports green over a quarantined \
-             upstream that comes back approved and an approval that is redeemable once per node. \
-             Point this at a live Postgres, e.g. \
-             postgres://busbar:busbar@127.0.0.1:5432/busbar_test"
-        )
-    })
-}
-
-/// Per-process namespacing. This suite runs against a SHARED Postgres in CI, so a fixed key would
-/// have two concurrent runs redeeming each other's approvals and reading each other's demotions.
-fn trust_ns(tag: &str) -> String {
-    format!("{}-{}", tag, std::process::id())
-}
-
-const TRUST_NOW: u64 = 2_000_000_000;
-
-fn demotion(server: &str, reason: &str, recorded_at: u64) -> McpDemotionRow {
-    McpDemotionRow {
-        server: server.to_string(),
-        reason: reason.to_string(),
-        recorded_at,
-    }
-}
-
-/// Drop every row this suite is about to write, so a rerun (or a crashed prior run that left rows
-/// behind) starts where a first run does.
-fn reset_trust_state(store: &PostgresStore, servers: &[&str], nonces: &[&str]) {
-    let mut client = store.lock();
-    for s in servers {
-        let _ = client.execute("DELETE FROM mcp_demotions WHERE server=$1", &[s]);
-    }
-    for n in nonces {
-        let _ = client.execute("DELETE FROM spent_ask_states WHERE nonce=$1", &[n]);
-    }
-}
-
-/// A DEMOTION OUTLIVES THE PROCESS THAT RECORDED IT. The engine derives a demotion from a live
-/// observation, and a process that has taken no observation has nothing to derive it from — it
-/// serves the upstream against the digest the operator approved. So without this row on the server,
-/// a restart hands a quarantined upstream its approval back.
-#[test]
-fn a_demotion_survives_dropping_the_store_and_reconnecting() {
-    let url = require_live_url();
-    let (a, b, c) = (
-        trust_ns("srv-payments"),
-        trust_ns("srv-search"),
-        trust_ns("srv-mail"),
-    );
-    {
-        let store = connect_store_with_retry(&url).expect("connect");
-        reset_trust_state(&store, &[&a, &b, &c], &[]);
-        store
-            .put_mcp_demotion(&demotion(&a, "tool-drift", TRUST_NOW))
-            .unwrap();
-        // UPSERT by `server`: a second demotion of one upstream REPLACES the row rather than
-        // standing a rival one beside it, so the boot read cannot hold two answers about one server.
-        store
-            .put_mcp_demotion(&demotion(&a, "digest-mismatch", TRUST_NOW + 10))
-            .unwrap();
-        store
-            .put_mcp_demotion(&demotion(&b, "tool-drift", TRUST_NOW + 20))
-            .unwrap();
-        store
-            .put_mcp_demotion(&demotion(&c, "tool-drift", TRUST_NOW + 30))
-            .unwrap();
-        store
-            .clear_mcp_demotion(&c)
-            .expect("a later observation that agrees with the approval clears the quarantine");
-        store
-            .clear_mcp_demotion(&trust_ns("srv-never-demoted"))
-            .expect("clearing a row that is not there is a no-op, not an error");
-        drop(store);
-    }
-
-    let reopened = connect_store_with_retry(&url).expect("reconnect");
-    let mut mine = reopened
-        .list_mcp_demotions()
-        .unwrap()
-        .into_iter()
-        .filter(|r| r.server == a || r.server == b || r.server == c)
-        .collect::<Vec<_>>();
-    mine.sort_by(|x, y| x.server.cmp(&y.server));
-    let mut expect = vec![
-        demotion(&a, "digest-mismatch", TRUST_NOW + 10),
-        demotion(&b, "tool-drift", TRUST_NOW + 20),
-    ];
-    expect.sort_by(|x, y| x.server.cmp(&y.server));
-    assert_eq!(
-        mine, expect,
-        "the boot read must put every recorded quarantine back in force before the first request is \
-         served — upserted to the LATEST reason, and WITHOUT the one a later agreeing observation \
-         cleared. An empty or stale answer here is the accept-and-keep-nothing trait default, and \
-         it means a restart hands a demoted upstream the operator's approval back"
-    );
-    reset_trust_state(&reopened, &[&a, &b, &c], &[]);
-}
-
-/// THE SPENT-APPROVAL LEDGER ACROSS A RESTART. The seal that carries a single-use approval is valid
-/// bytes on its second presentation exactly as on its first; only a record that the first happened
-/// tells them apart. In process memory that record dies with the process while the approval it
-/// records is still openable — so this drops the connection and asks a new one.
-#[test]
-fn a_reconnected_store_refuses_a_second_redemption_of_the_same_approval() {
-    let url = require_live_url();
-    let (spent, fresh) = (trust_ns("nonce-restart"), trust_ns("nonce-restart-other"));
-    {
-        let store = connect_store_with_retry(&url).expect("connect");
-        reset_trust_state(&store, &[], &[&spent, &fresh]);
-        assert!(
-            store
-                .redeem_ask_state(&spent, TRUST_NOW + 900, TRUST_NOW)
-                .unwrap(),
-            "the FIRST redemption must be answered `true`, or nothing below is about single use"
-        );
-        drop(store);
-    }
-
-    let reopened = connect_store_with_retry(&url).expect("reconnect");
-    assert!(
-        !reopened
-            .redeem_ask_state(&spent, TRUST_NOW + 900, TRUST_NOW + 1)
-            .unwrap(),
-        "a restart handed a spent approval back. The approval has not lapsed — outliving a restart \
-         is the point of it — so the only thing that changed is that the process which recorded the \
-         redemption is gone. On a tool an operator gated because it moves money, that second \
-         redemption is the whole defect the gate exists to stop"
-    );
-    // THE CONTROL, and it is load-bearing: a ledger that refused everything would satisfy the case
-    // above and would have deleted the feature.
-    assert!(
-        reopened
-            .redeem_ask_state(&fresh, TRUST_NOW + 900, TRUST_NOW + 2)
-            .unwrap(),
-        "a different approval is not the one that was spent; refusing it would make the ledger a \
-         blanket refusal of every confirmation after the first"
-    );
-    reset_trust_state(&reopened, &[], &[&spent, &fresh]);
-}
-
-/// TWO CONNECTIONS ARE TWO NODES OF A FLEET, and this is the arrangement the durable ledger exists
-/// for. They share the deployment's signing key, so they share the SEAL — every check but this one
-/// passes on both — and the second redemption needs no timing skill at all: it is an ordinary
-/// sequential request that a load balancer sends somewhere else.
-#[test]
-fn a_second_node_cannot_redeem_an_approval_the_first_already_spent() {
-    let url = require_live_url();
-    let nonce = trust_ns("nonce-fleet");
-    let node_a = connect_store_with_retry(&url).expect("node A connects");
-    let node_b = connect_store_with_retry(&url).expect("node B connects");
-    reset_trust_state(&node_a, &[], &[&nonce]);
-
-    assert!(node_a
-        .redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
-        .unwrap());
-    assert!(
-        !node_b
-            .redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
-            .unwrap(),
-        "a second node of the same deployment redeemed an approval the first already spent, which \
-         is one operator confirmation executing once per node"
-    );
-    reset_trust_state(&node_a, &[], &[&nonce]);
-}
-
-/// CONCURRENT REDEMPTION IS THE ATTACK, not the corner case. Eight independent CONNECTIONS — not
-/// eight threads sharing one — race on one approval through a barrier, which is the arrangement a
-/// read-then-write implementation answers "first" to eight times. Exactly one may win.
-#[test]
-fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
-    let url = require_live_url();
-    let nonce = trust_ns("nonce-race");
-    let cleanup = connect_store_with_retry(&url).expect("connect");
-    reset_trust_state(&cleanup, &[], &[&nonce]);
-    drop(cleanup);
-
-    let n = 8usize;
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
-    let winners: usize = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..n)
-            .map(|_| {
-                let url = url.clone();
-                let nonce = nonce.clone();
-                let barrier = std::sync::Arc::clone(&barrier);
-                scope.spawn(move || {
-                    let node = connect_store_with_retry(&url).expect("a racing node connects");
-                    barrier.wait();
-                    node.redeem_ask_state(&nonce, TRUST_NOW + 900, TRUST_NOW)
-                        .expect("redeem_ask_state") as usize
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).sum()
-    });
-
-    assert_eq!(
-        winners, 1,
-        "exactly one redemption of one approval may be the first; {winners} nodes were each told \
-         they were, which is a test-and-set that is really a read followed by a write"
-    );
-    let cleanup = connect_store_with_retry(&url).expect("connect");
-    reset_trust_state(&cleanup, &[], &[&nonce]);
-}
-
-/// THE LEDGER IS BOUNDED BY ONE APPROVAL-VALIDITY WINDOW. `now` is handed to every redemption so the
-/// backend can drop what has lapsed in the same call — an entry recording an approval that can no
-/// longer be opened protects nothing, and a table that only grows is its own outage.
-#[test]
-fn redeeming_evicts_entries_whose_approval_can_no_longer_be_opened() {
-    let url = require_live_url();
-    let (short, long, other) = (
-        trust_ns("nonce-short"),
-        trust_ns("nonce-long"),
-        trust_ns("nonce-sweeper"),
-    );
-    let store = connect_store_with_retry(&url).expect("connect");
-    reset_trust_state(&store, &[], &[&short, &long, &other]);
-
-    assert!(store
-        .redeem_ask_state(&short, TRUST_NOW + 10, TRUST_NOW)
-        .unwrap());
-    assert!(store
-        .redeem_ask_state(&long, TRUST_NOW + 10_000, TRUST_NOW)
-        .unwrap());
-
-    // A redemption past the first entry's expiry: the sweep rides along with it.
-    let later = TRUST_NOW + 11;
-    assert!(store.redeem_ask_state(&other, later + 900, later).unwrap());
-
-    let still_there = |nonce: &str| -> bool {
-        store
-            .lock()
-            .query_one(
-                "SELECT COUNT(*) FROM spent_ask_states WHERE nonce=$1",
-                &[&nonce],
-            )
-            .map(|r| r.get::<_, i64>(0) > 0)
-            .expect("count the ledger row")
-    };
-    assert!(
-        !still_there(&short),
-        "the entry whose approval can no longer be opened must be evicted by the sweep the \
-         redemption carries; a ledger that only grows is its own outage"
-    );
-    assert!(
-        still_there(&long),
-        "an approval still inside its window must NOT be swept — evicting it early is exactly the \
-         double redemption this ledger exists to refuse"
-    );
-    reset_trust_state(&store, &[], &[&short, &long, &other]);
-}
-
-/// REFUSED RATHER THAN CLAMPED, and here the reason is sharper than it is for a task cursor. The
-/// crate-wide `clamp` pins a `u64` above `i64::MAX` to `i64::MAX`; a `now` clamped that way sweeps
-/// the ENTIRE ledger and then reports the insert as a first redemption, i.e. an out-of-range
-/// argument would silently reopen every spent approval in the deployment. The engine's call site
-/// turns a store error into a REFUSED redemption, so an error is the direction to fail in.
-#[test]
-fn the_ledger_refuses_values_it_cannot_store_faithfully() {
-    let url = require_live_url();
-    let nonce = trust_ns("nonce-range");
-    let store = connect_store_with_retry(&url).expect("connect");
-    reset_trust_state(&store, &[&trust_ns("srv-range")], &[&nonce]);
-
-    store
-        .redeem_ask_state(&nonce, u64::MAX, TRUST_NOW)
-        .expect_err("an unstorable expires_at must be an error, never a silent first redemption");
-    store
-        .redeem_ask_state(&nonce, TRUST_NOW + 900, u64::MAX)
-        .expect_err(
-        "an unstorable now must be an error: clamped to i64::MAX it would evict the entire ledger \
-         and then report every replay as a first redemption",
-    );
-    store
-        .put_mcp_demotion(&demotion(&trust_ns("srv-range"), "tool-drift", u64::MAX))
-        .expect_err("an unstorable recorded_at must be an error rather than a mangled row");
-
-    // The top of the storable range still stores, so the guard is a ceiling and not a blanket
-    // refusal of large values.
-    assert!(store
-        .redeem_ask_state(&nonce, i64::MAX as u64, TRUST_NOW)
-        .unwrap());
-    reset_trust_state(&store, &[&trust_ns("srv-range")], &[&nonce]);
-}
-
-/// THE NEW TABLES CARRY AN EXPLICIT COLLATION, and it is not decoration. This store does not get to
-/// choose the database it is pointed at, and a database created with a NON-DETERMINISTIC ICU
-/// collation makes `=` case- and accent-insensitive. On these two tables that is a security defect
-/// rather than a curiosity: two upstream ids differing only in case would COLLIDE on the demotion
-/// primary key (one quarantine silently overwriting another's), and — far worse — a nonce differing
-/// only in case from a spent one would collide too, so `redeem_ask_state` would refuse a DIFFERENT,
-/// legitimately fresh approval, while an attacker's near-miss variants map onto one row. `COLLATE
-/// "C"` states byte-exactness rather than inheriting it. Asserted from the catalogue, so the DDL
-/// cannot quietly lose it.
-#[test]
-fn the_trust_state_key_columns_pin_a_byte_exact_collation() {
-    let url = require_live_url();
-    let store = connect_store_with_retry(&url).expect("connect");
-    for (table, column) in [("mcp_demotions", "server"), ("spent_ask_states", "nonce")] {
-        let collation: Option<String> = store
-            .lock()
-            .query_one(
-                "SELECT c.collname FROM pg_attribute a
-                   JOIN pg_class t ON t.oid = a.attrelid
-                   LEFT JOIN pg_collation c ON c.oid = a.attcollation
-                  WHERE t.relname = $1 AND a.attname = $2 AND a.attnum > 0",
-                &[&table, &column],
-            )
-            .map(|r| r.get(0))
-            .unwrap_or_else(|e| panic!("{table}.{column} must exist in the catalogue: {e}"));
-        assert_eq!(
-            collation.as_deref(),
-            Some("C"),
-            "{table}.{column} must pin COLLATE \"C\". Inheriting the database's collation means a \
-             non-deterministic ICU database decides whether two distinct keys are the same key, and \
-             on a ledger whose whole job is telling one nonce from another that is the defect"
-        );
-    }
-}
+// The durable MCP call log, A2A task store, demotion record and single-use ledger, which 1.5.x
+// reached through protocol-named methods, now ride the eight neutral plane-record verbs. Their
+// coverage — durability across a reconnect, fork refusal, retention, the fleet-wide ledger —
+// lives in its own file.
+mod plane_records;
+
+// ── THE 1.6.0 RECORD SHAPES AND THE IN-PLACE v6 -> v10 UPGRADE ─────────────────────────────────
+mod v160_shapes;

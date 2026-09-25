@@ -22,9 +22,33 @@ node.
 
 This plugin is versioned **independently of busbar** — `v1.0.0` here says
 nothing about which busbar release it is. Compatibility with busbar is
-stated separately: **requires busbar 1.5.0+** (the release that ships the
-signed hybrid plugin ABI this crate loads over). Pin both versions
+stated separately: **requires busbar 1.6.0+** (the release whose store
+interface this crate implements: the kind-tagged plane-record verbs, the
+name-keyed usage ledger and the dated metering rows). Pin both versions
 explicitly in production; do not assume they move together.
+
+### Upgrading from a 1.5.x deployment
+
+The first connect of this build upgrades an existing database **in place**
+(schema v6 → v10, inside one transaction, under the same advisory lock every
+node's migration takes). Nothing is dropped and no existing row changes
+meaning:
+
+- `keys` gains `idp_subject`, `binding_mode`, `minted_by` (NULL for existing
+  keys) and `allowed_scopes_by_kind`, which holds non-pool scope grants
+  (`mcp_server`, `agent`, …). Pool grants stay in `allowed_pools` exactly as
+  1.5.x wrote them.
+- `usage_metering` gains `priced_from_ms` (existing rows read `0`, the opening
+  rate card) and it joins the primary key, so a rate-card change mid-day opens
+  a second row for that day.
+- New tables: `usage_ledger_units` and `usage_metering_units` (unit classes
+  other than the four reserved token classes), and `plane_records`,
+  `plane_chain`, `plane_tokens` (busbar's durable A2A tasks, MCP call log,
+  upstream demotions, push-callback capabilities and single-use approvals).
+
+A database a pre-release dev build took to schema v7–v9 keeps its
+`mcp_calls`/`tasks`/`task_events`/`mcp_demotions`/`spent_ask_states` tables
+untouched; busbar 1.6.0 no longer reads them.
 
 It is a `cdylib` that implements busbar's `Store` trait (via
 [`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk))
@@ -73,13 +97,13 @@ the engine's JSON config (`{"url": "postgres://..."}`) into a
 See the doc comments at the top of
 [`store-postgres/src/lib.rs`](store-postgres/src/lib.rs)
 for the full design rationale — that is where the actual store logic
-lives (in this repo now, not busbarAI); `store-postgres-plugin/` is the
+lives (in this repo now, not busbar); `store-postgres-plugin/` is the
 thin `cdylib` adapter around it.
 
 ## Build
 
 Needs a Rust toolchain ([rustup](https://rustup.rs)), and — interim,
-until [busbarAI](https://github.com/GetBusbar/busbar) ships publicly
+until [busbar](https://github.com/GetBusbar/busbar) ships publicly
 — a sibling checkout of `busbar` at `../busbar` (see
 [Dependencies](#dependencies) below).
 
@@ -98,8 +122,8 @@ adapter — see [members](Cargo.toml)). `busbar-store-postgres` is a
 SAME-REPO sibling dependency; only `busbar-api` and `busbar-plugin-sdk`
 (and, as a dev-dependency of the plugin adapter for the end-to-end
 test, `busbar-plugin-loader`) still reach into the
-[busbarAI](https://github.com/GetBusbar/busbar) monorepo. Because
-busbarAI is not yet public, both crates' `Cargo.toml`s point at those
+[busbar](https://github.com/GetBusbar/busbar) monorepo. Because
+busbar is not yet public, both crates' `Cargo.toml`s point at those
 as **local path dependencies** (`../../busbar/crates/...`), which
 means this repo expects to be checked out as a sibling of `busbar`:
 
@@ -112,7 +136,7 @@ some-parent-dir/
     └── store-postgres-plugin/     # busbar-store-postgres-plugin — the thin dlopen adapter
 ```
 
-This is an interim measure — once busbarAI ships publicly, these
+This is an interim measure — once busbar ships publicly, these
 should become git (pinned rev/tag) or crates.io dependencies instead.
 Grep both crates' `Cargo.toml` for the `INTERIM` comments when doing
 that migration.
@@ -141,7 +165,11 @@ loader.
 `store-postgres/src/tests.rs` holds the store's own coverage against a
 live database: tombstone semantics, slot-safe credential minting,
 revocation, snapshot isolation, and each migration boundary on its own
-throwaway database.
+throwaway database (including a released 1.5.x database upgraded in place).
+`src/tests/plane_records.rs` covers the plane-record verbs, and
+`src/tests/store_conformance.rs` is this repo's own copy of busbar's `Store`
+conformance suite, taken verbatim from busbar's in-tree copy and wired in
+full.
 
 All of them are gated on the `BUSBAR_TEST_POSTGRES_URL` env var, and
 they refuse to skip silently under CI. An unset variable there is a
@@ -153,8 +181,11 @@ export BUSBAR_TEST_POSTGRES_URL=postgres://busbar:busbar@localhost:5432/busbar_t
 cargo test --workspace
 ```
 
-Locally, with the env var unset, both test suites print a `skip:`
-message and pass — no database needed for a bare `cargo test`. Under
+Locally, with the env var unset, most live cases print a `skip:`
+message and pass. The trust-state cases (demotions, the single-use token
+ledger, push-callback liveness — in `plane_records.rs` and the
+`trust_state_…` e2e case) deliberately FAIL instead of skipping, because
+their unimplemented form is silently green; run them against a database. Under
 CI (`CI` env var set — see `.github/workflows/ci.yml`), a *missing*
 `BUSBAR_TEST_POSTGRES_URL` is a **hard failure**, not a silent skip:
 CI provisions a real `postgres:16` GitHub Actions service container on
@@ -165,7 +196,7 @@ every push, specifically so this coverage can never quietly vanish.
 Once built, the cdylib is packed and signed like any other busbar
 plugin — see
 [`docs/plugins.md`](https://github.com/GetBusbar/busbar/blob/main/docs/plugins.md#signing-and-packaging)
-in busbarAI for the full reference. In short:
+in busbar for the full reference. In short:
 
 ```sh
 BUSBAR_SIGN_KEY=<signing key> busbar-plugin-pack pack \

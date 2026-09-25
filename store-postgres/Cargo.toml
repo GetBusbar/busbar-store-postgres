@@ -9,14 +9,17 @@ description = "The Postgres backend for busbar's durable governance store — th
 license = "Apache-2.0"
 
 [dependencies]
-# INTERIM: busbarAI isn't public yet, so this is a local path dependency into a sibling checkout of
-# the monorepo. Once busbarAI ships publicly this should become a git (pinned rev/tag) or crates.io
+# INTERIM: busbar isn't public yet, so this is a local path dependency into a sibling checkout of
+# the monorepo. Once busbar ships publicly this should become a git (pinned rev/tag) or crates.io
 # dependency instead — same pattern already applied to busbar-plugin-sdk in ../store-postgres-plugin.
 busbar-api = { path = "../../busbar/crates/api" }
 postgres = "0.19"
 serde_json = "1"
 
-# NO DEV-DEPENDENCIES. The `Store` contract conformance suite used to arrive here as
-# `busbar-plugin-testkit`; the owner ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a
-# shared test util between plugins, so this crate owns its copy at `src/tests/store_conformance.rs`.
-# All it needs is `busbar-api`, which is already a normal dependency above.
+[dev-dependencies]
+# The `Store` contract conformance suite used to arrive here as `busbar-plugin-testkit`; the owner
+# ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a shared test util between plugins, so
+# this crate owns its copy at `src/tests/store_conformance.rs` (verbatim from busbar's in-tree copy).
+# Its plane-record checks serialize stand-in rows with serde derive, hence this one dev-dependency;
+# no busbar crate beyond `busbar-api` is needed.
+serde = { version = "1", features = ["derive"] }

@@ -230,7 +230,7 @@ fn plugin_path() -> PathBuf {
 }
 
 /// The sibling busbar checkout's root (same convention `e2e.rs` already uses for its path deps).
-fn busbarai_root() -> PathBuf {
+fn busbar_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../busbar")
         .canonicalize()
@@ -240,27 +240,40 @@ fn busbarai_root() -> PathBuf {
 /// Build (once, cached by cargo) and return the real `busbar` and `busbar-plugin-pack` binaries,
 /// both from the sibling busbar checkout — never a fixture, never a stub.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
-    let root = busbarai_root();
-    let status = Command::new("cargo")
-        .args([
+    let root = busbar_root();
+    // busbar 1.6.0 folded `busbar-plugin-pack` into `busbar-plugin-sdk` as a feature-gated [[bin]]
+    // (the same build line busbar's own plugin-ci.yml uses). Two invocations, because `--features`
+    // applies to the one package it names.
+    for args in [
+        &["build", "--release", "-p", "busbar", "--bin", "busbar"][..],
+        &[
             "build",
             "--release",
             "-p",
-            "busbar",
-            "-p",
+            "busbar-plugin-sdk",
+            "--features",
+            "pack",
+            "--bin",
             "busbar-plugin-pack",
-        ])
-        .current_dir(&root)
-        .status()
-        .expect("run cargo build for busbar + busbar-plugin-pack");
-    assert!(
-        status.success(),
-        "building the real busbar + busbar-plugin-pack binaries must succeed"
-    );
-    (
-        root.join("target/release/busbar"),
-        root.join("target/release/busbar-plugin-pack"),
-    )
+        ][..],
+    ] {
+        let status = Command::new("cargo")
+            .args(args)
+            .current_dir(&root)
+            .status()
+            .expect("run cargo build for busbar + busbar-plugin-pack");
+        assert!(
+            status.success(),
+            "building the real busbar + busbar-plugin-pack binaries must succeed ({args:?})"
+        );
+    }
+    // The nested `cargo build` inherits this process's environment, so a CARGO_TARGET_DIR set for
+    // the test run redirects THAT build too; look where it actually put the binaries.
+    let release = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target"))
+        .join("release");
+    (release.join("busbar"), release.join("busbar-plugin-pack"))
 }
 
 /// Reserve a free loopback port for the admin listener (bind-then-drop; the standard, small-TOCTOU
@@ -414,6 +427,13 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             .env("BUSBAR_PROVIDERS", &providers)
             .env("BUSBAR_ADMIN_TOKEN", admin_token)
             .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
+            // busbar 1.6.0 REFUSES BOOT on a provider credential that cannot resolve (BUSBAR-9007),
+            // and the fixture's provider names `env: MOCK_KEY`. Any value will do: the mock
+            // upstream is never dialled.
+            .env(
+                "MOCK_KEY",
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )
             .env("BUSBAR_STATE_FILE", ""),
         work.join("boot1.log"),
         "boot #1 (memory store, admin listener up)",
@@ -446,7 +466,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     );
 
     // A mutation WITHOUT the admin token must be rejected -- the surface really is guarded, not
-    // open, mirroring the exact assertion busbarAI core's own
+    // open, mirroring the exact assertion busbar core's own
     // `test_admin_v1_plugin_install_list_reload_remove` makes. Over a REAL out-of-process TCP
     // connection (unlike that in-process axum test), a server that rejects before reading the
     // full request body can legitimately close the connection rather than complete a clean 401
@@ -534,7 +554,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         "the installed postgres plugin must be listed in the real catalog: {items:?}"
     );
 
-    // Install alone does NOT hot-swap the active store (confirmed against busbarAI core's own
+    // Install alone does NOT hot-swap the active store (confirmed against busbar core's own
     // `reload_plugins`/`PUT /config/settings` doc comments -- `store` is on the restart_required
     // list, and there is no live-swap endpoint for it). A real restart is the only real activation
     // path, so this test uses one, same as a real operator would.
@@ -557,6 +577,13 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             .env("BUSBAR_PROVIDERS", &providers)
             .env("BUSBAR_ADMIN_TOKEN", admin_token)
             .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
+            // busbar 1.6.0 REFUSES BOOT on a provider credential that cannot resolve (BUSBAR-9007),
+            // and the fixture's provider names `env: MOCK_KEY`. Any value will do: the mock
+            // upstream is never dialled.
+            .env(
+                "MOCK_KEY",
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )
             .env("BUSBAR_STATE_FILE", ""),
         work.join("boot2.log"),
         "boot #2 (postgres store, the admin-installed plugin)",

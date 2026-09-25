@@ -69,19 +69,45 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
 name = "busbar-api"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "async-trait",
+ "busbar-contract",
+ "busbar-secret-ref",
  "hex",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+]
+
+[[package]]
+name = "busbar-contract"
+version = "1.6.0"
+dependencies = [
+ "futures",
+ "serde",
  "smallvec",
  "zeroize",
 ]
 
 [[package]]
-name = "busbar-plugin-abi"
+name = "busbar-kernel-ledger"
+version = "1.6.0"
+dependencies = [
+ "busbar-contract",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "busbar-kernel-wal"
+version = "1.6.0"
+dependencies = [
+ "busbar-contract",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "busbar-plugin"
 version = "1.5.0"
 dependencies = [
  "busbar-api",
@@ -95,14 +121,19 @@ version = "1.5.0"
 dependencies = [
  "async-trait",
  "busbar-api",
- "busbar-plugin-abi",
- "busbar-plugin-sign",
+ "busbar-contract",
+ "busbar-kernel-ledger",
+ "busbar-kernel-wal",
+ "busbar-plugin",
+ "ed25519-dalek",
  "flate2",
  "getrandom 0.3.4",
+ "hex",
  "libc",
  "libloading",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tar",
  "tokio",
  "tracing",
@@ -113,21 +144,18 @@ name = "busbar-plugin-sdk"
 version = "1.5.0"
 dependencies = [
  "busbar-api",
- "busbar-plugin-abi",
+ "busbar-plugin",
  "serde_json",
  "tracing",
  "tracing-core",
 ]
 
 [[package]]
-name = "busbar-plugin-sign"
+name = "busbar-secret-ref"
 version = "1.5.0"
 dependencies = [
- "ed25519-dalek",
- "hex",
  "serde",
  "serde_json",
- "sha2 0.11.0",
 ]
 
 [[package]]
@@ -136,6 +164,7 @@ version = "1.0.0"
 dependencies = [
  "busbar-api",
  "postgres",
+ "serde",
  "serde_json",
 ]
 
@@ -423,6 +452,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a88cf1f829d945f548cf8fec32c61b1f202b6d93b45848602fc02af4b12ad218"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -439,10 +483,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2cd50c473c80f6d7c3670a752354b8e569b1a7cbfdc0419ec88e5edad85e0dc7"
 
 [[package]]
+name = "futures-executor"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6754879cc9f2c66f88c6e5c35344bb0bdb0708b0352b1201815667c7eabc7458"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-io"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4577ecaa3c4f96589d473f679a71b596316f6641bc350038b962a5daf0085d7a"
+
+[[package]]
+name = "futures-macro"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d6d3cde68c518367be28956066ddfef33813991b77a55005a69dae04bf3b10b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "futures-sink"
@@ -462,8 +528,10 @@ version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a77a90a256fce34da66415271e30f94ee91c57b04b8a2c042d9cf3220179deaa"
 dependencies = [
+ "futures-channel",
  "futures-core",
  "futures-io",
+ "futures-macro",
  "futures-sink",
  "futures-task",
  "memchr",
