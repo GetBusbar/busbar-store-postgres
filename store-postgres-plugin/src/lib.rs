@@ -1,39 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The **Postgres store as a droppable busbar plugin** — a `cdylib` exporting the store C ABI.
-//! Build it, drop the resulting `.so`/`.dll`/`.dylib` into the engine's plugins folder, and set
+//! The **Postgres store as a droppable busbar plugin** — the `cdylib` a signed tarball of the store
+//! carries (`kind: store`, alias `postgres`). Drop it into the engine's plugins folder and set
 //! `store: { module: postgres, settings: { url: "postgres://..." } }`; the engine loads it
 //! in-process at boot. One Postgres behind a fleet of busbar nodes means shared virtual keys,
 //! budgets, and usage across the cluster.
 //!
-//! All the SQL lives in the `busbar-store-postgres` `lib` crate (which a custom build can also link
-//! statically). Here we only adapt the engine's JSON config into a `PostgresStore`.
+//! All the store lives in the `busbar-store-postgres` crate, including its one door registration
+//! (`export_store_plugin!(open)`): the frozen symbols the loader looks up are the SDK's, defined once,
+//! and they answer through that door. This crate re-exports the logic crate so the library it builds
+//! carries exactly the code a busbar build that links the store runs — one source, both doors
+//! (DECISIONS #2 rule (1)). Do NOT call the export macro here: two door registrations in one image.
 
-use busbar_api::Store;
-use busbar_store_postgres::PostgresStore;
+#![deny(unsafe_code)]
 
-/// Construct a Postgres store from the JSON config the engine passes through `open`:
-///
-/// ```json
-/// { "url": "postgres://user:pass@host:5432/busbar" }
-/// ```
-fn open(cfg: &str) -> Result<Box<dyn Store>, String> {
-    let v: serde_json::Value = if cfg.trim().is_empty() {
-        serde_json::Value::Object(Default::default())
-    } else {
-        serde_json::from_str(cfg).map_err(|e| format!("invalid postgres plugin config: {e}"))?
-    };
-    let url = v
-        .get("url")
-        .and_then(|x| x.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            "postgres plugin config requires a \"url\" (a libpq connection string)".to_string()
-        })?;
-    let store = PostgresStore::connect(url).map_err(|e| e.0)?;
-    Ok(Box::new(store))
-}
-
-busbar_plugin_sdk::export_store_plugin!(open);
+pub use busbar_store_postgres::*;

@@ -229,28 +229,46 @@ fn plugin_path() -> PathBuf {
     fresh
 }
 
-/// The sibling busbar checkout's root (same convention `e2e.rs` already uses for its path deps).
+/// The busbar checkout the real binaries are built from: `BUSBAR_CHECKOUT` when set, else a sibling
+/// `busbar/` beside this repo. It must be busbar at the rev `.busbar-ref` pins (ci.yml checks it out
+/// there), so the binary these tests drive is the one this plugin's contract dependency names. A
+/// missing checkout FAILS the test, never skips it.
 fn busbar_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../busbar")
-        .canonicalize()
-        .expect("sibling busbar checkout must exist (see Cargo.toml path deps)")
+    let root = std::env::var_os("BUSBAR_CHECKOUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../busbar"));
+    root.canonicalize().unwrap_or_else(|e| {
+        panic!(
+            "no busbar checkout at {} ({e}): set BUSBAR_CHECKOUT to a checkout of GetBusbar/busbar \
+             at the .busbar-ref rev, or check it out beside this repo",
+            root.display()
+        )
+    })
 }
 
 /// Build (once, cached by cargo) and return the real `busbar` and `busbar-plugin-pack` binaries,
 /// both from the sibling busbar checkout — never a fixture, never a stub.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
-    // busbar 1.6.0 folded `busbar-plugin-pack` into `busbar-plugin-sdk` as a feature-gated [[bin]]
-    // (the same build line busbar's own plugin-ci.yml uses). Two invocations, because `--features`
-    // applies to the one package it names.
+    // `busbar-plugin-pack` is a feature-gated [[bin]] of `busbar-plugin-loader` (roster def 14:
+    // author-side packaging). Two invocations, because `--features` applies to the one package it
+    // names. `--locked`: the checkout's own lockfile, never rewritten.
     for args in [
-        &["build", "--release", "-p", "busbar", "--bin", "busbar"][..],
         &[
             "build",
             "--release",
+            "--locked",
             "-p",
-            "busbar-plugin-sdk",
+            "busbar",
+            "--bin",
+            "busbar",
+        ][..],
+        &[
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "busbar-plugin-loader",
             "--features",
             "pack",
             "--bin",

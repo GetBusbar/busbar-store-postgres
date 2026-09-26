@@ -7,7 +7,7 @@
 //! v6) database to v10, which must keep every existing row readable and meaning what it meant.
 
 use super::*;
-use busbar_api::UsageDelta;
+use busbar_contract::records::UsageDelta;
 
 /// The schema a RELEASED 1.5.x build (store-postgres v1.0.0-v1.0.6, schema v6) created, verbatim
 /// from `main` (comments stripped). The upgrade test builds a database from exactly this, fills it

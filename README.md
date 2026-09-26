@@ -50,8 +50,8 @@ A database a pre-release dev build took to schema v7–v9 keeps its
 `mcp_calls`/`tasks`/`task_events`/`mcp_demotions`/`spent_ask_states` tables
 untouched; busbar 1.6.0 no longer reads them.
 
-It is a `cdylib` that implements busbar's `Store` trait (via
-[`busbar-plugin-sdk`](https://github.com/GetBusbar/busbar/tree/main/crates/plugin-sdk))
+It is a `cdylib` that implements busbar's `RecordStore` trait (via the plugin SDK in
+[`busbar-contract`](https://github.com/GetBusbar/busbar/tree/main/crates/busbar-contract))
 and is loaded in-process by busbar over the signed hybrid plugin ABI —
 `dlopen`'d, not spawned as a separate process.
 
@@ -117,29 +117,28 @@ cargo fmt --all -- --check
 ## Dependencies
 
 This is a same-repo, 2-crate Cargo workspace (`store-postgres/`, the
-real logic crate, and `store-postgres-plugin/`, the thin `cdylib`
-adapter — see [members](Cargo.toml)). `busbar-store-postgres` is a
-SAME-REPO sibling dependency; only `busbar-api` and `busbar-plugin-sdk`
-(and, as a dev-dependency of the plugin adapter for the end-to-end
-test, `busbar-plugin-loader`) still reach into the
-[busbar](https://github.com/GetBusbar/busbar) monorepo. Because
-busbar is not yet public, both crates' `Cargo.toml`s point at those
-as **local path dependencies** (`../../busbar/crates/...`), which
-means this repo expects to be checked out as a sibling of `busbar`:
+real logic crate — which also carries the plugin's one door
+registration, `export_store_plugin!(open)`, and its `linked` row — and
+`store-postgres-plugin/`, the thin `cdylib` adapter that re-exports it;
+see [members](Cargo.toml)).
 
-```
-some-parent-dir/
-├── busbar/
-└── store-postgres/
-    ├── Cargo.toml                 # workspace root
-    ├── store-postgres/            # busbar-store-postgres — the real logic crate
-    └── store-postgres-plugin/     # busbar-store-postgres-plugin — the thin dlopen adapter
-```
+Its one busbar dependency is `busbar-contract` (plus
+`busbar-plugin-loader`, dev-only, for the conformance and end-to-end
+tests): a **git dependency** on
+[GetBusbar/busbar](https://github.com/GetBusbar/busbar) pinned to the
+rev in field 1 of [`.busbar-ref`](.busbar-ref). No sibling-checkout
+path dependency ships in any manifest; CI's `pin` job refuses one, and
+refuses a manifest rev that disagrees with `.busbar-ref`.
 
-This is an interim measure — once busbar ships publicly, these
-should become git (pinned rev/tag) or crates.io dependencies instead.
-Grep both crates' `Cargo.toml` for the `INTERIM` comments when doing
-that migration.
+The end-to-end tests drive the REAL `busbar` binary, built from a
+busbar checkout at that same rev: `BUSBAR_CHECKOUT=<path>`, or a
+`busbar/` checkout beside this repo (CI checks one out there).
+
+`store-postgres-plugin/tests/conformance.rs` holds the store to ONE
+row and ONE behaviour through both doors — linked (the `linked::STORE`
+boundary) and dropped in (this repo's cdylib, signed, packed, scanned
+and opened by the real loader) — with RED arms that prove the
+comparison is not vacuous.
 
 ## Tests need a real Postgres
 

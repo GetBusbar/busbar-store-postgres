@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# This repo brings 100% of what it needs: the real Postgres store logic (store-postgres) and the thin
-# dlopen ABI adapter that packages it as a busbar plugin (store-postgres-plugin) both live here, as a
-# same-repo Cargo workspace — not split across this repo and busbar. Only busbar-api/busbar-plugin-sdk
-# (and, for the adapter's dev-dependencies, busbar-plugin-loader) still reach into a sibling busbar
-# checkout, since those are core-engine contracts every plugin depends on the same way.
+# One repo per plugin (owner ruling, busbar 1.6.0): this repo brings 100% of what the Postgres
+# governance store needs — the store logic (busbar-store-postgres, an rlib a busbar build can link,
+# carrying the plugin's one door registration) and the thin cdylib that packages it as a droppable
+# `kind: store` plugin (busbar-store-postgres-plugin) — as a same-repo Cargo workspace.
+#
+# Its one busbar dependency is busbar-contract (busbar-plugin-loader too, dev-only for the
+# conformance and end-to-end tests), a git dependency on GetBusbar/busbar pinned to the rev in
+# `.busbar-ref` field 1. No sibling-checkout path dependency ships in any manifest.
 [workspace]
 resolver = "2"
 members = [
