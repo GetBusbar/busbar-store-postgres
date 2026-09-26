@@ -19,7 +19,7 @@
 //!
 //! RED ARMS, in the same test and always run (no database needed): the same bytes signed as
 //! `kind: secret` are refused at the kind handshake naming both kinds, and the same statement over
-//! DIFFERENT bytes (the cdylib truncated) is not the same store — its transcript differs from the
+//! DIFFERENT bytes (the cdylib with its object magic broken) is not the same store — its transcript differs from the
 //! linked one, so the comparison above cannot pass vacuously.
 
 use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
@@ -281,9 +281,12 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
         "{e}"
     );
 
-    // RED ARM 2: the same statement over DIFFERENT bytes is not the same store.
-    let truncated = &lib[..lib.len() / 2];
-    let red_registry = dropped("red", statement("store"), truncated);
+    // RED ARM 2: the same statement over DIFFERENT bytes is not the same store. The object's magic
+    // is broken (not a truncation: glibc can hand back the image already loaded under the same
+    // SONAME for bytes that still parse, which would make this arm pass as the store it is not).
+    let mut foreign = lib.clone();
+    foreign[..4].copy_from_slice(b"XXXX");
+    let red_registry = dropped("red", statement("store"), &foreign);
     let red = transcript("red", &red_registry, None);
     let linked_no_db = transcript("linked-no-db", &linked_registry, None);
     assert_ne!(
