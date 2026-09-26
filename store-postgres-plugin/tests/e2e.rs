@@ -298,12 +298,21 @@ fn set_referenced_secret_envs(cmd: &mut Command, config_text: &str) {
     }
 }
 
-/// The sibling busbar checkout's root (same convention this repo already uses for its path deps).
+/// The busbar checkout the real binaries are built from: `BUSBAR_CHECKOUT` when set, else a sibling
+/// `busbar/` beside this repo. It must be busbar at the rev `.busbar-ref` pins (ci.yml checks it out
+/// there), so the binary these tests drive is the one this plugin's contract dependency names. A
+/// missing checkout FAILS the test, never skips it.
 fn busbar_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../busbar")
-        .canonicalize()
-        .expect("sibling busbar checkout must exist (see Cargo.toml path deps)")
+    let root = std::env::var_os("BUSBAR_CHECKOUT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../busbar"));
+    root.canonicalize().unwrap_or_else(|e| {
+        panic!(
+            "no busbar checkout at {} ({e}): set BUSBAR_CHECKOUT to a checkout of GetBusbar/busbar \
+             at the .busbar-ref rev, or check it out beside this repo",
+            root.display()
+        )
+    })
 }
 
 /// Build (once, cached by cargo) and return the path to the real `busbar` binary and the real
@@ -311,16 +320,25 @@ fn busbar_root() -> PathBuf {
 /// stub, the exact binaries a real release ships.
 fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
-    // busbar 1.6.0 folded `busbar-plugin-pack` into `busbar-plugin-sdk` as a feature-gated [[bin]]
-    // (the same build line busbar's own plugin-ci.yml uses). Two invocations, because `--features`
-    // applies to the one package it names.
+    // `busbar-plugin-pack` is a feature-gated [[bin]] of `busbar-plugin-loader` (roster def 14:
+    // author-side packaging). Two invocations, because `--features` applies to the one package it
+    // names. `--locked`: the checkout's own lockfile, never rewritten.
     for args in [
-        &["build", "--release", "-p", "busbar", "--bin", "busbar"][..],
         &[
             "build",
             "--release",
+            "--locked",
             "-p",
-            "busbar-plugin-sdk",
+            "busbar",
+            "--bin",
+            "busbar",
+        ][..],
+        &[
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "busbar-plugin-loader",
             "--features",
             "pack",
             "--bin",
@@ -514,7 +532,7 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     assert!(
         booted,
         "a real busbar boot with the file-dropped postgres plugin must create the `keys` table \
-         (via Store::connect/migrate) within 15s -- proof the real dlopen+connect path executed \
+         (via RecordStore::connect/migrate) within 15s -- proof the real dlopen+connect path executed \
          during boot, not a no-op\n--- boot output ---\n{}",
         guard.output()
     );
@@ -634,7 +652,7 @@ fn plane_decode(b: &[u8]) -> serde_json::Value {
 /// in-process cache still fails here.
 #[test]
 fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_api::{PlaneDisposition, PlaneRecord, PlaneSelector, Store};
+    use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
 
     let path = plugin_path();
     let Some(url) = postgres_url() else {
@@ -648,7 +666,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // contract-level wipe, so this needs no raw-SQL knowledge of the schema. No other test in this
     // binary touches the `call` kind.
     let direct = PostgresStore::connect(&url).expect("connect directly to clean up and verify");
-    Store::purge_plane_records_before(&direct, "call", i64::MAX as u64)
+    RecordStore::purge_plane_records_before(&direct, "call", i64::MAX as u64)
         .expect("wipe the call log before this run");
 
     // Per-run principal ids: a read that only THIS run's writes can answer. Two of them, because one
@@ -685,7 +703,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
             },
         })),
     };
-    let chain = |store: &dyn Store, principal: &str| -> Vec<serde_json::Value> {
+    let chain = |store: &dyn RecordStore, principal: &str| -> Vec<serde_json::Value> {
         store
             .list_plane_records("call", &PlaneSelector::Parent(principal.to_string()))
             .expect("list_plane_records over the ABI")
@@ -800,7 +818,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     );
     assert_eq!(direct_calls[1]["hash"], "h3");
 
-    Store::purge_plane_records_before(&direct, "call", i64::MAX as u64)
+    RecordStore::purge_plane_records_before(&direct, "call", i64::MAX as u64)
         .expect("clean up this run's records");
 }
 
@@ -818,7 +836,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 /// and read everything back; a third leg reads through the plain `PostgresStore`.
 #[test]
 fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_api::{PlaneDisposition, PlaneRecord, PlaneSelector, Store};
+    use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
 
     let path = plugin_path();
     let Some(url) = postgres_url() else {
@@ -830,7 +848,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // asserted exactly below, so a leftover terminal row from an earlier run would make that
     // assertion meaningless. The store's own contract-level sweep of exactly that population.
     let direct = PostgresStore::connect(&url).expect("connect directly to clean up and verify");
-    Store::purge_plane_records_before(&direct, "task", i64::MAX as u64)
+    RecordStore::purge_plane_records_before(&direct, "task", i64::MAX as u64)
         .expect("wipe terminal tasks before this run");
 
     let stamp = format!(
@@ -873,7 +891,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
             "content": { "kind": kind, "request_id": format!("req-{seq}") },
         })),
     };
-    let events = |store: &dyn Store, id: &str| -> Vec<serde_json::Value> {
+    let events = |store: &dyn RecordStore, id: &str| -> Vec<serde_json::Value> {
         store
             .list_plane_records("task_event", &PlaneSelector::Parent(id.to_string()))
             .expect("list_plane_records over the ABI")
@@ -1024,7 +1042,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     drop(store);
 
     // LEG 3 — the surviving rows through the plain `PostgresStore`.
-    let direct_task = Store::get_plane_record(&direct, "task", &t_live)
+    let direct_task = RecordStore::get_plane_record(&direct, "task", &t_live)
         .expect("get_plane_record via the direct connection")
         .expect("the task must be physically present in Postgres, not just cached in-process");
     let direct_task = plane_decode(&direct_task);
@@ -1033,7 +1051,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     assert_eq!(events(&direct, &t_live).len(), 3);
 
     // Clean up this run's rows through the contract: mark the survivor terminal, then sweep.
-    Store::upsert_plane_record(
+    RecordStore::upsert_plane_record(
         &direct,
         &task(
             &t_live,
@@ -1044,7 +1062,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         ),
     )
     .expect("clean up this run's task");
-    Store::purge_plane_records_before(&direct, "task", i64::MAX as u64)
+    RecordStore::purge_plane_records_before(&direct, "task", i64::MAX as u64)
         .expect("clean up this run's rows");
 }
 
@@ -1061,7 +1079,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 /// coverage of two properties whose unimplemented form is silently green.
 #[test]
 fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_api::{PlaneDisposition, PlaneRecord, PlaneSelector, Store};
+    use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
 
     let path = plugin_path();
     let url = std::env::var("BUSBAR_TEST_POSTGRES_URL").unwrap_or_else(|_| {
@@ -1099,7 +1117,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
             "server": server, "reason": reason, "recorded_at": at,
         })),
     };
-    let demotions = |store: &dyn Store| -> Vec<(String, String)> {
+    let demotions = |store: &dyn RecordStore| -> Vec<(String, String)> {
         store
             .list_plane_records("demotion", &PlaneSelector::All)
             .expect("list_plane_records")
@@ -1190,7 +1208,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "the demotion must be physically present in Postgres, not merely cached in the plugin"
     );
     assert!(
-        !Store::redeem_plane_token(&direct, "ask", &nonce_restart, NOW + 900, NOW + 5)
+        !RecordStore::redeem_plane_token(&direct, "ask", &nonce_restart, NOW + 900, NOW + 5)
             .expect("redeem_plane_token via the direct connection"),
         "the spent-token row must be physically present in Postgres"
     );
@@ -1198,6 +1216,6 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // Clean up this run's demotion through the contract. The ledger entries are left ON PURPOSE:
     // the contract gives the ledger no delete, only the expiry sweep a redemption carries, and
     // firing that with a far-future `now` would evict rows a CONCURRENT test process relies on.
-    Store::delete_plane_record(&direct, "demotion", &srv_demoted)
+    RecordStore::delete_plane_record(&direct, "demotion", &srv_demoted)
         .expect("clean up this run's demotion");
 }

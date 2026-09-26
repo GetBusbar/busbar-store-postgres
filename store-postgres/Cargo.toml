@@ -5,14 +5,15 @@ version = "1.0.0"
 publish = false            # internal workspace crate; never goes to crates.io
 edition = "2021"
 rust-version = "1.97"
-description = "The Postgres backend for busbar's durable governance store — the shared, multi-node db plugin. Implements busbar_api::Store over a mutex-guarded sync postgres client."
+description = "The Postgres backend for busbar's durable governance store — the shared, multi-node db plugin. Implements busbar_contract::records::RecordStore over a mutex-guarded sync postgres client."
 license = "Apache-2.0"
 
 [dependencies]
-# INTERIM: busbar isn't public yet, so this is a local path dependency into a sibling checkout of
-# the monorepo. Once busbar ships publicly this should become a git (pinned rev/tag) or crates.io
-# dependency instead — same pattern already applied to busbar-plugin-sdk in ../store-postgres-plugin.
-busbar-api = { path = "../../busbar/crates/api" }
+# The ONE busbar crate this plugin names (#40: contract only; DECISIONS #84 merged the plugin SDK
+# into it as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`;
+# a busbar build that links this crate `[patch]`es the busbar git source to its own tree, so ONE
+# copy of the contract links.
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9" }
 postgres = "0.19"
 serde_json = "1"
 
@@ -21,5 +22,5 @@ serde_json = "1"
 # ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a shared test util between plugins, so
 # this crate owns its copy at `src/tests/store_conformance.rs` (verbatim from busbar's in-tree copy).
 # Its plane-record checks serialize stand-in rows with serde derive, hence this one dev-dependency;
-# no busbar crate beyond `busbar-api` is needed.
+# no busbar crate beyond `busbar-contract` is needed.
 serde = { version = "1", features = ["derive"] }

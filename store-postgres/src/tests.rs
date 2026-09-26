@@ -6,7 +6,7 @@
 //! `postgres:16`.
 
 use super::*;
-use busbar_api::{
+use busbar_contract::records::{
     CredentialMeta, CredentialSecret, ModelTokensDelta, PlaneDisposition, PlaneRecord,
     PlaneSelector, SecretForm,
 };
@@ -172,14 +172,14 @@ fn connect_client_with_retry(url: &str) -> postgres::Client {
 /// `PostgresStore::connect` with bounded retry-with-backoff. Each connect opens a fresh connection
 /// AND runs `migrate()`, so under the core gate's parallel-test load against a shared Postgres a
 /// single connect can be TRANSIENTLY refused when the server is momentarily at its connection
-/// ceiling (surfacing as `StoreError("db error")` / too-many-clients) -- the exact class of flake
+/// ceiling (surfacing as `RecordStoreError("db error")` / too-many-clients) -- the exact class of flake
 /// the gate hit on the isolation test's connect. Every live-DB test needs at least this one store
 /// connection, so footprint reduction alone can't harden the primary connect; retrying ~10 times
-/// over a couple of seconds absorbs the transient. Returns the same `StoreResult` `connect` does, so
+/// over a couple of seconds absorbs the transient. Returns the same `RecordStoreResult` `connect` does, so
 /// each caller keeps its own `.expect(...)` message. NOT used where a connect is EXPECTED to fail
 /// (the permission test asserts `.is_err()` directly and must not spin on a genuine, persistent
 /// error).
-fn connect_store_with_retry(url: &str) -> StoreResult<PostgresStore> {
+fn connect_store_with_retry(url: &str) -> RecordStoreResult<PostgresStore> {
     let mut last_err = None;
     for attempt in 0..10u32 {
         if attempt > 0 {
@@ -749,7 +749,7 @@ fn hydration_delta_makes_credential_deletion_observable_via_the_key_tombstone() 
     assert!(
         cred_deltas.iter().all(|c| c.meta.key_id != id),
         "a hard-deleted credential produces no further delta -- this is the documented gap the \
-         consumer-side contract (see Store::list_credentials_since's doc) exists to close"
+         consumer-side contract (see RecordStore::list_credentials_since's doc) exists to close"
     );
 }
 
@@ -795,7 +795,7 @@ fn get_usage_transaction_is_actually_repeatable_read() {
     // connection was pure connection-footprint overhead here (this assertion never needed a
     // *separate* connection, only a real one), and under the core gate's parallel-test load against
     // a shared Postgres its `.connect()` transiently failed on connection pressure -- the observed
-    // flake panicked at this test's connect path (`connect: StoreError("db error")`), never on the
+    // flake panicked at this test's connect path (`connect: RecordStoreError("db error")`), never on the
     // isolation assertion below. Reusing the store's client (extending what b2f3804 did for the
     // sibling torn-read test) halves this test's connection count and removes the refuse-able
     // connect, while testing the real helper against a real client just as faithfully. The scope
@@ -928,7 +928,7 @@ fn metering_roundtrip_new_fields() {
     let bucket = 20_270_101u64;
     hard_reset(&store, "vk_meter_new1");
     store
-        .add_metering(&busbar_api::MeteringDelta {
+        .add_metering(&busbar_contract::records::MeteringDelta {
             key_id: "vk_meter_new1".into(),
             bucket,
             model: "m".into(),
@@ -1404,7 +1404,7 @@ fn purge_windows_and_metering_delete_only_what_is_older_than_the_boundary() {
     // usage_metering, whose boundary parameter is a STRING on this trait method while every other
     // metering method takes it as u64. The parse is the only caller-supplied parse in the crate.
     let key_id = format!("vk_purge_meter_{}", unique_suffix());
-    let meter = |bucket: u64| busbar_api::MeteringDelta {
+    let meter = |bucket: u64| busbar_contract::records::MeteringDelta {
         key_id: key_id.clone(),
         bucket,
         model: "m".into(),

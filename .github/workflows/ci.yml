@@ -1,5 +1,20 @@
-# Calls the canonical plugin-ci reusable workflow (GetBusbar/busbar/.github/workflows/plugin-ci.yml)
-# instead of hand-copying build/test/signoff steps here — see that file for what actually runs.
+# store-postgres CI — build, test, the live-Postgres suites, and the store's linked + dropped-in
+# conformance, against the busbar rev this repo PINS.
+#
+# This repo builds standalone: its only busbar dependency (busbar-contract, and busbar-plugin-loader
+# for the conformance/e2e tests) is a `git` dependency on https://github.com/GetBusbar/busbar at the
+# rev in field 1 of `.busbar-ref`. No path dependency — so what CI proves is exactly what a busbar
+# build that pulls this repo at a pinned rev links. The end-to-end tests drive the REAL `busbar`
+# binary, so busbar is ALSO checked out beside this repo at that same pinned rev (`busbar/`) — the
+# binary the tests boot is the one the contract dependency names, never a moving branch.
+#
+# The moving leg (this repo's `dev` against busbar's `predev`) is busbar's side of the contract: its
+# ci.yml `consumers` job builds this repo's `dev` with the busbar crates patched to busbar's own tree.
+#
+# LIVE POSTGRES ON EVERY LEG. The live suites read BUSBAR_TEST_POSTGRES_URL and, under CI, FAIL when
+# it is unset (never skip). ubuntu gets the digest-pinned postgres:16 service container; macOS has no
+# service containers, so it runs postgresql@16 from Homebrew on the same port with the same role and
+# database.
 name: ci
 
 on:
@@ -7,52 +22,124 @@ on:
     branches: [main, dev, qa]
   pull_request:
     branches: [main, dev, qa]
-  # Manual trigger. Needed because `gh run rerun` PINS the reusable-workflow SHA:
-  # a rerun re-uses the plugin-ci.yml snapshot from the original run, so a fix landing in
-  # core's reusable workflow can only be picked up by a NEW run, never by rerunning an old one.
   workflow_dispatch: {}
-jobs:
-  ci:
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@dev
-    with:
-      plugin_crate: busbar-store-postgres-plugin
-      plugin_kind: store
-      plugin_alias: postgres
-      service: postgres
-      # UNPINNED from `feat/1.5.5-mcp-integrated` on merge to dev: that pin existed only because
-      # core `dev` did not yet carry the durable MCP tool-call log contract, and the pin's own note
-      # said to move back to the branch ref once that line merged. Core dev now exports all four
-      # methods (append_mcp_call / list_mcp_calls / list_mcp_call_principals /
-      # purge_mcp_calls_before), so the precondition is met and CI tracks the branch again.
-      busbar_ref: ${{ github.base_ref || github.ref_name }}
-      # base_ref FIRST: on a pull_request `github.ref_name` is '<number>/merge', not a branch
-      # name, so this asked busbar for a branch called '5/merge' and the sibling checkout died
-      # with an unreadable git error on EVERY pull request to this repo.
-      # NOTE: no extra_sibling_test_command here (unlike before this repo's 2-crate-workspace
-      # restructure). `extra_sibling_test_command: cargo test -p busbar-store-postgres` used to
-      # exercise the monorepo's own copy of the store logic against the sibling busbar checkout's
-      # `crates/store-postgres` package; that package no longer exists in busbar (the real logic
-      # crate now lives HERE, in this repo's own `store-postgres/` member) — the plugin's own
-      # `cargo test` step above (working-directory: plugin, a workspace covering both
-      # `busbar-store-postgres` and `busbar-store-postgres-plugin`) already exercises it in full,
-      # so the sibling-checkout step would now fail (no such package) and is redundant besides.
 
-  # ── coverage: ADDITIVE and INFORMATIONAL. Runs llvm-cov over this repo's workspace and uploads to
-  # Codecov. It is NOT part of the required `ci` gate above (Codecov is configured informational in
-  # codecov.yml and this job never fail_ci_if_error), so a coverage hiccup can never block a PR.
-  #
-  # It mirrors the reusable plugin-ci.yml's setup exactly, because this repo's workspace has path
-  # dependencies into a SIBLING busbar checkout (busbar-api / busbar-plugin-sdk / plugin-loader): the
-  # plugin is checked out to `plugin/` and GetBusbar/busbar to `busbar/`, so
-  # `plugin/store-postgres/../../busbar` resolves to that sibling — the same layout `cargo test`
-  # uses. It boots the same digest-pinned postgres:16 service container and sets the same
-  # BUSBAR_TEST_POSTGRES_URL, so the live-DB roundtrip tests run under coverage rather than skipping.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  pin:
+    name: the busbar pin is one rev
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Every `rev = "..."` on the busbar git source in every manifest is field 1 of `.busbar-ref`.
+      # Two revs would link two copies of the contract; a rev that disagrees with `.busbar-ref` makes
+      # the pin a lie about what the release builds against.
+      - name: every busbar git dependency names the .busbar-ref rev
+        run: |
+          set -euo pipefail
+          pin=$(awk '{print $1; exit}' .busbar-ref)
+          [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::.busbar-ref field 1 is not a full sha: '$pin'"; exit 1; }
+          found=$(grep -hoE 'git = "https://github.com/GetBusbar/busbar", rev = "[0-9a-f]+"' */Cargo.toml | grep -oE '[0-9a-f]{40}' | sort -u)
+          [ -n "$found" ] || { echo "::error::no busbar git dependency found"; exit 1; }
+          if [ "$found" != "$pin" ]; then
+            echo "::error::busbar revs in manifests ($found) != .busbar-ref ($pin)"; exit 1
+          fi
+          if grep -nE 'path = "\.\./\.\./' */Cargo.toml; then
+            echo "::error::a manifest names a sibling-checkout path dependency"; exit 1
+          fi
+          if grep -nE '^(busbar-api|busbar-plugin-sdk|busbar-plugin) ' */Cargo.toml; then
+            echo "::error::a manifest names a retired busbar crate (busbar-contract only, #40)"; exit 1
+          fi
+          echo "pinned busbar rev: $pin"
+
+  build-test:
+    name: fmt, clippy, build, test, conformance [${{ matrix.os }}]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # Cold: the plugin workspace plus a release build of the pinned busbar binary and the pack tool
+    # for the end-to-end tests.
+    timeout-minutes: 90
+    services:
+      # Service containers exist only on Linux runners; the macOS leg provisions Postgres below.
+      postgres:
+        image: ${{ matrix.os == 'ubuntu-latest' && 'postgres:16@sha256:95206741a5b214807675e14165369d05b93a9cf692223b616d07cca227e74b0b' || '' }}
+        env:
+          POSTGRES_USER: busbar
+          POSTGRES_PASSWORD: busbar
+          POSTGRES_DB: busbar_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U busbar"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      BUSBAR_TEST_POSTGRES_URL: postgres://busbar:busbar@localhost:5432/busbar_test
+      BUSBAR_CHECKOUT: ${{ github.workspace }}/busbar
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: plugin
+      - name: Resolve the pinned busbar rev
+        id: pin
+        run: echo "sha=$(awk '{print $1; exit}' plugin/.busbar-ref)" >> "$GITHUB_OUTPUT"
+      - name: Checkout busbar at the PINNED rev (the binary the e2e tests boot)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: GetBusbar/busbar
+          ref: ${{ steps.pin.outputs.sha }}
+          path: busbar
+      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            plugin
+            busbar
+          key: pin-${{ steps.pin.outputs.sha }}
+      - name: Postgres (macOS — Homebrew postgresql@16, same role/db/port as the Linux service)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          brew install postgresql@16
+          pgbin="$(brew --prefix postgresql@16)/bin"
+          data="$RUNNER_TEMP/pgdata"
+          echo busbar > "$RUNNER_TEMP/pwfile"
+          "$pgbin/initdb" -D "$data" -U busbar --pwfile="$RUNNER_TEMP/pwfile" -A scram-sha-256
+          "$pgbin/pg_ctl" -D "$data" -o "-p 5432 -c max_connections=200" -l "$RUNNER_TEMP/pg.log" -w start
+          PGPASSWORD=busbar "$pgbin/createdb" -h localhost -p 5432 -U busbar busbar_test
+          PGPASSWORD=busbar "$pgbin/pg_isready" -h localhost -p 5432 -U busbar
+      - name: fmt
+        working-directory: plugin
+        run: cargo fmt --all -- --check
+      - name: clippy
+        working-directory: plugin
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: build (the rlib a busbar build links, and the cdylib a signed tarball carries)
+        working-directory: plugin
+        run: cargo build --workspace --locked
+      - name: test (store suites + live Postgres + linked/dropped-in conformance + real-binary e2e)
+        working-directory: plugin
+        run: cargo test --workspace --locked
+
+  # ── coverage: ADDITIVE and INFORMATIONAL (Codecov is informational in codecov.yml and the upload
+  # never fails the job). Same pinned busbar checkout and live Postgres as build-test.
   coverage:
     name: coverage (llvm-cov · codecov)
     runs-on: ubuntu-latest
-    # Copied from the reference coverage job: run on every PR/dispatch, and on push only to the
-    # protected branches this repo builds on. On a PR, github.base_ref is the target branch, so the
-    # sibling busbar checkout below always resolves to an existing branch (main/dev/qa).
+    timeout-minutes: 90
     if: github.event_name != 'push' || contains(fromJSON('["refs/heads/main", "refs/heads/dev", "refs/heads/qa"]'), github.ref)
     services:
       postgres:
@@ -68,38 +155,37 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+    env:
+      BUSBAR_TEST_POSTGRES_URL: postgres://busbar:busbar@localhost:5432/busbar_test
+      BUSBAR_CHECKOUT: ${{ github.workspace }}/busbar
     steps:
-      - name: Checkout the plugin (this repo's workspace)
-        uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: plugin
-      - name: Checkout busbar (sibling path dependency)
-        uses: actions/checkout@v7
+      - name: Resolve the pinned busbar rev
+        id: pin
+        run: echo "sha=$(awk '{print $1; exit}' plugin/.busbar-ref)" >> "$GITHUB_OUTPUT"
+      - name: Checkout busbar at the PINNED rev
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: GetBusbar/busbar
-          ref: ${{ github.base_ref || github.ref_name }}
+          ref: ${{ steps.pin.outputs.sha }}
           path: busbar
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@62ae3a85dbdd2bedbb5819da8ce45635129289a1 # 1.98.0
         with:
           components: llvm-tools-preview
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
-          # Both Cargo workspaces live under path: checkouts, so neither is at $GITHUB_WORKSPACE —
-          # list both explicitly or the cache silently no-ops (see plugin-ci.yml's note).
           workspaces: |
             plugin
             busbar
-          key: coverage-${{ github.base_ref || github.ref_name }}
+          key: coverage-${{ steps.pin.outputs.sha }}
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Collect coverage (workspace, live-DB tests wired)
         working-directory: plugin
-        env:
-          BUSBAR_TEST_POSTGRES_URL: postgres://busbar:busbar@localhost:5432/busbar_test
         run: cargo llvm-cov --workspace --locked --ignore-run-fail --lcov --output-path lcov.info
-      - name: Upload to Codecov (tokenless; never fails the build)
+      - name: Upload to Codecov (never fails the build)
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

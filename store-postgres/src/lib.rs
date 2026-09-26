@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The **Postgres** backend for busbar's durable governance store — the shared, multi-node `db`
-//! plugin. Implements `busbar_api::Store` over a mutex-guarded synchronous `postgres` client,
-//! depending only on the `busbar-api` contract (plus the `postgres` driver), never on the engine.
+//! plugin. Implements `busbar_contract::records::RecordStore` over a mutex-guarded synchronous `postgres` client,
+//! depending only on the `busbar-contract` crate (plus the `postgres` driver), never on the engine.
 //!
 //! Schema v10 (busbar 1.6.0): the kind-tagged plane-record tables, the name-keyed usage ledger and
 //! the dated metering key, upgraded IN PLACE from a 1.5.x (v6) database — see `SCHEMA_VERSION`.
@@ -37,10 +37,10 @@
 //!   the `Store` trait's observable behavior; they're purely internal to this crate and can be
 //!   added later without another schema bump.
 
-use busbar_api::{
+use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    PlaneDisposition, PlaneRecord, PlaneSelector, ScopeRef, SecretForm, Store, StoreError,
-    StoreResult, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ, UNIT_CACHE_WRITE,
+    PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult,
+    ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ, UNIT_CACHE_WRITE,
     UNIT_INPUT, UNIT_OUTPUT,
 };
 use postgres::types::ToSql;
@@ -48,14 +48,14 @@ use postgres::{Client, NoTls, Row, Transaction};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-// postgres driver error -> the api's backend-agnostic `StoreError` (the contract crate stays
+// postgres driver error -> the api's backend-agnostic `RecordStoreError` (the contract crate stays
 // storage-free, so the `From` impl that powers `?` cannot live there).
 trait IntoStoreResult<T> {
-    fn store(self) -> StoreResult<T>;
+    fn store(self) -> RecordStoreResult<T>;
 }
 impl<T> IntoStoreResult<T> for Result<T, postgres::Error> {
-    fn store(self) -> StoreResult<T> {
-        self.map_err(|e| StoreError(render_pg_error(&e)))
+    fn store(self) -> RecordStoreResult<T> {
+        self.map_err(|e| RecordStoreError(render_pg_error(&e)))
     }
 }
 
@@ -523,7 +523,7 @@ impl PostgresStore {
     /// Connect to Postgres with the given libpq connection string / URL and ensure the schema. TLS
     /// is not wired in this build (`NoTls`); front the database with a TLS-terminating proxy or a
     /// local socket.
-    pub fn connect(conn_str: &str) -> StoreResult<Self> {
+    pub fn connect(conn_str: &str) -> RecordStoreResult<Self> {
         let secret = dsn_password(conn_str);
         // `render_pg_error`, not `e.to_string()`. A server-side refusal (bad database name, failed
         // authentication, an unavailable extension) is a `db_error` whose Display is the literal
@@ -531,7 +531,7 @@ impl PostgresStore {
         // rendered as the least actionable string in the crate, while every query error had already
         // been fixed to carry its SQLSTATE and message. Still scrubbed of the DSN password.
         let client = Client::connect(conn_str, NoTls)
-            .map_err(|e| StoreError(scrub(render_pg_error(&e), secret.as_deref())))?;
+            .map_err(|e| RecordStoreError(scrub(render_pg_error(&e), secret.as_deref())))?;
         let store = Self {
             client: Mutex::new(client),
         };
@@ -549,7 +549,7 @@ impl PostgresStore {
     /// `get_usage` or the hydration delta queries).
     pub(crate) fn snapshot_consistent_tx<'a>(
         client: &'a mut Client,
-    ) -> StoreResult<postgres::Transaction<'a>> {
+    ) -> RecordStoreResult<postgres::Transaction<'a>> {
         client
             .build_transaction()
             .isolation_level(postgres::IsolationLevel::RepeatableRead)
@@ -559,7 +559,7 @@ impl PostgresStore {
 
     const MIGRATE_LOCK_KEY: i64 = 0x6275_7362_6172_5f70; // ASCII "busbar_p"
 
-    fn migrate(&self) -> StoreResult<()> {
+    fn migrate(&self) -> RecordStoreResult<()> {
         let mut client = self.lock();
         client
             .batch_execute(&format!(
@@ -578,7 +578,7 @@ impl PostgresStore {
         // (which takes the same lock before its own migrate) for the remaining lifetime of this
         // process's connection, with previously zero trace that it happened.
         match (result, unlocked) {
-            (Ok(()), Err(e)) => Err(StoreError(format!(
+            (Ok(()), Err(e)) => Err(RecordStoreError(format!(
                 "migrate: schema migration succeeded but releasing the advisory lock failed ({e}); \
                  a sibling node's own migrate() may now hang waiting for this lock"
             ))),
@@ -586,7 +586,7 @@ impl PostgresStore {
         }
     }
 
-    fn migrate_locked(client: &mut Client) -> StoreResult<()> {
+    fn migrate_locked(client: &mut Client) -> RecordStoreResult<()> {
         client
             .batch_execute("CREATE TABLE IF NOT EXISTS busbar_schema (version BIGINT PRIMARY KEY)")
             .store()?;
@@ -595,7 +595,7 @@ impl PostgresStore {
                 Ok(Some(r)) => r.get(0),
                 Ok(None) => 0,
                 Err(e) if is_undefined_table(&e) => 0,
-                Err(e) => return Err(StoreError(e.to_string())),
+                Err(e) => return Err(RecordStoreError(e.to_string())),
             };
         // ALREADY CURRENT: run no DDL at all. Every node runs `migrate()` on every connect, and
         // `SCHEMA`'s `CREATE INDEX IF NOT EXISTS` takes a SHARE lock on its table before it
@@ -686,7 +686,7 @@ impl PostgresStore {
     /// and credentials do): calling it first fixes a single lock-acquisition order
     /// (`store_revision` row, then whatever else the transaction touches) across every mutating
     /// method, which is what makes cross-method deadlock structurally impossible.
-    fn next_revision(tx: &mut Transaction<'_>) -> StoreResult<i64> {
+    fn next_revision(tx: &mut Transaction<'_>) -> RecordStoreResult<i64> {
         tx.query_one(
             "UPDATE store_revision SET revision = revision + 1 WHERE only_row RETURNING revision",
             &[],
@@ -835,8 +835,8 @@ fn row_to_cred_meta(r: &Row) -> CredentialMeta {
     }
 }
 
-impl Store for PostgresStore {
-    fn put_key(&self, key: &VirtualKey) -> StoreResult<()> {
+impl RecordStore for PostgresStore {
+    fn put_key(&self, key: &VirtualKey) -> RecordStoreResult<()> {
         let (pools, by_kind) = scopes_to_storage(&key.allowed_scopes);
         let labels = labels_to_storage(&key.labels);
         let created = clamp(key.created_at);
@@ -877,7 +877,7 @@ impl Store for PostgresStore {
         if changed == 0 {
             // The conflict branch matched a row but its WHERE rejected the write: the stored row is
             // tombstoned and this one is not. That is the only way to reach 0 here.
-            return Err(StoreError(format!(
+            return Err(RecordStoreError(format!(
                 "put_key: '{}' is tombstoned and its id is never reissued; refusing to clear the \
                  tombstone",
                 key.id
@@ -887,13 +887,13 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn get_key(&self, id: &str) -> StoreResult<Option<VirtualKey>> {
+    fn get_key(&self, id: &str) -> RecordStoreResult<Option<VirtualKey>> {
         let sql = format!("SELECT {KEY_COLUMNS} FROM keys WHERE id=$1");
         let row = self.lock().query_opt(&sql, &[&id]).store()?;
         Ok(row.map(|r| row_to_key(&r)))
     }
 
-    fn list_keys(&self) -> StoreResult<Vec<VirtualKey>> {
+    fn list_keys(&self) -> RecordStoreResult<Vec<VirtualKey>> {
         // Deliberately UNFILTERED (tombstoned rows included) -- see the trait doc: this serves both
         // the admin-listing caller (which filters deleted_at.is_none() itself) and list_keys_since's
         // default fallback, which needs tombstones visible to drive credential eviction downstream.
@@ -902,13 +902,13 @@ impl Store for PostgresStore {
         Ok(rows.iter().map(row_to_key).collect())
     }
 
-    fn list_keys_since(&self, since: u64) -> StoreResult<Vec<VirtualKey>> {
+    fn list_keys_since(&self, since: u64) -> RecordStoreResult<Vec<VirtualKey>> {
         let sql = format!("SELECT {KEY_COLUMNS} FROM keys WHERE revision > $1 ORDER BY revision");
         let rows = self.lock().query(&sql, &[&clamp(since)]).store()?;
         Ok(rows.iter().map(row_to_key).collect())
     }
 
-    fn delete_key(&self, id: &str) -> StoreResult<()> {
+    fn delete_key(&self, id: &str) -> RecordStoreResult<()> {
         // TOMBSTONE, not a hard delete: the `keys` row survives (billing/audit attribution keeps
         // resolving it forever) while every credential row for it is destroyed. Both happen in ONE
         // transaction stamped with the SAME revision, which is the load-bearing property for
@@ -933,7 +933,7 @@ impl Store for PostgresStore {
                 // operator's intent is satisfied and the evidence is on disk, while "no such id"
                 // means nothing was touched - and answering Ok there tells an operator who typo'd
                 // an id that a key was revoked when none was.
-                return Err(StoreError(format!("delete_key: unknown id '{id}'")));
+                return Err(RecordStoreError(format!("delete_key: unknown id '{id}'")));
             }
             Some(true) => {
                 // Already tombstoned: no-op, not an error.
@@ -975,7 +975,7 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn scrub_key(&self, id: &str) -> StoreResult<()> {
+    fn scrub_key(&self, id: &str) -> RecordStoreResult<()> {
         // PII-erasure only: null name/labels on an ALREADY-tombstoned key. Errors if unknown or
         // still live -- scrubbing a live key would be silent, un-auditable data loss on an active
         // principal (the trait doc's own guard: go through delete_key first).
@@ -989,9 +989,9 @@ impl Store for PostgresStore {
             .store()?
             .map(|r| r.get(0));
         match deleted {
-            None => return Err(StoreError(format!("scrub_key: unknown key {id}"))),
+            None => return Err(RecordStoreError(format!("scrub_key: unknown key {id}"))),
             Some(false) => {
-                return Err(StoreError(format!(
+                return Err(RecordStoreError(format!(
                     "scrub_key: key {id} is not tombstoned -- call delete_key first"
                 )))
             }
@@ -1013,7 +1013,7 @@ impl Store for PostgresStore {
             )
             .store()?;
         if changed == 0 {
-            return Err(StoreError(format!(
+            return Err(RecordStoreError(format!(
                 "scrub_key: key {id} was resurrected (deleted_at cleared) concurrently with this \
                  call -- refusing to scrub a key that is live by the time the write landed"
             )));
@@ -1022,7 +1022,7 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn get_usage(&self, bucket_id: &str, window_start: u64) -> StoreResult<UsageLedger> {
+    fn get_usage(&self, bucket_id: &str, window_start: u64) -> RecordStoreResult<UsageLedger> {
         let ws = clamp(window_start);
         let mut client = self.lock();
         let mut tx = Self::snapshot_consistent_tx(&mut client)?;
@@ -1085,7 +1085,7 @@ impl Store for PostgresStore {
         bucket_id: &str,
         window_start: u64,
         ledger: &UsageLedger,
-    ) -> StoreResult<()> {
+    ) -> RecordStoreResult<()> {
         let ws = clamp(window_start);
         let rq = clamp(ledger.requests);
         let brq = clamp(ledger.billable_requests);
@@ -1185,7 +1185,12 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn add_usage(&self, bucket_id: &str, window_start: u64, delta: &UsageDelta) -> StoreResult<()> {
+    fn add_usage(
+        &self,
+        bucket_id: &str,
+        window_start: u64,
+        delta: &UsageDelta,
+    ) -> RecordStoreResult<()> {
         let ws = clamp(window_start);
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
@@ -1318,7 +1323,7 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn add_metering(&self, d: &MeteringDelta) -> StoreResult<()> {
+    fn add_metering(&self, d: &MeteringDelta) -> RecordStoreResult<()> {
         let (bucket, ti, to, tcr, tcw) = (
             clamp(d.bucket),
             clamp(d.tokens_input),
@@ -1390,7 +1395,7 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn list_metering(&self, bucket: u64) -> StoreResult<Vec<MeteringRow>> {
+    fn list_metering(&self, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
         let b = clamp(bucket);
         let mut client = self.lock();
         // ONE snapshot for both reads, so a row's open classes are never read from a different
@@ -1450,7 +1455,7 @@ impl Store for PostgresStore {
             .collect())
     }
 
-    fn purge_windows_before(&self, before: u64) -> StoreResult<u64> {
+    fn purge_windows_before(&self, before: u64) -> RecordStoreResult<u64> {
         let b = clamp(before);
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
@@ -1468,12 +1473,12 @@ impl Store for PostgresStore {
         Ok(n1)
     }
 
-    fn purge_metering_before(&self, bucket: &str) -> StoreResult<u64> {
+    fn purge_metering_before(&self, bucket: &str) -> RecordStoreResult<u64> {
         // The trait's purge_metering_before takes `bucket: &str` while list_metering/add_metering
         // use `bucket: u64` -- an inconsistency in the core trait itself, not introduced here.
         // usage_metering.bucket is genuinely BIGINT, so this parses the string form.
         let b: i64 = bucket.parse().map_err(|_| {
-            StoreError(format!(
+            RecordStoreError(format!(
                 "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
             ))
         })?;
@@ -1488,7 +1493,7 @@ impl Store for PostgresStore {
         Ok(n)
     }
 
-    fn put_credential(&self, secret: &CredentialSecret) -> StoreResult<()> {
+    fn put_credential(&self, secret: &CredentialSecret) -> RecordStoreResult<()> {
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
         Self::put_credential_tx(&mut tx, secret)?;
@@ -1500,7 +1505,7 @@ impl Store for PostgresStore {
         &self,
         key: &VirtualKey,
         secret: &CredentialSecret,
-    ) -> StoreResult<()> {
+    ) -> RecordStoreResult<()> {
         // ATOMIC mint: the bearer key and its credential commit together or not at all.
         let (pools, by_kind) = scopes_to_storage(&key.allowed_scopes);
         let labels = labels_to_storage(&key.labels);
@@ -1539,7 +1544,7 @@ impl Store for PostgresStore {
         )
         .store()?;
         if changed == 0 {
-            return Err(StoreError(format!(
+            return Err(RecordStoreError(format!(
                 "put_key_with_credential: '{}' is tombstoned and its id is never reissued; \
                  refusing to clear the tombstone",
                 key.id
@@ -1550,7 +1555,7 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn list_credentials(&self, key_id: &str) -> StoreResult<Vec<CredentialMeta>> {
+    fn list_credentials(&self, key_id: &str) -> RecordStoreResult<Vec<CredentialMeta>> {
         let sql = format!("SELECT {CRED_META_COLUMNS} FROM credentials WHERE key_id=$1");
         let rows = self.lock().query(&sql, &[&key_id]).store()?;
         Ok(rows.iter().map(row_to_cred_meta).collect())
@@ -1560,7 +1565,7 @@ impl Store for PostgresStore {
         &self,
         kind: &str,
         public_id: &str,
-    ) -> StoreResult<Option<CredentialSecret>> {
+    ) -> RecordStoreResult<Option<CredentialSecret>> {
         let sql = format!(
             "SELECT {CRED_META_COLUMNS},secret FROM credentials WHERE kind=$1 AND public_id=$2"
         );
@@ -1573,7 +1578,7 @@ impl Store for PostgresStore {
         }))
     }
 
-    fn revoke_credential(&self, id: &str, reason: &str) -> StoreResult<()> {
+    fn revoke_credential(&self, id: &str, reason: &str) -> RecordStoreResult<()> {
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
         let exists: bool = tx
@@ -1591,7 +1596,7 @@ impl Store for PostgresStore {
             // an earlier `list_credentials` can stop resolving while a caller still holds it, and
             // reporting success there leaves the live credential authenticating with the audit trail
             // saying it was revoked. store-mysql and store-memory both fail loud here.
-            return Err(StoreError(format!(
+            return Err(RecordStoreError(format!(
                 "revoke_credential: unknown credential id {id}; nothing was revoked"
             )));
         }
@@ -1628,7 +1633,7 @@ impl Store for PostgresStore {
                 .store()?
                 .get(0);
             if !still_exists {
-                return Err(StoreError(format!(
+                return Err(RecordStoreError(format!(
                     "revoke_credential: credential id {id} existed when this call started and \
                      names no row by the time the revocation was written (a concurrent mint into \
                      the same slot rewrites the row's id); nothing was revoked"
@@ -1642,7 +1647,7 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn list_credentials_since(&self, since: u64) -> StoreResult<Vec<CredentialSecret>> {
+    fn list_credentials_since(&self, since: u64) -> RecordStoreResult<Vec<CredentialSecret>> {
         let sql = format!(
             "SELECT {CRED_META_COLUMNS},secret FROM credentials WHERE revision > $1 ORDER BY revision"
         );
@@ -1658,7 +1663,7 @@ impl Store for PostgresStore {
             .collect())
     }
 
-    fn append_audit(&self, entry: &AuditRecord) -> StoreResult<()> {
+    fn append_audit(&self, entry: &AuditRecord) -> RecordStoreResult<()> {
         // A `seq`/`ts` past `i64::MAX` cannot be stored faithfully: `clamp` pins it, so the record
         // read back is NOT the record written. Two consequences, both bad, and neither acceptable
         // silently — an identical retry compares unequal and is reported as "the audit chain has
@@ -1667,7 +1672,7 @@ impl Store for PostgresStore {
         // instead. Comparing the CLAMPED form would fix the false alarm by causing the silent loss,
         // which is the wrong half to give up.
         if entry.seq > i64::MAX as u64 || entry.ts > i64::MAX as u64 {
-            return Err(StoreError(format!(
+            return Err(RecordStoreError(format!(
                 "append_audit: seq {} / ts {} exceeds the storable range (i64::MAX); refusing to \
                  store a record that would not read back as itself",
                 entry.seq, entry.ts
@@ -1675,7 +1680,7 @@ impl Store for PostgresStore {
         }
         let (seq, ts) = (clamp(entry.seq), clamp(entry.ts));
         // ON CONFLICT DO NOTHING, not DO UPDATE: the trait's own contract is "append-only... a store
-        // never rewrites or recomputes the digest" (busbar_api::Store::append_audit doc). `seq` is a
+        // never rewrites or recomputes the digest" (busbar_contract::records::RecordStore::append_audit doc). `seq` is a
         // per-process counter (see the engine's own known caveat about clustered nodes), so a
         // collision here means either a real caller bug or two nodes racing on the same seq -- in
         // BOTH cases silently overwriting a prior entry's hash/prev_hash would corrupt the hash chain
@@ -1739,7 +1744,7 @@ impl Store for PostgresStore {
                     return Ok(());
                 }
                 Some(stored) => {
-                    return Err(StoreError(format!(
+                    return Err(RecordStoreError(format!(
                         "append_audit: seq {} already holds a DIFFERENT record; the audit chain \
                          has forked (stored action '{}', incoming '{}')",
                         entry.seq, stored.action, entry.action
@@ -1752,7 +1757,7 @@ impl Store for PostgresStore {
                 }
             }
         }
-        Err(StoreError(format!(
+        Err(RecordStoreError(format!(
             "append_audit: seq {} kept being freed between the insert and the read-back after \
              {MAX_ATTEMPTS} attempts; something is deleting audit rows concurrently and the record \
              was NOT stored",
@@ -1760,13 +1765,13 @@ impl Store for PostgresStore {
         )))
     }
 
-    fn list_audit(&self) -> StoreResult<Vec<AuditRecord>> {
+    fn list_audit(&self) -> RecordStoreResult<Vec<AuditRecord>> {
         let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log ORDER BY seq");
         let rows = self.lock().query(&sql, &[]).store()?;
         Ok(rows.iter().map(row_to_audit).collect())
     }
 
-    fn list_audit_tail(&self, limit: u64) -> StoreResult<Vec<AuditRecord>> {
+    fn list_audit_tail(&self, limit: u64) -> RecordStoreResult<Vec<AuditRecord>> {
         let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log ORDER BY seq DESC LIMIT $1");
         let rows = self
             .lock()
@@ -1777,7 +1782,7 @@ impl Store for PostgresStore {
         Ok(out)
     }
 
-    fn add_denylist(&self, sub: &str, reason: &str) -> StoreResult<()> {
+    fn add_denylist(&self, sub: &str, reason: &str) -> RecordStoreResult<()> {
         // `created_at` is a clock read, not the literal 0 it used to be. Same shape as the
         // `deleted_at` defect: the row lands, every "is this subject denied" check keeps working,
         // and only a question about WHEN it was denied reads back the epoch. store-sqlite writes
@@ -1792,7 +1797,7 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn list_denylist(&self) -> StoreResult<Vec<String>> {
+    fn list_denylist(&self) -> RecordStoreResult<Vec<String>> {
         let rows = self.lock().query("SELECT sub FROM denylist", &[]).store()?;
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
@@ -1803,7 +1808,7 @@ impl Store for PostgresStore {
     // in `plane_records` keyed `(kind, id)`; an APPENDED one in `plane_chain` keyed
     // `(kind, parent, seq)`. Identity, ordering and retention read only the typed sidecar columns.
 
-    fn upsert_plane_record(&self, record: &PlaneRecord) -> StoreResult<()> {
+    fn upsert_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
         // REFUSED rather than clamped: `clamp` pins a value above i64::MAX, so the row read back
         // would not be the row written and nothing would ever report it.
         let seq = as_storable_i64("upsert_plane_record", "seq", record.seq)?;
@@ -1832,7 +1837,7 @@ impl Store for PostgresStore {
         Ok(())
     }
 
-    fn get_plane_record(&self, kind: &str, id: &str) -> StoreResult<Option<Vec<u8>>> {
+    fn get_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<Option<Vec<u8>>> {
         // No principal filter, deliberately: caller scoping is ENGINE-side, because an
         // authorization check living in the backend is one an unauthorized reader bypasses by
         // configuring a different backend.
@@ -1846,7 +1851,7 @@ impl Store for PostgresStore {
         Ok(row.map(|r| r.get(0)))
     }
 
-    fn append_plane_record(&self, record: &PlaneRecord) -> StoreResult<()> {
+    fn append_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
         let seq = as_storable_i64("append_plane_record", "seq", record.seq)?;
         let ts = as_storable_i64("append_plane_record", "ts", record.ts)?;
         // The chain a child record hangs off: its parent, or (a parentless append) its own id —
@@ -1906,7 +1911,7 @@ impl Store for PostgresStore {
                     }
                     // Names the position and nothing else — it must not echo stored (or caller)
                     // content back.
-                    return Err(StoreError(format!(
+                    return Err(RecordStoreError(format!(
                         "append_plane_record: kind '{}' parent '{}' seq {} is already occupied by \
                          another record; the chain has forked",
                         record.kind, parent, record.seq
@@ -1915,7 +1920,7 @@ impl Store for PostgresStore {
                 None => drop(tx),
             }
         }
-        Err(StoreError(format!(
+        Err(RecordStoreError(format!(
             "append_plane_record: kind '{}' seq {} kept being freed between the insert and the \
              read-back after {MAX_ATTEMPTS} attempts; something is deleting chain rows \
              concurrently and the record was NOT stored",
@@ -1927,7 +1932,7 @@ impl Store for PostgresStore {
         &self,
         kind: &str,
         selector: &PlaneSelector,
-    ) -> StoreResult<Vec<Vec<u8>>> {
+    ) -> RecordStoreResult<Vec<Vec<u8>>> {
         let mut client = self.lock();
         // One snapshot across both tables.
         let mut tx = Self::snapshot_consistent_tx(&mut client)?;
@@ -1966,7 +1971,7 @@ impl Store for PostgresStore {
             .collect())
     }
 
-    fn list_plane_record_parents(&self, kind: &str) -> StoreResult<Vec<String>> {
+    fn list_plane_record_parents(&self, kind: &str) -> RecordStoreResult<Vec<String>> {
         // The boot enumeration a restart resumes chains from: every parent holding a record of
         // `kind`, each exactly once.
         let rows = self
@@ -1982,7 +1987,7 @@ impl Store for PostgresStore {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    fn purge_plane_records_before(&self, kind: &str, before: u64) -> StoreResult<u64> {
+    fn purge_plane_records_before(&self, kind: &str, before: u64) -> RecordStoreResult<u64> {
         // STRICTLY older than the cutoff: a row exactly at `before` is kept. WHICH rows go is the
         // kind's own contract, read off the typed `disposition` column and never out of the body —
         // see TERMINAL_ONLY_RETENTION_KINDS.
@@ -2024,7 +2029,7 @@ impl Store for PostgresStore {
         Ok(purged.len() as u64 + chain)
     }
 
-    fn delete_plane_record(&self, kind: &str, id: &str) -> StoreResult<()> {
+    fn delete_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<()> {
         // Absent is a NO-OP, not an error: the engine clears on every observation that agrees with
         // the operator rather than tracking whether it had written one. A chain whose parent is
         // `id` goes too, so deleting a record cannot leave part of its chain behind.
@@ -2050,7 +2055,7 @@ impl Store for PostgresStore {
         token: &str,
         expires_at: u64,
         now: u64,
-    ) -> StoreResult<bool> {
+    ) -> RecordStoreResult<bool> {
         // REFUSED rather than clamped, and this is the sharpest instance of that choice in the
         // crate: a `now` clamped to i64::MAX would sweep the kind's ENTIRE ledger below and then
         // report the insert as a first redemption — one out-of-range argument silently reopening
@@ -2089,7 +2094,7 @@ impl Store for PostgresStore {
         token: &str,
         expires_at: u64,
         now: u64,
-    ) -> StoreResult<bool> {
+    ) -> RecordStoreResult<bool> {
         // MULTI-use and SPENDS NOTHING: a plain read of the `(kind, token)` upserted record. Live
         // only while the record is present AND its disposition is still Active AND `now` has not
         // passed `expires_at`; a missing record, a terminal one and a lapsed deadline each answer
@@ -2121,9 +2126,9 @@ fn disposition_to_storage(d: PlaneDisposition) -> &'static str {
 /// `clamp` would pin it to `i64::MAX` instead, so the row read back would not be the row written and
 /// nothing would ever have reported an error — tolerable on the counters `clamp` still serves, not on
 /// a plane record's chain position or a token ledger's clock.
-fn as_storable_i64(method: &str, field: &str, v: u64) -> StoreResult<i64> {
+fn as_storable_i64(method: &str, field: &str, v: u64) -> RecordStoreResult<i64> {
     i64::try_from(v).map_err(|_| {
-        StoreError(format!(
+        RecordStoreError(format!(
             "{method}: {field} {v} exceeds the storable range (i64::MAX); refusing to store a row \
              that would not read back as itself"
         ))
@@ -2150,7 +2155,10 @@ impl PostgresStore {
     /// NULL` guard on the `DO UPDATE` makes that structural: the upsert simply does not apply if
     /// the existing row is live, and the subsequent `changed` check turns that into a real error
     /// instead of a silent no-op.
-    fn put_credential_tx(tx: &mut Transaction<'_>, secret: &CredentialSecret) -> StoreResult<()> {
+    fn put_credential_tx(
+        tx: &mut Transaction<'_>,
+        secret: &CredentialSecret,
+    ) -> RecordStoreResult<()> {
         let m = &secret.meta;
         let rev = Self::next_revision(tx)?;
         // The owning key must EXIST and be LIVE (`put_credential`'s precondition, pinned by the
@@ -2170,14 +2178,14 @@ impl PostgresStore {
             .map(|r| r.get(0));
         match owner_live {
             None => {
-                return Err(StoreError(format!(
+                return Err(RecordStoreError(format!(
                     "put_credential: owning key '{}' does not exist; refusing a credential that \
                      hangs off nothing",
                     m.key_id
                 )))
             }
             Some(false) => {
-                return Err(StoreError(format!(
+                return Err(RecordStoreError(format!(
                     "put_credential: owning key '{}' is tombstoned; refusing to mint a credential \
                      under a revoked key",
                     m.key_id
@@ -2230,7 +2238,7 @@ impl PostgresStore {
                 .store()?
                 .get(0);
             if exists {
-                return Err(StoreError(format!(
+                return Err(RecordStoreError(format!(
                     "put_credential: slot {} for key {} kind {} holds a LIVE credential; revoke it first",
                     m.slot, m.key_id, m.kind
                 )));
@@ -2238,7 +2246,7 @@ impl PostgresStore {
             // Free slot, first insert -- the INSERT branch of the upsert should have applied. If we
             // get here with changed==0 and no existing row, something else rejected the write (e.g.
             // a UNIQUE(kind, public_id) violation on a DIFFERENT key/slot) -- surface plainly.
-            return Err(StoreError(
+            return Err(RecordStoreError(
                 "put_credential: insert did not apply (public_id may already be in use by another credential)".to_string(),
             ));
         }
@@ -2252,6 +2260,50 @@ const _: fn() = || {
     assert_tosql::<Option<i64>>();
     assert_tosql::<bool>();
 };
+
+// ── THE PLUGIN DOOR ─────────────────────────────────────────────────────────────────────────────
+// One registration, both doors (DECISIONS #2 rule (1)): `export_store_plugin!(open)` emits
+// `BUSBAR_COLD_ENTRY` — the boundary a busbar build that LINKS this crate hands the loader (see
+// [`linked::STORE`]) — and registers that same entry as the image's door, through which the SDK's
+// frozen symbols answer when the sibling `busbar-store-postgres-plugin` cdylib is dropped in.
+
+/// The package name both doors state for this store.
+pub const NAME: &str = "busbar-store-postgres";
+/// The name `store.module` selects this store by.
+pub const ALIAS: &str = "postgres";
+
+/// Construct a Postgres store from the JSON config the engine passes through `open`:
+///
+/// ```json
+/// { "url": "postgres://user:pass@host:5432/busbar" }
+/// ```
+pub fn open(cfg: &str) -> Result<Box<dyn RecordStore>, String> {
+    let v: serde_json::Value = if cfg.trim().is_empty() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        serde_json::from_str(cfg).map_err(|e| format!("invalid postgres plugin config: {e}"))?
+    };
+    let url = v
+        .get("url")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "postgres plugin config requires a \"url\" (a libpq connection string)".to_string()
+        })?;
+    let store = PostgresStore::connect(url).map_err(|e| e.0)?;
+    Ok(Box::new(store))
+}
+
+busbar_contract::abi::sdk::export_store_plugin!(open);
+
+/// THE LINKED ENTRY (DECISIONS #2 rule (1)): what a busbar build that links this store registers
+/// onto the cold-kind axis — the same statement and boundary the dropped-in tarball carries.
+pub mod linked {
+    /// `(name, alias, boundary)`.
+    pub const STORE: (&str, &str, &busbar_contract::abi::sdk::ColdEntry) =
+        (super::NAME, super::ALIAS, &super::BUSBAR_COLD_ENTRY);
+}
 
 #[cfg(test)]
 mod tests;
