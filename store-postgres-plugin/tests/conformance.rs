@@ -230,6 +230,28 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
     let lib = cdylib();
 
     let linked_registry = PluginRegistry::empty().link(vec![row]).unwrap();
+    let linked_no_db = transcript("linked-no-db", &linked_registry, None);
+    // RED ARM 2 — RUN FIRST: the same statement over DIFFERENT bytes (the object's magic broken) is
+    // not the same store. It must run before ANY good image is dropped in: on Linux the loader
+    // dlopens a memfd as `/proc/self/fd/N`, a Rust cdylib stays resident after its handle drops, and
+    // glibc answers a later dlopen of the same path string with the object already loaded — without
+    // reading the new bytes. Run after a good arm, this arm would be served the real store.
+    let mut foreign = lib.clone();
+    foreign[..4].copy_from_slice(b"XXXX");
+    let red_registry = dropped("red", statement("store"), &foreign);
+    let red = transcript("red", &red_registry, None);
+    assert_ne!(
+        red, linked_no_db,
+        "different bytes must not pass as the store"
+    );
+    assert!(
+        !red["refusals"][0]
+            .as_str()
+            .unwrap()
+            .contains("requires a \"url\""),
+        "foreign bytes cannot speak the store's own refusal: {red}"
+    );
+
     let linked = transcript("linked", &linked_registry, live.as_deref());
     let dropped_registry = dropped("dropped", statement("store"), &lib);
     let dropped_in = transcript("dropped", &dropped_registry, live.as_deref());
@@ -279,25 +301,5 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
             "plugin 'busbar-store-postgres' exports kind 'store' but is being loaded as 'secret'"
         ),
         "{e}"
-    );
-
-    // RED ARM 2: the same statement over DIFFERENT bytes is not the same store. The object's magic
-    // is broken (not a truncation: glibc can hand back the image already loaded under the same
-    // SONAME for bytes that still parse, which would make this arm pass as the store it is not).
-    let mut foreign = lib.clone();
-    foreign[..4].copy_from_slice(b"XXXX");
-    let red_registry = dropped("red", statement("store"), &foreign);
-    let red = transcript("red", &red_registry, None);
-    let linked_no_db = transcript("linked-no-db", &linked_registry, None);
-    assert_ne!(
-        red, linked_no_db,
-        "different bytes must not pass as the store"
-    );
-    assert!(
-        !red["refusals"][0]
-            .as_str()
-            .unwrap()
-            .contains("requires a \"url\""),
-        "truncated bytes cannot speak the store's own refusal: {red}"
     );
 }
