@@ -267,7 +267,7 @@ fn cfg(url: &str) -> String {
 ///
 /// Hardcoding `MOCK_KEY` here would fix today's failure but rot the moment this fixture, or a future
 /// one, names a different variable. Extracting the names generically is the approach the sibling
-/// `GetBusbar/store-sqlite` and `GetBusbar/store-mysql` plugin e2e tests already took for this exact
+/// `GetBusbar/busbar-store-sqlite` and `GetBusbar/busbar-store-mysql` plugin e2e tests already took for this exact
 /// break (and the core repo's `crates/busbar/tests/docs_examples.rs`), so the harness keeps working
 /// no matter what the fixture references.
 fn referenced_env_vars(text: &str) -> Vec<String> {
