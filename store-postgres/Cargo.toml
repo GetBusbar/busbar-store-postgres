@@ -13,7 +13,7 @@ license = "Apache-2.0"
 # into it as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`;
 # a busbar build that links this crate `[patch]`es the busbar git source to its own tree, so ONE
 # copy of the contract links.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8b7b6473f47f8d37ae60839c74cfe6a9b64a1dc9" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "7a5b429041752e00375e120ab1547a8928c3dee4" }
 postgres = "0.19"
 serde_json = "1"
 
