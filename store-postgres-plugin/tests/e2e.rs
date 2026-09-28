@@ -406,7 +406,7 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
             "--lib",
             so_path.to_str().unwrap(),
             "--name",
-            "busbar-store-postgres-plugin",
+            "busbar-store-postgres",
             "--alias",
             "postgres",
             "--kind",

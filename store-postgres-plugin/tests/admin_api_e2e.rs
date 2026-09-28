@@ -388,7 +388,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             "--lib",
             so_path.to_str().unwrap(),
             "--name",
-            "busbar-store-postgres-plugin",
+            "busbar-store-postgres",
             "--alias",
             "postgres",
             "--kind",
@@ -568,7 +568,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     assert!(
         items
             .iter()
-            .any(|p| p["target"] == file && p["name"] == "busbar-store-postgres-plugin"),
+            .any(|p| p["target"] == file && p["name"] == "busbar-store-postgres"),
         "the installed postgres plugin must be listed in the real catalog: {items:?}"
     );
 
