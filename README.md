@@ -10,6 +10,8 @@ First-party signed kind:store plugin cdylib: the Postgres backend for busbar's d
 [![ci](https://github.com/GetBusbar/busbar-store-postgres/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-store-postgres/actions/workflows/ci.yml)
 <!-- fleet:header:end -->
 
+## What it is for
+
 **This plugin's version: v1.0.0.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
 
@@ -28,7 +30,7 @@ One Postgres behind a fleet of busbar nodes means virtual keys,
 budgets, and usage are shared across the cluster instead of siloed per
 node.
 
-## Versioning
+### Versioning
 
 This plugin is versioned **independently of busbar** — `v1.0.0` here says
 nothing about which busbar release it is. Compatibility with busbar is
@@ -73,7 +75,6 @@ of loading this cdylib); `store-postgres-plugin/src/lib.rs` only adapts
 the engine's JSON config (`{"url": "postgres://..."}`) into a
 `PostgresStore`.
 
-## What it is for
 
 - **A shared, multi-node governance store.** `store: sqlite` is
   per-node; `store: postgres` puts virtual keys, budgets, and usage
@@ -94,7 +95,7 @@ the engine's JSON config (`{"url": "postgres://..."}`) into a
   or ignore. Tooling that treats a store error as fatal should not
   assume the same input produces the same outcome on every backend.
 
-## Known limitations (documented honestly, not papered over)
+### Known limitations (documented honestly, not papered over)
 
 - **No TLS in this build (`NoTls`).** Run the connection over a trusted
   network segment, a local socket, or a TLS-terminating proxy
@@ -110,6 +111,12 @@ for the full design rationale — that is where the actual store logic
 lives (in this repo now, not busbar); `store-postgres-plugin/` is the
 thin `cdylib` adapter around it.
 
+## Config
+
+| Setting | Required | Default | Notes |
+|---|---|---|---|
+| `url` | yes | — | A libpq connection string, e.g. `postgres://user:pass@host:5432/busbar`. Connects `NoTls`; run it over a trusted network segment or a TLS-terminating proxy. **No connect timeout is set by default** — a blackholed host wedges engine boot indefinitely. libpq honors a `connect_timeout` query param in the DSN, e.g. `postgres://user:pass@host:5432/busbar?connect_timeout=10`; set one if boot hanging on a dead host is a concern. |
+
 ## Build
 
 Needs a Rust toolchain ([rustup](https://rustup.rs)), and — interim,
@@ -124,7 +131,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-## Dependencies
+### Dependencies
 
 This is a same-repo, 2-crate Cargo workspace (`store-postgres/`, the
 real logic crate — which also carries the plugin's one door
@@ -150,7 +157,7 @@ boundary) and dropped in (this repo's cdylib, signed, packed, scanned
 and opened by the real loader) — with RED arms that prove the
 comparison is not vacuous.
 
-## Tests need a real Postgres
+### Tests need a real Postgres
 
 Unlike a `kind: hook` plugin, this store's only meaningful coverage is
 against a **live Postgres** — there is no useful mock for "did the SQL
@@ -200,7 +207,7 @@ CI (`CI` env var set — see `.github/workflows/ci.yml`), a *missing*
 CI provisions a real `postgres:16` GitHub Actions service container on
 every push, specifically so this coverage can never quietly vanish.
 
-## Pack and sign
+### Pack and sign
 
 Once built, the cdylib is packed and signed like any other busbar
 plugin — see
@@ -232,11 +239,11 @@ store:
 — see [`docs/configuration.md`](https://github.com/GetBusbar/busbar/blob/main/docs/configuration.md)
 for the full store config reference.
 
-## Config
+## Tests
 
-| Setting | Required | Default | Notes |
-|---|---|---|---|
-| `url` | yes | — | A libpq connection string, e.g. `postgres://user:pass@host:5432/busbar`. Connects `NoTls`; run it over a trusted network segment or a TLS-terminating proxy. **No connect timeout is set by default** — a blackholed host wedges engine boot indefinitely. libpq honors a `connect_timeout` query param in the DSN, e.g. `postgres://user:pass@host:5432/busbar?connect_timeout=10`; set one if boot hanging on a dead host is a concern. |
+```bash
+cargo test --workspace --locked
+```
 
 ## License
 
