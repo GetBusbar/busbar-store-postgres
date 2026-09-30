@@ -21,4 +21,7 @@ jobs:
       busbar_checkout: true
       macos_test: "cargo test --workspace --locked"
       extra_test: ""
+      plugin_crate: busbar-store-postgres-plugin
+      plugin_kind: store
+      plugin_alias: postgres
     secrets: inherit
