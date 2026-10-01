@@ -143,25 +143,28 @@ fn scenario(store: &dyn RecordStore, ns: &str) -> serde_json::Value {
     };
     let text = |b: Option<Vec<u8>>| b.map(|b| String::from_utf8_lossy(&b).into_owned());
     store
-        .upsert_plane_record(&rec(kind, id.clone(), None, 0, "v1"))
+        .upsert_plane_record(rec(kind, id.clone(), None, 0, "v1").view())
         .expect("upsert");
     store
-        .upsert_plane_record(&rec(kind, id.clone(), None, 0, "v2"))
+        .upsert_plane_record(rec(kind, id.clone(), None, 0, "v2").view())
         .expect("upsert over");
     let got = text(store.get_plane_record(kind, &id).expect("get"));
     for seq in 1..=2 {
         store
-            .append_plane_record(&rec(
-                child,
-                format!("{ns}-e{seq}"),
-                Some(id.clone()),
-                seq,
-                &format!("event {seq}"),
-            ))
+            .append_plane_record(
+                rec(
+                    child,
+                    format!("{ns}-e{seq}"),
+                    Some(id.clone()),
+                    seq,
+                    &format!("event {seq}"),
+                )
+                .view(),
+            )
             .expect("append");
     }
     let chain: Vec<String> = store
-        .list_plane_records(child, &PlaneSelector::Parent(id.clone()))
+        .list_plane_records(child, &PlaneSelector::Parent(id.clone().into()))
         .expect("list")
         .into_iter()
         .map(|b| String::from_utf8_lossy(&b).into_owned())

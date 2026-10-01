@@ -705,7 +705,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
     let chain = |store: &dyn RecordStore, principal: &str| -> Vec<serde_json::Value> {
         store
-            .list_plane_records("call", &PlaneSelector::Parent(principal.to_string()))
+            .list_plane_records("call", &PlaneSelector::Parent(principal.to_string().into()))
             .expect("list_plane_records over the ABI")
             .iter()
             .map(|b| plane_decode(b))
@@ -718,11 +718,11 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
             .expect("the postgres plugin must load over the real ABI");
         for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
             store
-                .append_plane_record(&call(&p_main, seq, prev, hash))
+                .append_plane_record(call(&p_main, seq, prev, hash).view())
                 .expect("append_plane_record over the ABI");
         }
         store
-            .append_plane_record(&call(&p_other, 1, "", "o1"))
+            .append_plane_record(call(&p_other, 1, "", "o1").view())
             .expect("append_plane_record over the ABI");
         // Dropping the boxed store drops the loader's `Library` handle: `busbar_close` runs and the
         // dylib is UNLOADED. Nothing this process still holds can be answering the reads below.
@@ -766,11 +766,11 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // An identical replay is the retry and crosses the ABI as Ok; a different record at an occupied
     // position is a fork and crosses the ABI as an error.
     store
-        .append_plane_record(&call(&p_main, 3, "h2", "h3"))
+        .append_plane_record(call(&p_main, 3, "h2", "h3").view())
         .expect("an identical replay is Ok over the ABI");
     assert!(
         store
-            .append_plane_record(&call(&p_main, 3, "h2", "FORKED"))
+            .append_plane_record(call(&p_main, 3, "h2", "FORKED").view())
             .is_err(),
         "a forked chain must surface as an error across the ABI, not be swallowed"
     );
@@ -893,7 +893,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
     let events = |store: &dyn RecordStore, id: &str| -> Vec<serde_json::Value> {
         store
-            .list_plane_records("task_event", &PlaneSelector::Parent(id.to_string()))
+            .list_plane_records("task_event", &PlaneSelector::Parent(id.to_string().into()))
             .expect("list_plane_records over the ABI")
             .iter()
             .map(|b| plane_decode(b))
@@ -912,35 +912,41 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         let store = busbar_plugin_loader::load_store(&path, &cfg)
             .expect("the postgres plugin must load over the real ABI");
         store
-            .upsert_plane_record(&task(
-                &t_live,
-                "working",
-                BASE_TS + 100,
-                3,
-                PlaneDisposition::Active,
-            ))
+            .upsert_plane_record(
+                task(
+                    &t_live,
+                    "working",
+                    BASE_TS + 100,
+                    3,
+                    PlaneDisposition::Active,
+                )
+                .view(),
+            )
             .expect("upsert_plane_record over the ABI");
         // The SECOND write for the same id must REPLACE the row, never append a second one. An
         // interrupted task waiting on a human is exactly what a restart has to find.
         store
-            .upsert_plane_record(&interrupted)
+            .upsert_plane_record(interrupted.view())
             .expect("upsert_plane_record over the ABI");
         store
-            .upsert_plane_record(&task(
-                &t_done,
-                "completed",
-                BASE_TS + 50,
-                1,
-                PlaneDisposition::Terminal,
-            ))
+            .upsert_plane_record(
+                task(
+                    &t_done,
+                    "completed",
+                    BASE_TS + 50,
+                    1,
+                    PlaneDisposition::Terminal,
+                )
+                .view(),
+            )
             .expect("upsert_plane_record over the ABI");
         for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
             store
-                .append_plane_record(&event(&t_live, seq, "task.working", prev, hash))
+                .append_plane_record(event(&t_live, seq, "task.working", prev, hash).view())
                 .expect("append_plane_record over the ABI");
         }
         store
-            .append_plane_record(&event(&t_done, 1, "task.completed", "", "d1"))
+            .append_plane_record(event(&t_done, 1, "task.completed", "", "d1").view())
             .expect("append_plane_record over the ABI");
         drop(store);
     }
@@ -1011,10 +1017,10 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // 1.6.0: the append is FORK-DETECTING for every kind — an identical replay is the retry (Ok),
     // a different record at an occupied (task, seq) is refused rather than silently overwriting.
     store
-        .append_plane_record(&event(&t_live, 3, "task.working", "h2", "h3"))
+        .append_plane_record(event(&t_live, 3, "task.working", "h2", "h3").view())
         .expect("an identical replay is Ok");
     assert!(store
-        .append_plane_record(&event(&t_live, 3, "task.working", "h2", "rewritten"))
+        .append_plane_record(event(&t_live, 3, "task.working", "h2", "rewritten").view())
         .is_err());
     assert_eq!(events(store.as_ref(), &t_live).len(), 3, "no 4th event");
 
@@ -1053,13 +1059,14 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // Clean up this run's rows through the contract: mark the survivor terminal, then sweep.
     RecordStore::upsert_plane_record(
         &direct,
-        &task(
+        task(
             &t_live,
             "canceled",
             BASE_TS + 200,
             9,
             PlaneDisposition::Terminal,
-        ),
+        )
+        .view(),
     )
     .expect("clean up this run's task");
     RecordStore::purge_plane_records_before(&direct, "task", i64::MAX as u64)
@@ -1137,13 +1144,13 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         let store = busbar_plugin_loader::load_store(&path, &cfg)
             .expect("the postgres plugin must load over the real ABI");
         store
-            .upsert_plane_record(&demotion(&srv_demoted, "tool-drift", NOW))
+            .upsert_plane_record(demotion(&srv_demoted, "tool-drift", NOW).view())
             .expect("upsert_plane_record");
         store
-            .upsert_plane_record(&demotion(&srv_demoted, "digest-mismatch", NOW + 10))
+            .upsert_plane_record(demotion(&srv_demoted, "digest-mismatch", NOW + 10).view())
             .expect("upsert_plane_record");
         store
-            .upsert_plane_record(&demotion(&srv_cleared, "tool-drift", NOW + 20))
+            .upsert_plane_record(demotion(&srv_cleared, "tool-drift", NOW + 20).view())
             .expect("upsert_plane_record");
         store
             .delete_plane_record("demotion", &srv_cleared)

@@ -39,9 +39,9 @@
 
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore, RecordStoreError, RecordStoreResult,
-    ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ, UNIT_CACHE_WRITE,
-    UNIT_INPUT, UNIT_OUTPUT,
+    PlaneDisposition, PlaneRecordRef, PlaneSelector, RecordStore, RecordStoreError,
+    RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
+    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use postgres::types::ToSql;
 use postgres::{Client, NoTls, Row, Transaction};
@@ -1808,7 +1808,9 @@ impl RecordStore for PostgresStore {
     // in `plane_records` keyed `(kind, id)`; an APPENDED one in `plane_chain` keyed
     // `(kind, parent, seq)`. Identity, ordering and retention read only the typed sidecar columns.
 
-    fn upsert_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
+    fn upsert_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
+        // This store binds owned rows: the one copy of the borrowed view happens here.
+        let record = &record.to_record();
         // REFUSED rather than clamped: `clamp` pins a value above i64::MAX, so the row read back
         // would not be the row written and nothing would ever report it.
         let seq = as_storable_i64("upsert_plane_record", "seq", record.seq)?;
@@ -1851,7 +1853,9 @@ impl RecordStore for PostgresStore {
         Ok(row.map(|r| r.get(0)))
     }
 
-    fn append_plane_record(&self, record: &PlaneRecord) -> RecordStoreResult<()> {
+    fn append_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
+        // This store binds owned rows: the one copy of the borrowed view happens here.
+        let record = &record.to_record();
         let seq = as_storable_i64("append_plane_record", "seq", record.seq)?;
         let ts = as_storable_i64("append_plane_record", "ts", record.ts)?;
         // The chain a child record hangs off: its parent, or (a parentless append) its own id —
@@ -1931,7 +1935,7 @@ impl RecordStore for PostgresStore {
     fn list_plane_records(
         &self,
         kind: &str,
-        selector: &PlaneSelector,
+        selector: &PlaneSelector<'_>,
     ) -> RecordStoreResult<Vec<Vec<u8>>> {
         let mut client = self.lock();
         // One snapshot across both tables.
@@ -1950,18 +1954,21 @@ impl RecordStore for PostgresStore {
                 .store()?,
             ),
             // Oldest-first by seq — the order the engine's chain verifier reads a parent's chain.
-            PlaneSelector::Parent(p) => (
-                tx.query(
-                    "SELECT body FROM plane_records WHERE kind=$1 AND parent=$2 ORDER BY seq, id",
-                    &[&kind, p],
+            PlaneSelector::Parent(p) => {
+                let p: &str = p;
+                (
+                    tx.query(
+                        "SELECT body FROM plane_records WHERE kind=$1 AND parent=$2 ORDER BY seq, id",
+                        &[&kind, &p],
+                    )
+                    .store()?,
+                    tx.query(
+                        "SELECT body FROM plane_chain WHERE kind=$1 AND parent=$2 ORDER BY seq",
+                        &[&kind, &p],
+                    )
+                    .store()?,
                 )
-                .store()?,
-                tx.query(
-                    "SELECT body FROM plane_chain WHERE kind=$1 AND parent=$2 ORDER BY seq",
-                    &[&kind, p],
-                )
-                .store()?,
-            ),
+            }
         };
         tx.commit().store()?;
         Ok(records
