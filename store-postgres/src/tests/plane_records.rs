@@ -169,7 +169,7 @@ fn clear_purge_band(store: &PostgresStore) {
 
 fn chain(store: &PostgresStore, kind: &str, parent: &str) -> Vec<serde_json::Value> {
     store
-        .list_plane_records(kind, &PlaneSelector::Parent(parent.to_string()))
+        .list_plane_records(kind, &PlaneSelector::Parent(parent.to_string().into()))
         .unwrap()
         .iter()
         .map(|b| decode(b))
@@ -207,13 +207,13 @@ fn an_mcp_call_chain_survives_dropping_the_connection_and_reconnecting() {
         let store = connect_store_with_retry(&url).expect("connect");
         reset(&store, "call", &[p]);
         store
-            .append_plane_record(&call(p, 1, LIVE_TS + 100, "", "h1"))
+            .append_plane_record(call(p, 1, LIVE_TS + 100, "", "h1").view())
             .unwrap();
         store
-            .append_plane_record(&call(p, 2, LIVE_TS + 200, "h1", "h2"))
+            .append_plane_record(call(p, 2, LIVE_TS + 200, "h1", "h2").view())
             .unwrap();
         store
-            .append_plane_record(&call(p, 3, LIVE_TS + 300, "h2", "h3"))
+            .append_plane_record(call(p, 3, LIVE_TS + 300, "h2", "h3").view())
             .unwrap();
         drop(store);
     }
@@ -257,13 +257,13 @@ fn mcp_call_principals_are_enumerable_after_a_reconnect() {
         let store = connect_store_with_retry(&url).expect("connect");
         reset(&store, "call", &[a, b]);
         store
-            .append_plane_record(&call(a, 1, LIVE_TS + 100, "", "a1"))
+            .append_plane_record(call(a, 1, LIVE_TS + 100, "", "a1").view())
             .unwrap();
         store
-            .append_plane_record(&call(b, 1, LIVE_TS + 100, "", "b1"))
+            .append_plane_record(call(b, 1, LIVE_TS + 100, "", "b1").view())
             .unwrap();
         store
-            .append_plane_record(&call(a, 2, LIVE_TS + 101, "a1", "a2"))
+            .append_plane_record(call(a, 2, LIVE_TS + 101, "a1", "a2").view())
             .unwrap();
         drop(store);
     }
@@ -303,13 +303,13 @@ fn purge_calls_before_deletes_and_returns_a_real_count() {
     let p = "vk_mcp_purge";
     reset(&store, "call", &[p]);
     store
-        .append_plane_record(&call(p, 1, 1_000_000_100, "", "h1"))
+        .append_plane_record(call(p, 1, 1_000_000_100, "", "h1").view())
         .unwrap();
     store
-        .append_plane_record(&call(p, 2, 1_000_000_200, "h1", "h2"))
+        .append_plane_record(call(p, 2, 1_000_000_200, "h1", "h2").view())
         .unwrap();
     store
-        .append_plane_record(&call(p, 3, 1_000_000_300, "h2", "h3"))
+        .append_plane_record(call(p, 3, 1_000_000_300, "h2", "h3").view())
         .unwrap();
 
     assert_eq!(
@@ -356,9 +356,9 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
     reset(&store, "call", &[p]);
 
     let rec = call(p, 1, LIVE_TS + 100, "", "h1");
-    store.append_plane_record(&rec).unwrap();
+    store.append_plane_record(rec.view()).unwrap();
     store
-        .append_plane_record(&rec)
+        .append_plane_record(rec.view())
         .expect("an identical replay is the at-least-once retry and must succeed");
     assert_eq!(
         chain(&store, "call", p).len(),
@@ -368,7 +368,7 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
 
     let forked = call(p, 1, LIVE_TS + 100, "", "DIFFERENT");
     let err = store
-        .append_plane_record(&forked)
+        .append_plane_record(forked.view())
         .expect_err("a different record at an occupied position is a fork and must error");
     assert!(
         !format!("{err}").contains("DIFFERENT"),
@@ -384,7 +384,7 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
     let mut moved = call(p, 1, LIVE_TS + 100, "", "h1");
     moved.ts += 1;
     store
-        .append_plane_record(&moved)
+        .append_plane_record(moved.view())
         .expect_err("the same body at a different ts is not the retry; it is a fork");
     reset(&store, "call", &[p]);
 }
@@ -407,21 +407,15 @@ fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
         let store = connect_store_with_retry(&url).expect("connect");
         reset(&store, "task", &[t1, t2]);
         store
-            .upsert_plane_record(&task(
-                t1,
-                "working",
-                LIVE_TS + 200,
-                PlaneDisposition::Active,
-            ))
+            .upsert_plane_record(
+                task(t1, "working", LIVE_TS + 200, PlaneDisposition::Active).view(),
+            )
             .unwrap();
-        store.upsert_plane_record(&second).unwrap();
+        store.upsert_plane_record(second.view()).unwrap();
         store
-            .upsert_plane_record(&task(
-                t2,
-                "submitted",
-                LIVE_TS + 210,
-                PlaneDisposition::Active,
-            ))
+            .upsert_plane_record(
+                task(t2, "submitted", LIVE_TS + 210, PlaneDisposition::Active).view(),
+            )
             .unwrap();
         drop(store);
     }
@@ -479,7 +473,7 @@ fn listing_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
         reset(&store, "task", &ids);
         for (id, state, d) in rows {
             store
-                .upsert_plane_record(&task(id, state, LIVE_TS + 200, d))
+                .upsert_plane_record(task(id, state, LIVE_TS + 200, d).view())
                 .unwrap();
         }
         drop(store);
@@ -512,17 +506,17 @@ fn a_task_event_chain_survives_a_reconnect_and_still_links() {
         reset(&store, "task_event", &[t1, t2]);
         // Appended OUT of order: the read must still come back oldest-first by seq.
         store
-            .append_plane_record(&event(t1, 2, "task.working", "e1", "e2"))
+            .append_plane_record(event(t1, 2, "task.working", "e1", "e2").view())
             .unwrap();
         store
-            .append_plane_record(&event(t1, 1, "task.submitted", "", "e1"))
+            .append_plane_record(event(t1, 1, "task.submitted", "", "e1").view())
             .unwrap();
         store
-            .append_plane_record(&event(t1, 3, "task.interrupted", "e2", "e3"))
+            .append_plane_record(event(t1, 3, "task.interrupted", "e2", "e3").view())
             .unwrap();
         // A second task's chain is independent — it must not leak into the first one's read.
         store
-            .append_plane_record(&event(t2, 1, "task.submitted", "", "f1"))
+            .append_plane_record(event(t2, 1, "task.submitted", "", "f1").view())
             .unwrap();
         drop(store);
     }
@@ -567,9 +561,9 @@ fn a_replayed_task_event_is_idempotent_but_a_forked_one_is_refused() {
     reset(&store, "task_event", &[t]);
 
     let e = event(t, 1, "task.submitted", "", "e1");
-    store.append_plane_record(&e).unwrap();
+    store.append_plane_record(e.view()).unwrap();
     store
-        .append_plane_record(&e)
+        .append_plane_record(e.view())
         .expect("an identical replay must succeed, not be rejected as a fork");
     assert_eq!(
         chain(&store, "task_event", t).len(),
@@ -578,7 +572,7 @@ fn a_replayed_task_event_is_idempotent_but_a_forked_one_is_refused() {
     );
 
     store
-        .append_plane_record(&event(t, 1, "task.submitted", "", "e1-rewritten"))
+        .append_plane_record(event(t, 1, "task.submitted", "", "e1-rewritten").view())
         .expect_err("a different record at an occupied (task, seq) is a fork");
     let got = chain(&store, "task_event", t);
     assert_eq!(got.len(), 1);
@@ -603,12 +597,15 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     let old = 1_000_000_100;
     for state in ["completed", "failed", "canceled", "rejected"] {
         store
-            .upsert_plane_record(&task(
-                &format!("t_purge_old_{state}"),
-                state,
-                old,
-                PlaneDisposition::Terminal,
-            ))
+            .upsert_plane_record(
+                task(
+                    &format!("t_purge_old_{state}"),
+                    state,
+                    old,
+                    PlaneDisposition::Terminal,
+                )
+                .view(),
+            )
             .unwrap();
     }
     // Old and ACTIVE — never dropped, no matter how old. `completed` here stands in for a body whose
@@ -621,30 +618,39 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
         "completed",
     ] {
         store
-            .upsert_plane_record(&task(
-                &format!("t_purge_old_active_{state}"),
-                state,
-                old,
-                PlaneDisposition::Active,
-            ))
+            .upsert_plane_record(
+                task(
+                    &format!("t_purge_old_active_{state}"),
+                    state,
+                    old,
+                    PlaneDisposition::Active,
+                )
+                .view(),
+            )
             .unwrap();
     }
     // Terminal but at the cutoff exactly, and terminal but newer — both kept.
     store
-        .upsert_plane_record(&task(
-            "t_purge_at_cutoff",
-            "completed",
-            1_000_000_200,
-            PlaneDisposition::Terminal,
-        ))
+        .upsert_plane_record(
+            task(
+                "t_purge_at_cutoff",
+                "completed",
+                1_000_000_200,
+                PlaneDisposition::Terminal,
+            )
+            .view(),
+        )
         .unwrap();
     store
-        .upsert_plane_record(&task(
-            "t_purge_newer",
-            "completed",
-            1_000_000_300,
-            PlaneDisposition::Terminal,
-        ))
+        .upsert_plane_record(
+            task(
+                "t_purge_newer",
+                "completed",
+                1_000_000_300,
+                PlaneDisposition::Terminal,
+            )
+            .view(),
+        )
         .unwrap();
 
     assert_eq!(
@@ -697,29 +703,21 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
     let (gone, stays) = ("t_cascade_gone", "t_cascade_stays");
     reset(&store, "task_event", &[gone, stays]);
     store
-        .upsert_plane_record(&task(
-            gone,
-            "completed",
-            1_000_000_100,
-            PlaneDisposition::Terminal,
-        ))
+        .upsert_plane_record(
+            task(gone, "completed", 1_000_000_100, PlaneDisposition::Terminal).view(),
+        )
         .unwrap();
     store
-        .upsert_plane_record(&task(
-            stays,
-            "working",
-            1_000_000_100,
-            PlaneDisposition::Active,
-        ))
+        .upsert_plane_record(task(stays, "working", 1_000_000_100, PlaneDisposition::Active).view())
         .unwrap();
     store
-        .append_plane_record(&event(gone, 1, "task.submitted", "", "g1"))
+        .append_plane_record(event(gone, 1, "task.submitted", "", "g1").view())
         .unwrap();
     store
-        .append_plane_record(&event(gone, 2, "task.completed", "g1", "g2"))
+        .append_plane_record(event(gone, 2, "task.completed", "g1", "g2").view())
         .unwrap();
     store
-        .append_plane_record(&event(stays, 1, "task.submitted", "", "s1"))
+        .append_plane_record(event(stays, 1, "task.submitted", "", "s1").view())
         .unwrap();
 
     assert_eq!(
@@ -755,20 +753,18 @@ fn task_ids_differing_only_in_case_are_distinct_tasks() {
     reset(&store, "task_event", &[lower, upper]);
 
     store
-        .upsert_plane_record(&task(
-            lower,
-            "working",
-            LIVE_TS + 400,
-            PlaneDisposition::Active,
-        ))
+        .upsert_plane_record(task(lower, "working", LIVE_TS + 400, PlaneDisposition::Active).view())
         .unwrap();
     store
-        .upsert_plane_record(&task(
-            upper,
-            "completed",
-            LIVE_TS + 400,
-            PlaneDisposition::Terminal,
-        ))
+        .upsert_plane_record(
+            task(
+                upper,
+                "completed",
+                LIVE_TS + 400,
+                PlaneDisposition::Terminal,
+            )
+            .view(),
+        )
         .unwrap();
     assert_eq!(task_state(&store, lower).as_deref(), Some("working"));
     assert_eq!(
@@ -778,10 +774,10 @@ fn task_ids_differing_only_in_case_are_distinct_tasks() {
     );
 
     store
-        .append_plane_record(&event(lower, 1, "task.submitted", "", "l1"))
+        .append_plane_record(event(lower, 1, "task.submitted", "", "l1").view())
         .unwrap();
     store
-        .append_plane_record(&event(upper, 1, "task.submitted", "", "u1"))
+        .append_plane_record(event(upper, 1, "task.submitted", "", "u1").view())
         .unwrap();
     assert_eq!(chain(&store, "task_event", lower)[0]["hash"], "l1");
     assert_eq!(
@@ -805,7 +801,7 @@ fn a_sidecar_value_beyond_the_storable_range_is_refused_rather_than_clamped() {
     reset(&store, "task_event", &[t]);
 
     let err = store
-        .upsert_plane_record(&task(t, "working", u64::MAX, PlaneDisposition::Active))
+        .upsert_plane_record(task(t, "working", u64::MAX, PlaneDisposition::Active).view())
         .expect_err("a ts above i64::MAX must be refused, never silently clamped");
     assert!(
         format!("{err}").contains("ts"),
@@ -814,7 +810,7 @@ fn a_sidecar_value_beyond_the_storable_range_is_refused_rather_than_clamped() {
     let mut seq_too_big = task(t, "working", LIVE_TS, PlaneDisposition::Active);
     seq_too_big.seq = u64::MAX;
     store
-        .upsert_plane_record(&seq_too_big)
+        .upsert_plane_record(seq_too_big.view())
         .expect_err("a seq above i64::MAX must be refused");
     assert!(
         store.get_plane_record("task", t).unwrap().is_none(),
@@ -824,7 +820,7 @@ fn a_sidecar_value_beyond_the_storable_range_is_refused_rather_than_clamped() {
     let mut e = event(t, 1, "task.submitted", "", "e1");
     e.seq = u64::MAX;
     store
-        .append_plane_record(&e)
+        .append_plane_record(e.view())
         .expect_err("an appended seq above i64::MAX must be refused too");
     assert!(chain(&store, "task_event", t).is_empty());
 
@@ -832,7 +828,7 @@ fn a_sidecar_value_beyond_the_storable_range_is_refused_rather_than_clamped() {
     // refusal of large values.
     let mut top = event(t, 1, "task.submitted", "", "e1");
     top.seq = i64::MAX as u64;
-    store.append_plane_record(&top).unwrap();
+    store.append_plane_record(top.view()).unwrap();
     assert_eq!(chain(&store, "task_event", t).len(), 1);
     reset(&store, "task", &[t]);
     reset(&store, "task_event", &[t]);
@@ -891,17 +887,17 @@ fn a_demotion_survives_dropping_the_store_and_reconnecting() {
         let store = connect_store_with_retry(&url).expect("connect");
         reset(&store, "demotion", &[&a, &b, &c]);
         store
-            .upsert_plane_record(&demotion(&a, "tool-drift", TRUST_NOW))
+            .upsert_plane_record(demotion(&a, "tool-drift", TRUST_NOW).view())
             .unwrap();
         // UPSERT by id: a second demotion of one upstream REPLACES the row.
         store
-            .upsert_plane_record(&demotion(&a, "digest-mismatch", TRUST_NOW + 10))
+            .upsert_plane_record(demotion(&a, "digest-mismatch", TRUST_NOW + 10).view())
             .unwrap();
         store
-            .upsert_plane_record(&demotion(&b, "tool-drift", TRUST_NOW + 20))
+            .upsert_plane_record(demotion(&b, "tool-drift", TRUST_NOW + 20).view())
             .unwrap();
         store
-            .upsert_plane_record(&demotion(&c, "tool-drift", TRUST_NOW + 30))
+            .upsert_plane_record(demotion(&c, "tool-drift", TRUST_NOW + 30).view())
             .unwrap();
         store
             .delete_plane_record("demotion", &c)
@@ -1120,7 +1116,7 @@ fn the_ledger_refuses_values_it_cannot_store_faithfully() {
         .redeem_plane_token("ask", &nonce, TRUST_NOW + 900, u64::MAX)
         .expect_err("an unstorable now must be an error");
     store
-        .upsert_plane_record(&demotion(&srv, "tool-drift", u64::MAX))
+        .upsert_plane_record(demotion(&srv, "tool-drift", u64::MAX).view())
         .expect_err("an unstorable ts must be an error rather than a mangled row");
 
     assert!(store
@@ -1150,7 +1146,7 @@ fn plane_token_live_carries_a_task_and_dies_with_it() {
     };
 
     store
-        .upsert_plane_record(&config(PlaneDisposition::Active))
+        .upsert_plane_record(config(PlaneDisposition::Active).view())
         .unwrap();
     for nth in 1..=3 {
         assert!(
@@ -1167,7 +1163,7 @@ fn plane_token_live_carries_a_task_and_dies_with_it() {
         .unwrap());
 
     store
-        .upsert_plane_record(&config(PlaneDisposition::Terminal))
+        .upsert_plane_record(config(PlaneDisposition::Terminal).view())
         .unwrap();
     assert!(
         !store
@@ -1177,7 +1173,7 @@ fn plane_token_live_carries_a_task_and_dies_with_it() {
     );
 
     store
-        .upsert_plane_record(&config(PlaneDisposition::Active))
+        .upsert_plane_record(config(PlaneDisposition::Active).view())
         .unwrap();
     store.delete_plane_record("push_config", &id).unwrap();
     assert!(!store
@@ -1195,15 +1191,18 @@ fn plane_token_live_refuses_a_lapsed_token_and_an_unknown_one() {
     let store = connect_store_with_retry(&url).expect("connect");
     reset(&store, "push_config", &[&id]);
     store
-        .upsert_plane_record(&PlaneRecord {
-            kind: "push_config".into(),
-            id: id.clone(),
-            parent: None,
-            seq: 0,
-            ts: TRUST_NOW,
-            disposition: PlaneDisposition::Active,
-            body: b"{}".to_vec(),
-        })
+        .upsert_plane_record(
+            (PlaneRecord {
+                kind: "push_config".into(),
+                id: id.clone(),
+                parent: None,
+                seq: 0,
+                ts: TRUST_NOW,
+                disposition: PlaneDisposition::Active,
+                body: b"{}".to_vec(),
+            })
+            .view(),
+        )
         .unwrap();
 
     assert!(store
