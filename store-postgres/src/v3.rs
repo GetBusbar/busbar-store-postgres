@@ -486,7 +486,7 @@ impl StoreSlots for PostgresStore {
         if answer.len() != cells.len() * 3 {
             return Err(ReserveRefused::Conflict);
         }
-        grants.extend(answer.chunks_exact(3).map(|g| Grant {
+        grants.extend(answer.as_chunks::<3>().0.iter().map(|g| Grant {
             slice_id: g[0],
             granted: g[1],
             valid_until_ms: g[2],
