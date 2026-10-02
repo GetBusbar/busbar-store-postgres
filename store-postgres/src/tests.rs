@@ -2233,3 +2233,6 @@ mod plane_records;
 
 // ── THE 1.6.0 RECORD SHAPES AND THE IN-PLACE v6 -> v10 UPGRADE ─────────────────────────────────
 mod v160_shapes;
+
+// ── THE STORE v3 SLOTS (the door's table beyond the 1.5.5 op set) ──────────────────────────────
+mod v3_slots;

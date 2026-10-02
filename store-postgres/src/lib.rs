@@ -5,8 +5,12 @@
 //! plugin. Implements `busbar_contract::records::RecordStore` over a mutex-guarded synchronous `postgres` client,
 //! depending only on the `busbar-contract` crate (plus the `postgres` driver), never on the engine.
 //!
+//! Served through the store kind's ONE door (`store_door!` in `v3`, the store v3 table of busbar
+//! 1.6.0): linked into a busbar build as `door`, or dropped in as the sibling plugin cdylib.
+//!
 //! Schema v10 (busbar 1.6.0): the kind-tagged plane-record tables, the name-keyed usage ledger and
-//! the dated metering key, upgraded IN PLACE from a 1.5.x (v6) database — see `SCHEMA_VERSION`.
+//! the dated metering key, upgraded IN PLACE from a 1.5.x (v6) database; v11 adds the store v3
+//! table's own tables (`op_id` dedupe, journal, sessions, records, money) — see `SCHEMA_VERSION`.
 //!
 //! Schema v5 (1.5.0, the generic-credentials redesign): `virtual_keys`/`aws_credentials` are
 //! replaced by `keys` (pure principal attributes, `generation_hash` instead of `key_hash`,
@@ -37,15 +41,18 @@
 //!   the `Store` trait's observable behavior; they're purely internal to this crate and can be
 //!   added later without another schema bump.
 
+#![forbid(unsafe_code)]
+
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    PlaneDisposition, PlaneRecordRef, PlaneSelector, RecordStore, RecordStoreError,
+    PlaneDisposition, PlaneRecord, PlaneRecordRef, PlaneSelector, RecordStore, RecordStoreError,
     RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
     UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use postgres::types::ToSql;
 use postgres::{Client, NoTls, Row, Transaction};
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
 
 // postgres driver error -> the api's backend-agnostic `RecordStoreError` (the contract crate stays
@@ -262,7 +269,12 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 ///   * the kind-tagged PLANE-RECORD verbs get `plane_records` (upserted, keyed `(kind, id)`),
 ///     `plane_chain` (appended, keyed `(kind, parent, seq)`) and `plane_tokens` (the single-use
 ///     token ledger, keyed `(kind, token)`).
-const SCHEMA_VERSION: i64 = 10;
+///
+/// v11 (busbar 1.6.0 store v3 table), ADDITIVE: the tables the store v3 slots beyond the 1.5.5 op
+/// set keep (`v3`): `store_ops` (the durable `op_id` dedupe log), `store_journal` (`append_batch`'s
+/// streams), `store_sessions`, `store_records` (`record_put`/`get`/`scan`), and `money_slots` /
+/// `money_slices` (`window_caps`, `reserve`, `slice_release`). Nothing existing changes.
+const SCHEMA_VERSION: i64 = 11;
 
 /// The plane-record kinds whose retention is TERMINAL-ONLY: `purge_plane_records_before` drops a row
 /// of one of these kinds only once its `disposition` sidecar says `Terminal`. An interrupted task
@@ -468,6 +480,51 @@ CREATE TABLE IF NOT EXISTS plane_tokens (
     expires_at BIGINT NOT NULL,
     PRIMARY KEY (kind, token)
 );
+
+-- v11, THE STORE v3 TABLE (`v3`). Every u64 the table hands the store is kept bit-for-bit in a
+-- BIGINT and compared in the store, never in SQL.
+-- The durable op_id dedupe log (abi::store S1-S4): the op's value fields and its answer, kept
+-- OP_ID_RETENTION_SECS from recorded_at.
+CREATE TABLE IF NOT EXISTS store_ops (
+    op_id       BYTEA PRIMARY KEY,
+    body        TEXT NOT NULL,
+    answer      TEXT NOT NULL,
+    recorded_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS store_ops_recorded_at_idx ON store_ops (recorded_at);
+-- append_batch's streams; a stream's head is its highest seq.
+CREATE TABLE IF NOT EXISTS store_journal (
+    stream TEXT COLLATE \"C\" NOT NULL,
+    seq    BIGINT NOT NULL,
+    record BYTEA NOT NULL,
+    PRIMARY KEY (stream, seq)
+);
+CREATE TABLE IF NOT EXISTS store_sessions (
+    session   BIGINT PRIMARY KEY,
+    node      TEXT NOT NULL,
+    principal TEXT COLLATE \"C\" NOT NULL
+);
+CREATE INDEX IF NOT EXISTS store_sessions_principal_idx ON store_sessions (principal);
+-- A plane's kernel-held durable records, keyed (schema, key); scanned in key (byte) order.
+CREATE TABLE IF NOT EXISTS store_records (
+    schema_id TEXT COLLATE \"C\" NOT NULL,
+    key       BYTEA NOT NULL,
+    value     BYTEA NOT NULL,
+    PRIMARY KEY (schema_id, key)
+);
+-- One money slot (bucket, pool, dimension, class_key, window_start), keyed by its rendering: the
+-- cap window_caps pushed, its config generation, and what outstanding slices have drawn.
+CREATE TABLE IF NOT EXISTS money_slots (
+    slot       TEXT COLLATE \"C\" PRIMARY KEY,
+    cap        BIGINT NOT NULL,
+    config_gen BIGINT NOT NULL,
+    used       BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS money_slices (
+    slice_id  BIGSERIAL PRIMARY KEY,
+    slot      TEXT COLLATE \"C\" NOT NULL,
+    remaining BIGINT NOT NULL
+);
 ";
 
 /// The v10 column additions on tables a 1.5.x database already has. `IF NOT EXISTS`, so a re-run
@@ -484,6 +541,8 @@ ALTER TABLE usage_metering ADD COLUMN IF NOT EXISTS priced_from_ms BIGINT NOT NU
 /// governance is off the request hot path, so serializing access is fine.
 pub struct PostgresStore {
     client: Mutex<Client>,
+    /// When this instance last swept `store_ops` past its retention (`v3`).
+    ops_swept_at: AtomicU64,
 }
 
 /// Clamp a `u64` into `i64` for a BIGINT column (a value above `i64::MAX` pins to `i64::MAX`, never
@@ -534,6 +593,7 @@ impl PostgresStore {
             .map_err(|e| RecordStoreError(scrub(render_pg_error(&e), secret.as_deref())))?;
         let store = Self {
             client: Mutex::new(client),
+            ops_swept_at: AtomicU64::new(0),
         };
         store.migrate()?;
         Ok(store)
@@ -1191,208 +1251,17 @@ impl RecordStore for PostgresStore {
         window_start: u64,
         delta: &UsageDelta,
     ) -> RecordStoreResult<()> {
-        let ws = clamp(window_start);
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
-        tx.execute(
-            "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
-             VALUES ($1,$2,GREATEST(0,$3::bigint),GREATEST(0,$4::bigint))
-             ON CONFLICT (bucket_id, window_start) DO UPDATE SET
-                requests = GREATEST(0, usage_windows.requests + $3::bigint),
-                billable_requests = GREATEST(0, usage_windows.billable_requests + $4::bigint)",
-            &[&bucket_id, &ws, &delta.requests, &delta.billable_requests],
-        )
-        .store()?;
-        if !delta.models.is_empty() {
-            // TWO statements, both batched over every model, and the split is what makes a
-            // NEGATIVE delta (a refund) land. An `INSERT … ON CONFLICT DO UPDATE` can only add
-            // `EXCLUDED.col` on conflict, and EXCLUDED is the row the INSERT would have written —
-            // which has to be floored at 0 for a first-seen model — so a refund against an existing
-            // row added 0 and was silently lost. Instead: make sure every model's row exists (at
-            // zero), then apply the SIGNED deltas to it in one UPDATE, floored at 0 there. A refund
-            // against a fresh row floors to 0, exactly as `UsageLedger::apply_model_delta` does.
-            let deltas: Vec<[i64; 4]> = delta
-                .models
-                .iter()
-                .map(|m| RESERVED_COLUMNS.map(|u| m.usage_units.get(u).copied().unwrap_or(0)))
-                .collect();
-            let mut ensure =
-                String::from("INSERT INTO usage_ledger (bucket_id, window_start, model) VALUES ");
-            let mut update = String::from(
-                "UPDATE usage_ledger u SET \
-                    tokens_input       = GREATEST(0, u.tokens_input + v.di), \
-                    tokens_output      = GREATEST(0, u.tokens_output + v.do_), \
-                    tokens_cache_read  = GREATEST(0, u.tokens_cache_read + v.dcr), \
-                    tokens_cache_write = GREATEST(0, u.tokens_cache_write + v.dcw) \
-                 FROM (VALUES ",
-            );
-            let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
-                Vec::with_capacity(2 + delta.models.len());
-            let mut update_params: Vec<&(dyn ToSql + Sync)> =
-                Vec::with_capacity(2 + delta.models.len() * 5);
-            ensure_params.push(&bucket_id);
-            ensure_params.push(&ws);
-            update_params.push(&bucket_id);
-            update_params.push(&ws);
-            for (i, (m, d)) in delta.models.iter().zip(deltas.iter()).enumerate() {
-                if i > 0 {
-                    ensure.push(',');
-                    update.push(',');
-                }
-                ensure.push_str(&format!("($1,$2,${})", 3 + i));
-                ensure_params.push(&m.model);
-                let base = 3 + i * 5;
-                update.push_str(&format!(
-                    "(${}::text,${}::bigint,${}::bigint,${}::bigint,${}::bigint)",
-                    base,
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4
-                ));
-                update_params.push(&m.model);
-                for v in d {
-                    update_params.push(v);
-                }
-            }
-            ensure.push_str(" ON CONFLICT (bucket_id, window_start, model) DO NOTHING");
-            update.push_str(
-                ") AS v(model, di, do_, dcr, dcw) \
-                 WHERE u.bucket_id = $1 AND u.window_start = $2 AND u.model = v.model",
-            );
-            tx.execute(&ensure, &ensure_params).store()?;
-            tx.execute(&update, &update_params).store()?;
-
-            // The OPEN unit classes, the same ensure-then-signed-update shape.
-            let opens: Vec<(&String, &String, i64)> = delta
-                .models
-                .iter()
-                .flat_map(|m| {
-                    m.usage_units
-                        .iter()
-                        .filter(|(u, _)| !is_reserved_unit(u))
-                        .map(move |(u, d)| (&m.model, u, *d))
-                })
-                .collect();
-            if !opens.is_empty() {
-                let mut ensure = String::from(
-                    "INSERT INTO usage_ledger_units (bucket_id, window_start, model, unit) VALUES ",
-                );
-                let mut update = String::from(
-                    "UPDATE usage_ledger_units u SET count = GREATEST(0, u.count + v.d) FROM (VALUES ",
-                );
-                let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
-                    Vec::with_capacity(2 + opens.len() * 2);
-                let mut update_params: Vec<&(dyn ToSql + Sync)> =
-                    Vec::with_capacity(2 + opens.len() * 3);
-                ensure_params.push(&bucket_id);
-                ensure_params.push(&ws);
-                update_params.push(&bucket_id);
-                update_params.push(&ws);
-                for (i, (model, unit, d)) in opens.iter().enumerate() {
-                    if i > 0 {
-                        ensure.push(',');
-                        update.push(',');
-                    }
-                    let eb = 3 + i * 2;
-                    ensure.push_str(&format!("($1,$2,${},${})", eb, eb + 1));
-                    ensure_params.push(*model);
-                    ensure_params.push(*unit);
-                    let ub = 3 + i * 3;
-                    update.push_str(&format!(
-                        "(${}::text,${}::text,${}::bigint)",
-                        ub,
-                        ub + 1,
-                        ub + 2
-                    ));
-                    update_params.push(*model);
-                    update_params.push(*unit);
-                    update_params.push(d);
-                }
-                ensure.push_str(" ON CONFLICT (bucket_id, window_start, model, unit) DO NOTHING");
-                update.push_str(
-                    ") AS v(model, unit, d) \
-                     WHERE u.bucket_id = $1 AND u.window_start = $2 \
-                       AND u.model = v.model AND u.unit = v.unit",
-                );
-                tx.execute(&ensure, &ensure_params).store()?;
-                tx.execute(&update, &update_params).store()?;
-            }
-        }
-        tx.commit().store()?;
-        Ok(())
+        Self::add_usage_in(&mut tx, bucket_id, window_start, delta)?;
+        tx.commit().store()
     }
 
     fn add_metering(&self, d: &MeteringDelta) -> RecordStoreResult<()> {
-        let (bucket, ti, to, tcr, tcw) = (
-            clamp(d.bucket),
-            clamp(d.tokens_input),
-            clamp(d.tokens_output),
-            clamp(d.tokens_cache_read),
-            clamp(d.tokens_cache_write),
-        );
-        let requests = clamp(d.requests);
-        let brequests = clamp(d.billable_requests);
-        let priced_from = clamp(d.priced_from_ms);
         let mut client = self.lock();
         let mut tx = client.transaction().store()?;
-        // `priced_from_ms` is part of the accrual key (DECISION #79): a rate-card edit inside the
-        // UTC day opens a SECOND row for that day so each half keeps the card it was earned under,
-        // rather than folding counts earned under two prices into one row readable against one.
-        tx.execute(
-            "INSERT INTO usage_metering (key_id, bucket, model, provider,
-                 tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
-                 requests, billable_requests, key_group_at_use, pricing_version, priced_from_ms)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-             ON CONFLICT (key_id, bucket, model, provider, priced_from_ms) DO UPDATE SET
-                 tokens_input       = usage_metering.tokens_input + EXCLUDED.tokens_input,
-                 tokens_output      = usage_metering.tokens_output + EXCLUDED.tokens_output,
-                 tokens_cache_read  = usage_metering.tokens_cache_read + EXCLUDED.tokens_cache_read,
-                 tokens_cache_write = usage_metering.tokens_cache_write + EXCLUDED.tokens_cache_write,
-                 requests           = usage_metering.requests + EXCLUDED.requests,
-                 billable_requests  = usage_metering.billable_requests + EXCLUDED.billable_requests",
-            &[
-                &d.key_id, &bucket, &d.model, &d.provider, &ti, &to, &tcr, &tcw, &requests,
-                &brequests, &d.key_group_at_use, &d.pricing_version, &priced_from,
-            ],
-        )
-        .store()?;
-        // Every ledgered class the token columns do not hold, additive like them, in the SAME
-        // transaction so a metering row never shows its tokens without its other classes.
-        let units: Vec<(&String, i64)> = d
-            .usage_units
-            .iter()
-            .filter(|(_, v)| **v != 0)
-            .map(|(u, v)| (u, clamp(*v)))
-            .collect();
-        if !units.is_empty() {
-            let mut sql = String::from(
-                "INSERT INTO usage_metering_units \
-                 (key_id, bucket, model, provider, priced_from_ms, unit, count) VALUES ",
-            );
-            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(5 + units.len() * 2);
-            params.push(&d.key_id);
-            params.push(&bucket);
-            params.push(&d.model);
-            params.push(&d.provider);
-            params.push(&priced_from);
-            for (i, (unit, count)) in units.iter().enumerate() {
-                if i > 0 {
-                    sql.push(',');
-                }
-                let base = 6 + i * 2;
-                sql.push_str(&format!("($1,$2,$3,$4,$5,${},${})", base, base + 1));
-                params.push(*unit);
-                params.push(count);
-            }
-            sql.push_str(
-                " ON CONFLICT (key_id, bucket, model, provider, priced_from_ms, unit) DO UPDATE SET \
-                 count = usage_metering_units.count + EXCLUDED.count",
-            );
-            tx.execute(&sql, &params).store()?;
-        }
-        tx.commit().store()?;
-        Ok(())
+        Self::add_metering_in(&mut tx, d)?;
+        tx.commit().store()
     }
 
     fn list_metering(&self, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
@@ -1664,97 +1533,16 @@ impl RecordStore for PostgresStore {
     }
 
     fn append_audit(&self, entry: &AuditRecord) -> RecordStoreResult<()> {
-        // A `seq`/`ts` past `i64::MAX` cannot be stored faithfully: `clamp` pins it, so the record
-        // read back is NOT the record written. Two consequences, both bad, and neither acceptable
-        // silently — an identical retry compares unequal and is reported as "the audit chain has
-        // forked" (naming the same action on both sides, the worst possible page to hand an
-        // operator), and two genuinely distinct seqs collapse onto one row. Rejected outright
-        // instead. Comparing the CLAMPED form would fix the false alarm by causing the silent loss,
-        // which is the wrong half to give up.
-        if entry.seq > i64::MAX as u64 || entry.ts > i64::MAX as u64 {
-            return Err(RecordStoreError(format!(
-                "append_audit: seq {} / ts {} exceeds the storable range (i64::MAX); refusing to \
-                 store a record that would not read back as itself",
-                entry.seq, entry.ts
-            )));
-        }
-        let (seq, ts) = (clamp(entry.seq), clamp(entry.ts));
-        // ON CONFLICT DO NOTHING, not DO UPDATE: the trait's own contract is "append-only... a store
-        // never rewrites or recomputes the digest" (busbar_contract::records::RecordStore::append_audit doc). `seq` is a
-        // per-process counter (see the engine's own known caveat about clustered nodes), so a
-        // collision here means either a real caller bug or two nodes racing on the same seq -- in
-        // BOTH cases silently overwriting a prior entry's hash/prev_hash would corrupt the hash chain
-        // without any trace. Failing loudly on a collision is strictly safer than the alternative:
-        // the caller (or an operator) finds out immediately, instead of the audit log quietly losing
-        // integrity guarantees it claims to hold.
-        // A collision has TWO causes and they are not the same event. Erroring on both (which this
-        // used to do) makes the engine's own write-through look like a corrupt chain the first time
-        // a commit ACK is lost to a timeout or a reconnect and it retries. Compare the records and
-        // let the difference decide, per the trait contract:
-        //   identical -> the retry. Benign, and the common one. Ok.
-        //   different -> two records claiming one chain position: forked or tampered. Error.
-        //
-        // The INSERT and the read-back run in ONE transaction, and the read takes `FOR SHARE`, so
-        // the row that caused the conflict cannot be deleted out from under the comparison. Without
-        // that (an autocommit INSERT then a separate autocommit SELECT), an out-of-band deleter —
-        // operator SQL, an external retention job — could remove the conflicting row in between,
-        // leaving the seq empty and this method with nothing to compare. The obvious-looking answer
-        // there, "nothing occupies the seq, so no fork: return Ok", REPORTS SUCCESS FOR A RECORD IT
-        // NEVER STORED. That is the same silent-loss shape the whole comparison exists to prevent,
-        // just inverted, and an audit entry is the last thing that should vanish quietly.
-        //
-        // The loop covers the one case the lock cannot: the row disappearing BEFORE the read takes
-        // its share lock. Then the seq is genuinely free again and the right move is to insert,
-        // which is what the next iteration does. Bounded, and exhausting the bound is an error
-        // rather than a success, so no path here returns Ok without the record being stored.
+        // The loop covers the one case the share lock cannot: the conflicting row disappearing
+        // BEFORE the read takes its lock. Then the seq is genuinely free again and the next
+        // iteration inserts. Bounded, and exhausting the bound is an error rather than a success,
+        // so no path here returns Ok without the record being stored.
         const MAX_ATTEMPTS: u32 = 3;
         for _ in 0..MAX_ATTEMPTS {
             let mut client = self.lock();
             let mut tx = client.transaction().store()?;
-            let inserted = tx
-                .execute(
-                    "INSERT INTO audit_log
-                        (seq, ts, action, resource, outcome, principal, prev_hash, hash)
-                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                     ON CONFLICT (seq) DO NOTHING",
-                    &[
-                        &seq,
-                        &ts,
-                        &entry.action,
-                        &entry.resource,
-                        &entry.outcome,
-                        &entry.principal,
-                        &entry.prev_hash,
-                        &entry.hash,
-                    ],
-                )
-                .store()?;
-            if inserted == 1 {
-                tx.commit().store()?;
-                return Ok(());
-            }
-            let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log WHERE seq=$1 FOR SHARE");
-            let stored = tx
-                .query_opt(&sql, &[&seq])
-                .store()?
-                .map(|r| row_to_audit(&r));
-            match stored {
-                Some(stored) if &stored == entry => {
-                    tx.commit().store()?;
-                    return Ok(());
-                }
-                Some(stored) => {
-                    return Err(RecordStoreError(format!(
-                        "append_audit: seq {} already holds a DIFFERENT record; the audit chain \
-                         has forked (stored action '{}', incoming '{}')",
-                        entry.seq, stored.action, entry.action
-                    )));
-                }
-                // Gone before the share lock could hold it. Drop the transaction and try again:
-                // the seq is free, so the insert should now land.
-                None => {
-                    drop(tx);
-                }
+            if Self::append_audit_in(&mut tx, entry)? {
+                return tx.commit().store();
             }
         }
         Err(RecordStoreError(format!(
@@ -1856,72 +1644,14 @@ impl RecordStore for PostgresStore {
     fn append_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
         // This store binds owned rows: the one copy of the borrowed view happens here.
         let record = &record.to_record();
-        let seq = as_storable_i64("append_plane_record", "seq", record.seq)?;
-        let ts = as_storable_i64("append_plane_record", "ts", record.ts)?;
-        // The chain a child record hangs off: its parent, or (a parentless append) its own id —
-        // the same identity busbar's reference backends key a chain by.
-        let parent = record.parent.as_deref().unwrap_or(record.id.as_str());
-        let disposition = disposition_to_storage(record.disposition);
-        // APPEND-ONLY, never an overwrite. A record arriving on an occupied (kind, parent, seq) is
-        // settled by comparing the two, the same way `append_audit` settles a duplicate seq:
-        // IDENTICAL is the write-through retrying after a timeout (Ok, the common case), DIFFERENT
-        // is a forked or tampered chain (an error — overwriting would destroy exactly the case
-        // worth reporting, and this store never restates a digest it was handed).
-        //
-        // The INSERT and the read-back share ONE transaction and the read takes `FOR SHARE`, so the
-        // conflicting row cannot be purged out from under the comparison; the bounded loop covers
-        // the row vanishing before the share lock lands (the position is then free, so insert). No
-        // path returns Ok without the record being stored.
+        // The bounded loop covers the conflicting row vanishing before the share lock lands (the
+        // position is then free, so insert). No path returns Ok without the record being stored.
         const MAX_ATTEMPTS: u32 = 3;
         for _ in 0..MAX_ATTEMPTS {
             let mut client = self.lock();
             let mut tx = client.transaction().store()?;
-            let inserted = tx
-                .execute(
-                    "INSERT INTO plane_chain (kind, parent, seq, id, ts, disposition, body)
-                     VALUES ($1,$2,$3,$4,$5,$6,$7)
-                     ON CONFLICT (kind, parent, seq) DO NOTHING",
-                    &[
-                        &record.kind,
-                        &parent,
-                        &seq,
-                        &record.id,
-                        &ts,
-                        &disposition,
-                        &record.body,
-                    ],
-                )
-                .store()?;
-            if inserted == 1 {
-                tx.commit().store()?;
-                return Ok(());
-            }
-            let stored = tx
-                .query_opt(
-                    "SELECT id, ts, disposition, body FROM plane_chain
-                     WHERE kind=$1 AND parent=$2 AND seq=$3 FOR SHARE",
-                    &[&record.kind, &parent, &seq],
-                )
-                .store()?;
-            match stored {
-                Some(r) => {
-                    let identical = r.get::<_, String>(0) == record.id
-                        && r.get::<_, i64>(1) == ts
-                        && r.get::<_, String>(2) == disposition
-                        && r.get::<_, Vec<u8>>(3) == record.body;
-                    if identical {
-                        tx.commit().store()?;
-                        return Ok(());
-                    }
-                    // Names the position and nothing else — it must not echo stored (or caller)
-                    // content back.
-                    return Err(RecordStoreError(format!(
-                        "append_plane_record: kind '{}' parent '{}' seq {} is already occupied by \
-                         another record; the chain has forked",
-                        record.kind, parent, record.seq
-                    )));
-                }
-                None => drop(tx),
+            if Self::append_plane_record_in(&mut tx, record)? {
+                return tx.commit().store();
             }
         }
         Err(RecordStoreError(format!(
@@ -2261,6 +1991,373 @@ impl PostgresStore {
     }
 }
 
+/// The writes the store v3 `op_id` slots run inside their dedupe transaction ([`v3`]).
+impl PostgresStore {
+    /// `add_usage` inside the caller's transaction (the store v3 `op_id` writes and batches run
+    /// it with their dedupe record, in one transaction).
+    pub(crate) fn add_usage_in(
+        tx: &mut Transaction<'_>,
+        bucket_id: &str,
+        window_start: u64,
+        delta: &UsageDelta,
+    ) -> RecordStoreResult<()> {
+        let ws = clamp(window_start);
+        tx.execute(
+            "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
+             VALUES ($1,$2,GREATEST(0,$3::bigint),GREATEST(0,$4::bigint))
+             ON CONFLICT (bucket_id, window_start) DO UPDATE SET
+                requests = GREATEST(0, usage_windows.requests + $3::bigint),
+                billable_requests = GREATEST(0, usage_windows.billable_requests + $4::bigint)",
+            &[&bucket_id, &ws, &delta.requests, &delta.billable_requests],
+        )
+        .store()?;
+        if !delta.models.is_empty() {
+            // TWO statements, both batched over every model, and the split is what makes a
+            // NEGATIVE delta (a refund) land. An `INSERT … ON CONFLICT DO UPDATE` can only add
+            // `EXCLUDED.col` on conflict, and EXCLUDED is the row the INSERT would have written —
+            // which has to be floored at 0 for a first-seen model — so a refund against an existing
+            // row added 0 and was silently lost. Instead: make sure every model's row exists (at
+            // zero), then apply the SIGNED deltas to it in one UPDATE, floored at 0 there. A refund
+            // against a fresh row floors to 0, exactly as `UsageLedger::apply_model_delta` does.
+            let deltas: Vec<[i64; 4]> = delta
+                .models
+                .iter()
+                .map(|m| RESERVED_COLUMNS.map(|u| m.usage_units.get(u).copied().unwrap_or(0)))
+                .collect();
+            let mut ensure =
+                String::from("INSERT INTO usage_ledger (bucket_id, window_start, model) VALUES ");
+            let mut update = String::from(
+                "UPDATE usage_ledger u SET \
+                    tokens_input       = GREATEST(0, u.tokens_input + v.di), \
+                    tokens_output      = GREATEST(0, u.tokens_output + v.do_), \
+                    tokens_cache_read  = GREATEST(0, u.tokens_cache_read + v.dcr), \
+                    tokens_cache_write = GREATEST(0, u.tokens_cache_write + v.dcw) \
+                 FROM (VALUES ",
+            );
+            let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
+                Vec::with_capacity(2 + delta.models.len());
+            let mut update_params: Vec<&(dyn ToSql + Sync)> =
+                Vec::with_capacity(2 + delta.models.len() * 5);
+            ensure_params.push(&bucket_id);
+            ensure_params.push(&ws);
+            update_params.push(&bucket_id);
+            update_params.push(&ws);
+            for (i, (m, d)) in delta.models.iter().zip(deltas.iter()).enumerate() {
+                if i > 0 {
+                    ensure.push(',');
+                    update.push(',');
+                }
+                ensure.push_str(&format!("($1,$2,${})", 3 + i));
+                ensure_params.push(&m.model);
+                let base = 3 + i * 5;
+                update.push_str(&format!(
+                    "(${}::text,${}::bigint,${}::bigint,${}::bigint,${}::bigint)",
+                    base,
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4
+                ));
+                update_params.push(&m.model);
+                for v in d {
+                    update_params.push(v);
+                }
+            }
+            ensure.push_str(" ON CONFLICT (bucket_id, window_start, model) DO NOTHING");
+            update.push_str(
+                ") AS v(model, di, do_, dcr, dcw) \
+                 WHERE u.bucket_id = $1 AND u.window_start = $2 AND u.model = v.model",
+            );
+            tx.execute(&ensure, &ensure_params).store()?;
+            tx.execute(&update, &update_params).store()?;
+
+            // The OPEN unit classes, the same ensure-then-signed-update shape.
+            let opens: Vec<(&String, &String, i64)> = delta
+                .models
+                .iter()
+                .flat_map(|m| {
+                    m.usage_units
+                        .iter()
+                        .filter(|(u, _)| !is_reserved_unit(u))
+                        .map(move |(u, d)| (&m.model, u, *d))
+                })
+                .collect();
+            if !opens.is_empty() {
+                let mut ensure = String::from(
+                    "INSERT INTO usage_ledger_units (bucket_id, window_start, model, unit) VALUES ",
+                );
+                let mut update = String::from(
+                    "UPDATE usage_ledger_units u SET count = GREATEST(0, u.count + v.d) FROM (VALUES ",
+                );
+                let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
+                    Vec::with_capacity(2 + opens.len() * 2);
+                let mut update_params: Vec<&(dyn ToSql + Sync)> =
+                    Vec::with_capacity(2 + opens.len() * 3);
+                ensure_params.push(&bucket_id);
+                ensure_params.push(&ws);
+                update_params.push(&bucket_id);
+                update_params.push(&ws);
+                for (i, (model, unit, d)) in opens.iter().enumerate() {
+                    if i > 0 {
+                        ensure.push(',');
+                        update.push(',');
+                    }
+                    let eb = 3 + i * 2;
+                    ensure.push_str(&format!("($1,$2,${},${})", eb, eb + 1));
+                    ensure_params.push(*model);
+                    ensure_params.push(*unit);
+                    let ub = 3 + i * 3;
+                    update.push_str(&format!(
+                        "(${}::text,${}::text,${}::bigint)",
+                        ub,
+                        ub + 1,
+                        ub + 2
+                    ));
+                    update_params.push(*model);
+                    update_params.push(*unit);
+                    update_params.push(d);
+                }
+                ensure.push_str(" ON CONFLICT (bucket_id, window_start, model, unit) DO NOTHING");
+                update.push_str(
+                    ") AS v(model, unit, d) \
+                     WHERE u.bucket_id = $1 AND u.window_start = $2 \
+                       AND u.model = v.model AND u.unit = v.unit",
+                );
+                tx.execute(&ensure, &ensure_params).store()?;
+                tx.execute(&update, &update_params).store()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `add_metering` inside the caller's transaction.
+    pub(crate) fn add_metering_in(
+        tx: &mut Transaction<'_>,
+        d: &MeteringDelta,
+    ) -> RecordStoreResult<()> {
+        let (bucket, ti, to, tcr, tcw) = (
+            clamp(d.bucket),
+            clamp(d.tokens_input),
+            clamp(d.tokens_output),
+            clamp(d.tokens_cache_read),
+            clamp(d.tokens_cache_write),
+        );
+        let requests = clamp(d.requests);
+        let brequests = clamp(d.billable_requests);
+        let priced_from = clamp(d.priced_from_ms);
+        // `priced_from_ms` is part of the accrual key (DECISION #79): a rate-card edit inside the
+        // UTC day opens a SECOND row for that day so each half keeps the card it was earned under,
+        // rather than folding counts earned under two prices into one row readable against one.
+        tx.execute(
+            "INSERT INTO usage_metering (key_id, bucket, model, provider,
+                 tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
+                 requests, billable_requests, key_group_at_use, pricing_version, priced_from_ms)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+             ON CONFLICT (key_id, bucket, model, provider, priced_from_ms) DO UPDATE SET
+                 tokens_input       = usage_metering.tokens_input + EXCLUDED.tokens_input,
+                 tokens_output      = usage_metering.tokens_output + EXCLUDED.tokens_output,
+                 tokens_cache_read  = usage_metering.tokens_cache_read + EXCLUDED.tokens_cache_read,
+                 tokens_cache_write = usage_metering.tokens_cache_write + EXCLUDED.tokens_cache_write,
+                 requests           = usage_metering.requests + EXCLUDED.requests,
+                 billable_requests  = usage_metering.billable_requests + EXCLUDED.billable_requests",
+            &[
+                &d.key_id, &bucket, &d.model, &d.provider, &ti, &to, &tcr, &tcw, &requests,
+                &brequests, &d.key_group_at_use, &d.pricing_version, &priced_from,
+            ],
+        )
+        .store()?;
+        // Every ledgered class the token columns do not hold, additive like them, in the SAME
+        // transaction so a metering row never shows its tokens without its other classes.
+        let units: Vec<(&String, i64)> = d
+            .usage_units
+            .iter()
+            .filter(|(_, v)| **v != 0)
+            .map(|(u, v)| (u, clamp(*v)))
+            .collect();
+        if !units.is_empty() {
+            let mut sql = String::from(
+                "INSERT INTO usage_metering_units \
+                 (key_id, bucket, model, provider, priced_from_ms, unit, count) VALUES ",
+            );
+            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(5 + units.len() * 2);
+            params.push(&d.key_id);
+            params.push(&bucket);
+            params.push(&d.model);
+            params.push(&d.provider);
+            params.push(&priced_from);
+            for (i, (unit, count)) in units.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                let base = 6 + i * 2;
+                sql.push_str(&format!("($1,$2,$3,$4,$5,${},${})", base, base + 1));
+                params.push(*unit);
+                params.push(count);
+            }
+            sql.push_str(
+                " ON CONFLICT (key_id, bucket, model, provider, priced_from_ms, unit) DO UPDATE SET \
+                 count = usage_metering_units.count + EXCLUDED.count",
+            );
+            tx.execute(&sql, &params).store()?;
+        }
+        Ok(())
+    }
+
+    /// `append_audit` inside the caller's transaction: `Ok(true)` once the record is stored (or an
+    /// identical one already was), `Ok(false)` when the conflicting row vanished before the share
+    /// lock held it (the seq is free again: retry in a fresh transaction), `Err` on a fork.
+    pub(crate) fn append_audit_in(
+        tx: &mut Transaction<'_>,
+        entry: &AuditRecord,
+    ) -> RecordStoreResult<bool> {
+        // A `seq`/`ts` past `i64::MAX` cannot be stored faithfully: `clamp` pins it, so the record
+        // read back is NOT the record written. Two consequences, both bad, and neither acceptable
+        // silently — an identical retry compares unequal and is reported as "the audit chain has
+        // forked" (naming the same action on both sides, the worst possible page to hand an
+        // operator), and two genuinely distinct seqs collapse onto one row. Rejected outright
+        // instead. Comparing the CLAMPED form would fix the false alarm by causing the silent loss,
+        // which is the wrong half to give up.
+        if entry.seq > i64::MAX as u64 || entry.ts > i64::MAX as u64 {
+            return Err(RecordStoreError(format!(
+                "append_audit: seq {} / ts {} exceeds the storable range (i64::MAX); refusing to \
+                 store a record that would not read back as itself",
+                entry.seq, entry.ts
+            )));
+        }
+        let (seq, ts) = (clamp(entry.seq), clamp(entry.ts));
+        // ON CONFLICT DO NOTHING, not DO UPDATE: the trait's own contract is "append-only... a store
+        // never rewrites or recomputes the digest" (busbar_contract::records::RecordStore::append_audit doc). `seq` is a
+        // per-process counter (see the engine's own known caveat about clustered nodes), so a
+        // collision here means either a real caller bug or two nodes racing on the same seq -- in
+        // BOTH cases silently overwriting a prior entry's hash/prev_hash would corrupt the hash chain
+        // without any trace. Failing loudly on a collision is strictly safer than the alternative:
+        // the caller (or an operator) finds out immediately, instead of the audit log quietly losing
+        // integrity guarantees it claims to hold.
+        // A collision has TWO causes and they are not the same event. Erroring on both (which this
+        // used to do) makes the engine's own write-through look like a corrupt chain the first time
+        // a commit ACK is lost to a timeout or a reconnect and it retries. Compare the records and
+        // let the difference decide, per the trait contract:
+        //   identical -> the retry. Benign, and the common one. Ok.
+        //   different -> two records claiming one chain position: forked or tampered. Error.
+        //
+        // The INSERT and the read-back run in ONE transaction, and the read takes `FOR SHARE`, so
+        // the row that caused the conflict cannot be deleted out from under the comparison. Without
+        // that (an autocommit INSERT then a separate autocommit SELECT), an out-of-band deleter —
+        // operator SQL, an external retention job — could remove the conflicting row in between,
+        // leaving the seq empty and this method with nothing to compare. The obvious-looking answer
+        // there, "nothing occupies the seq, so no fork: return Ok", REPORTS SUCCESS FOR A RECORD IT
+        // NEVER STORED. That is the same silent-loss shape the whole comparison exists to prevent,
+        // just inverted, and an audit entry is the last thing that should vanish quietly.
+
+        let inserted = tx
+            .execute(
+                "INSERT INTO audit_log
+                    (seq, ts, action, resource, outcome, principal, prev_hash, hash)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                 ON CONFLICT (seq) DO NOTHING",
+                &[
+                    &seq,
+                    &ts,
+                    &entry.action,
+                    &entry.resource,
+                    &entry.outcome,
+                    &entry.principal,
+                    &entry.prev_hash,
+                    &entry.hash,
+                ],
+            )
+            .store()?;
+        if inserted == 1 {
+            return Ok(true);
+        }
+        let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log WHERE seq=$1 FOR SHARE");
+        let stored = tx
+            .query_opt(&sql, &[&seq])
+            .store()?
+            .map(|r| row_to_audit(&r));
+        match stored {
+            Some(stored) if &stored == entry => Ok(true),
+            Some(stored) => Err(RecordStoreError(format!(
+                "append_audit: seq {} already holds a DIFFERENT record; the audit chain \
+                     has forked (stored action '{}', incoming '{}')",
+                entry.seq, stored.action, entry.action
+            ))),
+            // Gone before the share lock could hold it.
+            None => Ok(false),
+        }
+    }
+
+    /// `append_plane_record` inside the caller's transaction: `Ok(true)` once the record is stored
+    /// (or an identical one already was), `Ok(false)` when the conflicting row vanished before the
+    /// share lock held it (retry in a fresh transaction), `Err` on a fork.
+    pub(crate) fn append_plane_record_in(
+        tx: &mut Transaction<'_>,
+        record: &PlaneRecord,
+    ) -> RecordStoreResult<bool> {
+        let seq = as_storable_i64("append_plane_record", "seq", record.seq)?;
+        let ts = as_storable_i64("append_plane_record", "ts", record.ts)?;
+        // The chain a child record hangs off: its parent, or (a parentless append) its own id —
+        // the same identity busbar's reference backends key a chain by.
+        let parent = record.parent.as_deref().unwrap_or(record.id.as_str());
+        let disposition = disposition_to_storage(record.disposition);
+        // APPEND-ONLY, never an overwrite. A record arriving on an occupied (kind, parent, seq) is
+        // settled by comparing the two, the same way `append_audit` settles a duplicate seq:
+        // IDENTICAL is the write-through retrying after a timeout (Ok, the common case), DIFFERENT
+        // is a forked or tampered chain (an error — overwriting would destroy exactly the case
+        // worth reporting, and this store never restates a digest it was handed).
+        //
+        // The INSERT and the read-back share ONE transaction and the read takes `FOR SHARE`, so the
+        // conflicting row cannot be purged out from under the comparison; the bounded loop covers
+        // the row vanishing before the share lock lands (the position is then free, so insert). No
+        // path returns Ok without the record being stored.
+        let inserted = tx
+            .execute(
+                "INSERT INTO plane_chain (kind, parent, seq, id, ts, disposition, body)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7)
+                 ON CONFLICT (kind, parent, seq) DO NOTHING",
+                &[
+                    &record.kind,
+                    &parent,
+                    &seq,
+                    &record.id,
+                    &ts,
+                    &disposition,
+                    &record.body,
+                ],
+            )
+            .store()?;
+        if inserted == 1 {
+            return Ok(true);
+        }
+        let stored = tx
+            .query_opt(
+                "SELECT id, ts, disposition, body FROM plane_chain
+                 WHERE kind=$1 AND parent=$2 AND seq=$3 FOR SHARE",
+                &[&record.kind, &parent, &seq],
+            )
+            .store()?;
+        match stored {
+            Some(r) => {
+                let identical = r.get::<_, String>(0) == record.id
+                    && r.get::<_, i64>(1) == ts
+                    && r.get::<_, String>(2) == disposition
+                    && r.get::<_, Vec<u8>>(3) == record.body;
+                if identical {
+                    return Ok(true);
+                }
+                // Names the position and nothing else — it must not echo stored (or caller)
+                // content back.
+                Err(RecordStoreError(format!(
+                    "append_plane_record: kind '{}' parent '{}' seq {} is already occupied by \
+                     another record; the chain has forked",
+                    record.kind, parent, record.seq
+                )))
+            }
+            None => Ok(false),
+        }
+    }
+}
+
 const _: fn() = || {
     fn assert_tosql<T: ToSql>() {}
     assert_tosql::<i64>();
@@ -2269,48 +2366,16 @@ const _: fn() = || {
 };
 
 // ── THE PLUGIN DOOR ─────────────────────────────────────────────────────────────────────────────
-// One registration, both doors (DECISIONS #2 rule (1)): `export_store_plugin!(open)` emits
-// `BUSBAR_COLD_ENTRY` — the boundary a busbar build that LINKS this crate hands the loader (see
-// [`linked::STORE`]) — and registers that same entry as the image's door, through which the SDK's
-// frozen symbols answer when the sibling `busbar-store-postgres-plugin` cdylib is dropped in.
+// One door, both ways in (THE DESIGN §11, DECISIONS #2 rule (1)): `v3` invokes `store_door!` over
+// this store, which expands to `door`. A busbar build that links this crate registers `door` as a
+// compiled-in row (`LinkedRow::of(door)`); the sibling `busbar-store-postgres-plugin` cdylib exports
+// the same `door` as `busbar_plugin_door` for the loader to `dlopen`.
 
-/// The package name both doors state for this store.
+mod v3;
+pub use v3::door;
+
+/// The package name the door's Statement states for this store.
 pub const NAME: &str = "busbar-store-postgres";
-/// The name `store.module` selects this store by.
-pub const ALIAS: &str = "postgres";
-
-/// Construct a Postgres store from the JSON config the engine passes through `open`:
-///
-/// ```json
-/// { "url": "postgres://user:pass@host:5432/busbar" }
-/// ```
-pub fn open(cfg: &str) -> Result<Box<dyn RecordStore>, String> {
-    let v: serde_json::Value = if cfg.trim().is_empty() {
-        serde_json::Value::Object(Default::default())
-    } else {
-        serde_json::from_str(cfg).map_err(|e| format!("invalid postgres plugin config: {e}"))?
-    };
-    let url = v
-        .get("url")
-        .and_then(|x| x.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            "postgres plugin config requires a \"url\" (a libpq connection string)".to_string()
-        })?;
-    let store = PostgresStore::connect(url).map_err(|e| e.0)?;
-    Ok(Box::new(store))
-}
-
-busbar_contract::abi::sdk::export_store_plugin!(open);
-
-/// THE LINKED ENTRY (DECISIONS #2 rule (1)): what a busbar build that links this store registers
-/// onto the cold-kind axis — the same statement and boundary the dropped-in tarball carries.
-pub mod linked {
-    /// `(name, alias, boundary)`.
-    pub const STORE: (&str, &str, &busbar_contract::abi::sdk::ColdEntry) =
-        (super::NAME, super::ALIAS, &super::BUSBAR_COLD_ENTRY);
-}
 
 #[cfg(test)]
 mod tests;

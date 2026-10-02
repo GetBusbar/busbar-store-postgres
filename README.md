@@ -134,10 +134,10 @@ cargo fmt --all -- --check
 ### Dependencies
 
 This is a same-repo, 2-crate Cargo workspace (`store-postgres/`, the
-real logic crate — which also carries the plugin's one door
-registration, `export_store_plugin!(open)`, and its `linked` row — and
-`store-postgres-plugin/`, the thin `cdylib` adapter that re-exports it;
-see [members](Cargo.toml)).
+real logic crate — which also carries the store's one door, `door`,
+from `store_door!` over its `StoreSlots` implementation (`src/v3.rs`) —
+and `store-postgres-plugin/`, the thin `cdylib` that exports that door as
+`busbar_plugin_door` through `export_door!`; see [members](Cargo.toml)).
 
 Its one busbar dependency is `busbar-contract` (plus
 `busbar-plugin-loader`, dev-only, for the conformance and end-to-end
@@ -152,10 +152,11 @@ busbar checkout at that same rev: `BUSBAR_CHECKOUT=<path>`, or a
 `busbar/` checkout beside this repo (CI checks one out there).
 
 `store-postgres-plugin/tests/conformance.rs` holds the store to ONE
-row and ONE behaviour through both doors — linked (the `linked::STORE`
-boundary) and dropped in (this repo's cdylib, signed, packed, scanned
-and opened by the real loader) — with RED arms that prove the
-comparison is not vacuous.
+Statement and ONE behaviour through both doors — compiled in (the
+logic crate's `door`, through the loader's `load_linked`) and dropped in
+(this repo's cdylib, through `load_dropped`), each opened through the
+store v3 table — with RED arms that prove the comparison is not
+vacuous.
 
 ### Tests need a real Postgres
 
@@ -175,7 +176,7 @@ plugin ever loaded.
 `store-postgres-plugin/tests/admin_api_e2e.rs` goes one step further:
 it installs the plugin over the real admin API, restarts onto it, mints
 a key with an AWS-shaped credential over that API, and reads both rows
-back with a raw client that never touches the plugin, the C ABI or the
+back with a raw client that never touches the plugin, its door or the
 loader.
 
 `store-postgres/src/tests.rs` holds the store's own coverage against a

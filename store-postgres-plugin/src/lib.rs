@@ -7,12 +7,18 @@
 //! in-process at boot. One Postgres behind a fleet of busbar nodes means shared virtual keys,
 //! budgets, and usage across the cluster.
 //!
-//! All the store lives in the `busbar-store-postgres` crate, including its one door registration
-//! (`export_store_plugin!(open)`): the frozen symbols the loader looks up are the SDK's, defined once,
-//! and they answer through that door. This crate re-exports the logic crate so the library it builds
-//! carries exactly the code a busbar build that links the store runs — one source, both doors
-//! (DECISIONS #2 rule (1)). Do NOT call the export macro here: two door registrations in one image.
+//! All the store lives in the `busbar-store-postgres` crate, including its one door (`door`, from
+//! `store_door!`). This crate re-exports the logic crate so the library it builds carries exactly
+//! the code a busbar build that links the store runs — one source, both doors (DECISIONS #2 rule
+//! (1)) — and exports that same `door` as the image's ONE symbol, `busbar_plugin_door`.
 
 #![deny(unsafe_code)]
 
 pub use busbar_store_postgres::*;
+
+/// THE DROPPED-IN DOOR. The one module allowed unsafe code: the exported symbol is
+/// `#[unsafe(no_mangle)]`.
+#[allow(unsafe_code)]
+mod exported {
+    busbar_contract::export_door!(busbar_store_postgres::door);
+}

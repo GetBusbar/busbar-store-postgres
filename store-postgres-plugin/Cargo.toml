@@ -19,9 +19,10 @@ license = "Apache-2.0"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# THE LOGIC, same repo. Its `export_store_plugin!(open)` registers the image's one door; this crate
-# only makes that door a loadable library.
+# THE LOGIC, same repo. Its `store_door!` defines the store's one `door`; this crate only exports
+# that door as the image's one symbol (`busbar_plugin_door`, the contract's `export_door!`).
 busbar-store-postgres = { path = "../store-postgres" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "934a016e20fc1a67c209b671d137c8cc28092767" }
 
 [dev-dependencies]
 # The conformance and end-to-end tests load the built cdylib over the REAL loader (sign, pack, scan,
