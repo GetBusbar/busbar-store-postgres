@@ -584,16 +584,13 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
     let path = plugin_path();
 
     let err = common::dropped_at(&path, "{ not json")
-        .err()
-        .expect("malformed config JSON must fail to load, not silently succeed");
+        .expect_err("malformed config JSON must fail to load, not silently succeed");
     assert!(
         err.contains("invalid postgres plugin config"),
         "the plugin's own error message should survive the ABI crossing intact: {err}"
     );
 
-    let err = common::dropped_at(&path, "{}")
-        .err()
-        .expect("a config missing url must fail to load");
+    let err = common::dropped_at(&path, "{}").expect_err("a config missing url must fail to load");
     assert!(
         err.contains("requires a \"url\""),
         "expected the plugin's own missing-url message, got: {err}"
@@ -603,8 +600,7 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
         &path,
         &cfg("postgres://u:p@127.0.0.1:1/definitely_not_a_real_db"),
     )
-    .err()
-    .expect("an unreachable postgres target must fail to load");
+    .expect_err("an unreachable postgres target must fail to load");
     assert!(
         err.contains("error connecting to server"),
         "expected tokio-postgres's own connect-failure message to survive the ABI crossing, got: {err}"
