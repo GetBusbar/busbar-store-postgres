@@ -40,4 +40,4 @@ postgres = { workspace = true }
 # crates/busbar/src/admin/tests/tests.rs uses, minus the async-only features it needs for its
 # in-process axum server.
 reqwest = { workspace = true, features = ["blocking", "json"] }
-base64 = "0.22"
+base64 = { workspace = true }
