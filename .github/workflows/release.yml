@@ -6,7 +6,8 @@ name: release
 
 on:
   push:
-    tags: ["v*", "!v*-*"]
+    # `vX.Y.Z-dev.N` is a signed PRE-RELEASE from dev (never main/qa); other suffixed tags start nothing.
+    tags: ["v*", "!v*-*", "v*-dev.*"]
   # A tag pushed with GITHUB_TOKEN starts no workflow, so a workflow that tags dispatches this on
   # the tag ref (`gh workflow run release.yml --ref <tag>`).
   workflow_dispatch: {}
@@ -20,7 +21,7 @@ permissions:
 
 jobs:
   ci:
-    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@934a016e20fc1a67c209b671d137c8cc28092767
+    uses: GetBusbar/busbar/.github/workflows/plugin-ci.yml@e1d3d8b097201859751d77208e66249d98b50a4b
     with:
       service: postgres
       busbar_checkout: true
@@ -29,7 +30,7 @@ jobs:
     secrets: inherit
   release:
     needs: ci
-    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@934a016e20fc1a67c209b671d137c8cc28092767
+    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@e1d3d8b097201859751d77208e66249d98b50a4b
     with:
       plugin_crate: busbar-store-postgres-plugin
       manifest_name: busbar-store-postgres
@@ -45,7 +46,7 @@ jobs:
   consumer-verify:
     needs: release
     if: ${{ !cancelled() }}
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@934a016e20fc1a67c209b671d137c8cc28092767
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@e1d3d8b097201859751d77208e66249d98b50a4b
     with:
       version: ${{ github.ref_name }}
       asset_prefix: busbar-store-postgres
