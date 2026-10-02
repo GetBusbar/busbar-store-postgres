@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! End-to-end coverage of the `busbar-store-postgres-plugin` cdylib, loaded the way a REAL operator
-//! actually loads a plugin — not via a direct in-process `busbar_plugin_loader::load_store()` call
+//! actually loads a plugin — not via a direct in-process load of the library
 //! (flagged, correctly, as testing a mechanism no end user ever uses: nobody imports
 //! `busbar-plugin-loader` and calls its internal function).
 //!
@@ -35,11 +35,13 @@
 //!      plugin/ABI/loader entirely) confirms the store type itself can talk to the same schema.
 //!
 //! The two ABI-contract error-path tests below (`bad_config_fails_over_abi`, `refuses_non_plugin`)
-//! are DELIBERATELY left calling `load_store()` directly — they test the loader's own error-surface
+//! are DELIBERATELY left loading the dropped-in door directly (`common::dropped_at`) — they test the loader's own error-surface
 //! contract in isolation (a legitimate internal unit-test target: "does a bad config produce a clean
 //! Err across the ABI, never a panic"), which is a different question from "does a real end-user
 //! install work," and converting them to a full process-boot-and-capture-stderr harness for each
 //! error shape is a much larger, lower-value lift than the persistence test's conversion.
+
+mod common;
 
 use busbar_store_postgres::PostgresStore;
 use std::path::PathBuf;
@@ -575,13 +577,13 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
 }
 
 /// END-TO-END FAILURE (ABI-contract unit test, see module doc for why this stays a direct
-/// `load_store()` call): an `open()` config that cannot produce a usable store surfaces back across
-/// the C ABI as a clean `Err`, never a panic or a silently-succeeded load.
+/// dropped-in load): an `open()` config that cannot produce a usable store surfaces back across
+/// the door as a clean `Err`, never a panic or a silently-succeeded load.
 #[test]
 fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
     let path = plugin_path();
 
-    let err = busbar_plugin_loader::load_store(&path, "{ not json")
+    let err = common::dropped_at(&path, "{ not json")
         .err()
         .expect("malformed config JSON must fail to load, not silently succeed");
     assert!(
@@ -589,7 +591,7 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
         "the plugin's own error message should survive the ABI crossing intact: {err}"
     );
 
-    let err = busbar_plugin_loader::load_store(&path, "{}")
+    let err = common::dropped_at(&path, "{}")
         .err()
         .expect("a config missing url must fail to load");
     assert!(
@@ -597,7 +599,7 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
         "expected the plugin's own missing-url message, got: {err}"
     );
 
-    let err = busbar_plugin_loader::load_store(
+    let err = common::dropped_at(
         &path,
         &cfg("postgres://u:p@127.0.0.1:1/definitely_not_a_real_db"),
     )
@@ -613,14 +615,11 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
 /// ABI-contract-unit-test rationale as above.
 #[test]
 fn refuses_non_plugin() {
-    let err = match busbar_plugin_loader::load_store(
-        std::path::Path::new("/definitely/not/a/plugin.so"),
-        "{}",
-    ) {
+    let err = match common::dropped_at(std::path::Path::new("/definitely/not/a/plugin.so"), "{}") {
         Err(e) => e,
         Ok(_) => panic!("a missing library must not load"),
     };
-    assert!(err.contains("failed to load plugin"), "got: {err}");
+    assert!(err.contains("the library did not load"), "got: {err}");
 }
 
 /// Serialize a stand-in plane-record body. The store never decodes a body, so the shape only has to
@@ -643,12 +642,12 @@ fn plane_decode(b: &[u8]) -> serde_json::Value {
 /// this happened. Every in-process test of `PostgresStore` is blind to it, because in production this
 /// backend is ONLY ever reached as a plugin.
 ///
-/// So it goes through `busbar_plugin_loader::load_store`: a REAL `dlopen` of the built cdylib, the
-/// real C ABI, the real `DynStore`. It writes AT ARITY > 1 (three chained records for one principal
-/// and one for a second), DROPS the handle — which runs `busbar_close` and UNLOADS the library, so
+/// So it goes through the dropped-in door (`common::dropped_at`): a REAL `dlopen` of the built
+/// cdylib, the real store v3 table, the real `LoadedStore`. It writes AT ARITY > 1 (three chained
+/// records for one principal and one for a second), DROPS the handle — which closes the instance, so
 /// nothing this process still holds can answer the reads — then `dlopen`s AGAIN over the same file
 /// and reads everything back. A third leg reads the same rows through the plain `PostgresStore`,
-/// never touching the cdylib, the C ABI or the loader — so a plugin that answered from its own
+/// never touching the cdylib, the door or the loader — so a plugin that answered from its own
 /// in-process cache still fails here.
 #[test]
 fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
@@ -713,8 +712,8 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
 
     {
-        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
-        let store = busbar_plugin_loader::load_store(&path, &cfg)
+        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the door.
+        let store = common::dropped_at(&path, &cfg)
             .expect("the postgres plugin must load over the real ABI");
         for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
             store
@@ -724,17 +723,17 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         store
             .append_plane_record(call(&p_other, 1, "", "o1").view())
             .expect("append_plane_record over the ABI");
-        // Dropping the boxed store drops the loader's `Library` handle: `busbar_close` runs and the
-        // dylib is UNLOADED. Nothing this process still holds can be answering the reads below.
+        // Dropping the store closes the instance and its connection. Nothing this process still
+        // holds can be answering the reads below.
         drop(store);
     }
 
-    // BOOT 2 — a second, independent dlopen over the same file, a fresh `busbar_open`, a fresh
+    // BOOT 2 — a second, independent dlopen over the same file, a fresh `open`, a fresh
     // connection inside the plugin.
-    let store = busbar_plugin_loader::load_store(&path, &cfg)
+    let store = common::dropped_at(&path, &cfg)
         .expect("the postgres plugin must load again over the real ABI");
 
-    let calls = chain(store.as_ref(), &p_main);
+    let calls = chain(&store, &p_main);
     assert_eq!(
         calls
             .iter()
@@ -758,7 +757,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     assert_eq!(calls[2]["content"]["outcome"], "dispatched");
     assert_eq!(calls[1]["content"]["pin_generation"], 3);
     assert_eq!(
-        chain(store.as_ref(), &p_other).len(),
+        chain(&store, &p_other).len(),
         1,
         "one principal's chain must not carry another's records"
     );
@@ -793,8 +792,8 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         2,
         "both records at ts 2001 go (one per principal); the one sitting exactly at the cutoff stays"
     );
-    assert_eq!(chain(store.as_ref(), &p_main).len(), 2);
-    assert!(chain(store.as_ref(), &p_other).is_empty());
+    assert_eq!(chain(&store, &p_main).len(), 2);
+    assert!(chain(&store, &p_other).is_empty());
     assert_eq!(
         store
             .list_plane_record_parents("call")
@@ -806,7 +805,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     drop(store);
 
     // LEG 3 — read the surviving rows through the plain `PostgresStore`, a code path that never
-    // touches the cdylib, the C ABI or the loader.
+    // touches the cdylib, the door or the loader.
     let direct_calls = chain(&direct, &p_main);
     assert_eq!(
         direct_calls
@@ -831,7 +830,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 /// AND REPORTS SUCCESS while keeping nothing, and an operator finds "task state survives a restart"
 /// false on their own deployment.
 ///
-/// A REAL `dlopen`, the real C ABI, the real `DynStore`. Write at arity > 1 (two tasks, one of them
+/// A REAL `dlopen`, the real store v3 table, the real `LoadedStore`. Write at arity > 1 (two tasks, one of them
 /// UPSERTED a second time, plus two independent provenance chains), DROP the handle, `dlopen` again
 /// and read everything back; a third leg reads through the plain `PostgresStore`.
 #[test]
@@ -908,8 +907,8 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     );
 
     {
-        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
-        let store = busbar_plugin_loader::load_store(&path, &cfg)
+        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the door.
+        let store = common::dropped_at(&path, &cfg)
             .expect("the postgres plugin must load over the real ABI");
         store
             .upsert_plane_record(
@@ -952,7 +951,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     }
 
     // BOOT 2 — a second, independent dlopen over the same file.
-    let store = busbar_plugin_loader::load_store(&path, &cfg)
+    let store = common::dropped_at(&path, &cfg)
         .expect("the postgres plugin must load again over the real ABI");
 
     let got = store
@@ -995,7 +994,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
          appears exactly ONCE"
     );
 
-    let chain = events(store.as_ref(), &t_live);
+    let chain = events(&store, &t_live);
     assert_eq!(
         chain
             .iter()
@@ -1009,7 +1008,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     }
     assert_eq!(chain[2]["content"]["request_id"], "req-3");
     assert_eq!(
-        events(store.as_ref(), &t_done).len(),
+        events(&store, &t_done).len(),
         1,
         "one task's chain must not carry another's events"
     );
@@ -1022,7 +1021,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     assert!(store
         .append_plane_record(event(&t_live, 3, "task.working", "h2", "rewritten").view())
         .is_err());
-    assert_eq!(events(store.as_ref(), &t_live).len(), 3, "no 4th event");
+    assert_eq!(events(&store, &t_live).len(), 3, "no 4th event");
 
     // Retention crosses the ABI too, COUNT AND ALL.
     assert_eq!(
@@ -1042,7 +1041,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         .expect("get_plane_record")
         .is_some());
     assert!(
-        events(store.as_ref(), &t_done).is_empty(),
+        events(&store, &t_done).is_empty(),
         "a swept task's chain must go with it or it is unbounded forever"
     );
     drop(store);
@@ -1140,8 +1139,8 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
 
     {
-        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the C ABI.
-        let store = busbar_plugin_loader::load_store(&path, &cfg)
+        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the door.
+        let store = common::dropped_at(&path, &cfg)
             .expect("the postgres plugin must load over the real ABI");
         store
             .upsert_plane_record(demotion(&srv_demoted, "tool-drift", NOW).view())
@@ -1165,10 +1164,10 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     }
 
     // BOOT 2 — a second, independent dlopen against the same database.
-    let store = busbar_plugin_loader::load_store(&path, &cfg)
+    let store = common::dropped_at(&path, &cfg)
         .expect("the postgres plugin must load again over the real ABI");
 
-    let mine: Vec<(String, String)> = demotions(store.as_ref())
+    let mine: Vec<(String, String)> = demotions(&store)
         .into_iter()
         .filter(|(s, _)| *s == srv_demoted || *s == srv_cleared)
         .collect();
@@ -1187,7 +1186,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     );
 
     // THE FLEET: a second, simultaneous dlopen against the same database.
-    let node_b = busbar_plugin_loader::load_store(&path, &cfg)
+    let node_b = common::dropped_at(&path, &cfg)
         .expect("a second node loads the same plugin against the same database");
     assert!(store
         .redeem_plane_token("ask", &nonce_fleet, NOW + 900, NOW + 2)
