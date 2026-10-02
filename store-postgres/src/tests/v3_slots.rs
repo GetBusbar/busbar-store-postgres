@@ -88,6 +88,8 @@ fn an_op_id_dedupes_durably_across_a_reconnect() {
     };
     let ns = ns();
     let bucket = format!("{ns}-b");
+    // A window no parallel test's `purge_windows_before` cutoff reaches.
+    const WINDOW: u64 = 4_000_000_000_000_000;
     let a = store(&url);
     let delta = UsageDelta {
         requests: 1,
@@ -95,23 +97,25 @@ fn an_op_id_dedupes_durably_across_a_reconnect() {
         ..Default::default()
     };
     let id = op();
-    a.add_usage_op(id, &bucket, 0, &delta).expect("applied");
-    a.add_usage_op(id, &bucket, 0, &delta).expect("replayed");
+    a.add_usage_op(id, &bucket, WINDOW, &delta)
+        .expect("applied");
+    a.add_usage_op(id, &bucket, WINDOW, &delta)
+        .expect("replayed");
     let other = UsageDelta {
         requests: 2,
         ..Default::default()
     };
     assert_eq!(
-        a.add_usage_op(id, &bucket, 0, &other),
+        a.add_usage_op(id, &bucket, WINDOW, &other),
         Err(OpRefused::Conflict)
     );
     drop(a);
 
     let b = store(&url);
-    b.add_usage_op(id, &bucket, 0, &delta)
+    b.add_usage_op(id, &bucket, WINDOW, &delta)
         .expect("replayed after a reconnect");
     assert_eq!(
-        b.get_usage(&bucket, 0).expect("read").requests,
+        b.get_usage(&bucket, WINDOW).expect("read").requests,
         1,
         "the replays applied nothing"
     );
