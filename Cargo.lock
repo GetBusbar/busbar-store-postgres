@@ -150,6 +150,7 @@ dependencies = [
  "busbar-contract",
  "busbar-plugin-loader",
  "busbar-store-postgres",
+ "busbar-store-postgres-plugin",
  "postgres",
  "reqwest",
  "serde_json",

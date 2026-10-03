@@ -18,6 +18,7 @@ pub use busbar_store_postgres::*;
 
 /// THE DROPPED-IN DOOR. The one module allowed unsafe code: the exported symbol is
 /// `#[unsafe(no_mangle)]`.
+#[cfg(feature = "dropped-in")]
 #[allow(unsafe_code)]
 mod exported {
     busbar_contract::export_door!(busbar_store_postgres::door);
