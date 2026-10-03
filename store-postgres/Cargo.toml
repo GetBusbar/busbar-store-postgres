@@ -36,3 +36,8 @@ serde = { workspace = true }
 # connection of the `postgres` driver's own.
 busbar-plugin-loader = { workspace = true, features = ["test-support"] }
 postgres = { workspace = true }
+# The TLS test (`src/tests/tls.rs`): an in-test TLS proxy in front of the live server, its CA minted
+# per run; the store's side is the loader's test table trusting that CA. Test-only.
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }

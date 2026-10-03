@@ -21,8 +21,9 @@
 //! never deadlock), tests each cell with 1.5.5's per-dimension rule (`abi::store::ReserveIn`) and
 //! applies all or nothing. A grant is valid until `u64::MAX`: nothing in the table expires a slice.
 //!
-//! CONNECTIONS: every slot is ONE connection over the host's connector, run as straight-line async
-//! code by the store SDK's `wire::drive` (busbar THE DESIGN: every call Ready or Pending(wake), no
+//! CONNECTIONS: every slot runs on the instance's ONE kept connection over the host's connector
+//! (1.5.5's one mutex-guarded connection; STORE-KEEP), as straight-line async code by the store
+//! SDK's `wire::drive_kept` (busbar THE DESIGN: every call Ready or Pending(wake), no
 //! socket of the plugin's own; ARCHITECT rulings 2026-10-03 on Q-L14-1 and Q-L16-2). The door
 //! declares one outbound `tcp` need (`NEEDS`, `operator-infrastructure`); `open` parses the
 //! settings, and its connect step reaches the server and ensures the schema, so an unreachable or
@@ -39,7 +40,7 @@ use busbar_contract::abi::host::conn::connector::{
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_OCTETS};
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::door::abi_str;
-use busbar_contract::abi::sdk::store::wire::{drive, Body};
+use busbar_contract::abi::sdk::store::wire::{drive_kept, Body};
 use busbar_contract::abi::sdk::store::{
     Cap, CapsRefused, Cell, CellKey, Dimension, Grant, Op, OpRefused, OpResult, ReserveRefused,
     Scanned, Step, StoreSlots, Tail,
@@ -92,13 +93,15 @@ busbar_contract::store_door!(
     needs: NEEDS
 );
 
-/// RUN ONE OP over its own connection: open it (a failure is `$fail` of the driver's words), run
-/// `$body` on the session `$s`, say goodbye. Every argument the body names is owned (the body runs
+/// RUN ONE OP on the instance's kept connection (a fresh one when none is kept): open the session
+/// (a failure is `$fail` of the driver's words), run `$body` on it `$s`, and keep the connection if
+/// the session is idle. Every argument the body names is owned (the body runs
 /// across the op's entries).
 macro_rules! on_conn {
     ($self:ident, $cx:ident, $fail:expr, |$s:ident| $body:expr) => {{
         let shared = $self.shared();
-        drive($cx, move |wire| -> Body<_> {
+        let pool = shared.pool.clone();
+        drive_kept($cx, &pool, move |wire| -> Body<_> {
             Box::pin(async move {
                 let mut $s = match Session::open(wire, shared).await {
                     Ok(s) => s,

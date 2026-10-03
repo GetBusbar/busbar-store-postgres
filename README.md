@@ -97,17 +97,17 @@ the engine's JSON config (`{"url": "postgres://..."}`) into a
 
 ### Known limitations (documented honestly, not papered over)
 
-- **The store opens no socket of its own.** Every operation reaches
-  Postgres through busbar's connector (the store declares one outbound
-  `tcp` need in the `operator-infrastructure` egress class) as its own
-  connection: connect, authenticate, run, close. A dropped connection
-  fails that one operation; the next one connects afresh.
-- **One connection per operation.** There is no pool yet, so every
-  operation pays a connect and an authentication.
+- **The store opens no socket of its own.** It reaches Postgres through
+  busbar's connector (the store declares one outbound `tcp` need in the
+  `operator-infrastructure` egress class).
+- **One kept connection, as 1.5.x.** The store connects and authenticates
+  once and keeps that connection; operations take turns on it. A
+  connection that fails (or is left inside a transaction) is closed, and
+  the next operation connects afresh rather than needing a restart.
 - **TLS through busbar.** `sslmode=require`, `verify-ca` and
   `verify-full` secure the connection through busbar's connector and its
-  trust anchors; `disable`, `allow` and `prefer` connect in plaintext,
-  as 1.5.x (`NoTls`) did. A Unix-socket `host` is refused: the store
+  trust anchors (always verifying the certificate and name); `disable`,
+  `allow` and `prefer` connect in plaintext, as 1.5.x (`NoTls`) did. A Unix-socket `host` is refused: the store
   reaches its server over TCP.
 
 See the doc comments at the top of

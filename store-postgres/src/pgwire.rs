@@ -534,12 +534,31 @@ impl Row {
 
 // ── the client ──────────────────────────────────────────────────────────────────────────────
 
-/// One connection to the server, over the op's wire.
+/// One connection to the server, over the op's wire. The connection is KEPT for the instance's
+/// next op (the store SDK's kept set) only when [`Client::release`] finds the session idle: the
+/// last message read was `ReadyForQuery` with status `I` (no transaction open or failed), nothing
+/// is left unread and no transaction awaits its rollback. Dropped any other way (an early return,
+/// a protocol failure), it is discarded and the next op dials fresh.
 pub struct Client {
     wire: Wire,
     buf: BytesMut,
     /// A `Transaction` was dropped uncommitted: roll it back before the next statement.
     rollback_pending: bool,
+    /// The transaction status of the last `ReadyForQuery` (`I` idle, `T` in a transaction, `E` in
+    /// a failed one).
+    status: u8,
+    /// The last message read was `ReadyForQuery` and nothing was sent after it.
+    at_ready: bool,
+    /// [`Client::release`] found the session idle: keep the connection.
+    keep: bool,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.wire.discard();
+        }
+    }
 }
 
 impl fmt::Debug for Client {
@@ -561,11 +580,20 @@ impl Client {
         wire.connect(0, Some(&cfg.target()))
             .await
             .map_err(Error::connect)?;
+        let reused = wire.reused();
         let mut c = Client {
             wire,
             buf: BytesMut::new(),
             rollback_pending: false,
+            status: b'I',
+            at_ready: true,
+            keep: false,
         };
+        if reused {
+            // A kept connection: secured and authenticated by the op that established it, and
+            // idle when it was kept.
+            return Ok(c);
+        }
         if cfg.ssl == SslMode::Require {
             let mut out = BytesMut::new();
             frontend::ssl_request(&mut out);
@@ -679,14 +707,20 @@ impl Client {
         }
     }
 
-    /// Say goodbye (`Terminate`), best effort: the op's connection closes when it answers.
-    pub async fn terminate(&mut self) {
-        let mut out = BytesMut::new();
-        frontend::terminate(&mut out);
-        let _ = self.wire.write_all(&out).await;
+    /// Whether the session is idle and whole: fit to be kept for the next op.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.at_ready && self.status == b'I' && !self.rollback_pending && self.buf.is_empty()
+    }
+
+    /// The op is done with the connection: keep it if the session is idle, else it is discarded
+    /// when the client drops.
+    pub fn release(&mut self) {
+        self.keep = self.is_idle();
     }
 
     async fn send(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.at_ready = false;
         self.wire
             .write_all(bytes)
             .await
@@ -725,7 +759,13 @@ impl Client {
             match Message::parse(&mut self.buf).map_err(parse_err)? {
                 Some(Message::ParameterStatus(_) | Message::NoticeResponse(_)) => {}
                 Some(Message::NotificationResponse(_)) => {}
-                Some(m) => return Ok(m),
+                Some(m) => {
+                    if let Message::ReadyForQuery(b) = &m {
+                        self.status = b.status();
+                        self.at_ready = true;
+                    }
+                    return Ok(m);
+                }
                 None => self.more().await?,
             }
         }

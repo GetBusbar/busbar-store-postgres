@@ -66,9 +66,16 @@ fn mint() -> OpId {
 
 /// The store's linked door opened on `settings` over the loader, its needs on a [`TcpConns`].
 pub(crate) fn open_loaded(settings: &str) -> Result<LoadedStore, String> {
+    open_loaded_over(settings, |d| Arc::new(TcpConns::new(d.conn_waker())))
+}
+
+/// [`open_loaded`], its needs on the table `conns` builds (a [`TcpConns`] that trusts a test CA).
+pub(crate) fn open_loaded_over(
+    settings: &str,
+    conns: impl FnOnce(&Dispatcher) -> Arc<dyn busbar_contract::conn::DeclaredConns>,
+) -> Result<LoadedStore, String> {
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
-    let conns: Arc<dyn busbar_contract::conn::DeclaredConns> =
-        Arc::new(TcpConns::new(d.conn_waker()));
+    let conns = conns(&d);
     let row = LinkedRow::of(crate::door).map_err(|e| e.to_string())?;
     let p = load_linked::<Store>(
         &row,
@@ -89,6 +96,23 @@ pub(crate) struct TestStore {
     store: LoadedStore,
     url: String,
     raw: Mutex<Option<postgres::Client>>,
+}
+
+/// Close the instance (the loader's `close` slot), as busbar does when it lets a store go: its kept
+/// connection closes with it, so a test run never piles connections up on the server.
+pub(crate) fn close_instance(store: &LoadedStore) {
+    use busbar_plugin_loader::dispatch::{in_head, out_head, Frame};
+    let mut f = Frame::new(in_head(), out_head());
+    let _ = store.plugin().call(
+        busbar_contract::abi::mechanism::lifecycle::slot::CLOSE,
+        &mut f,
+    );
+}
+
+impl Drop for TestStore {
+    fn drop(&mut self) {
+        close_instance(&self.store);
+    }
 }
 
 impl std::ops::Deref for TestStore {
