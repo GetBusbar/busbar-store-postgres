@@ -137,7 +137,9 @@ This is a same-repo, 2-crate Cargo workspace (`store-postgres/`, the
 real logic crate — which also carries the store's one door, `door`,
 from `store_door!` over its `StoreSlots` implementation (`src/v3.rs`) —
 and `store-postgres-plugin/`, the thin `cdylib` that exports that door as
-`busbar_plugin_door` through `export_door!`; see [members](Cargo.toml)).
+`busbar_plugin_door` through `export_door!`, and also registers the store on
+the cold store lane (`export_store_plugin!`) that the busbar kernel at the pin
+boots a configured `store:` through; see [members](Cargo.toml)).
 
 Its one busbar dependency is `busbar-contract` (plus
 `busbar-plugin-loader`, dev-only, for the conformance and end-to-end
