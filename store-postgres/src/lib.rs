@@ -2,10 +2,10 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The **Postgres** backend for busbar's durable governance store — the shared, multi-node `db`
-//! plugin. Serves the store kind's table (`StoreSlots`) over the HOST'S CONNECTOR: every op is one
-//! connection, opened, authenticated and closed inside the op as straight-line async code (`pgwire`,
-//! the Postgres frontend protocol over the store SDK's `wire`), so the store opens no socket of its
-//! own and no op blocks a thread. Depends only on the `busbar-contract` crate (plus the sans-IO
+//! plugin. Serves the store kind's table (`StoreSlots`) over the HOST'S CONNECTOR: every op runs on
+//! the instance's kept connection as straight-line async code (`pgwire`, the Postgres frontend
+//! protocol over the store SDK's `wire`), so the store opens no socket of its own and no op blocks
+//! a thread. Depends only on the `busbar-contract` crate (plus the sans-IO
 //! `postgres-protocol`/`postgres-types` codec), never on the engine.
 //!
 //! Served through the store kind's ONE door (`store_door!` in `v3`, the store v3 table of busbar
@@ -27,19 +27,24 @@
 //! credentials in another would let a `REPEATABLE READ` hydration snapshot land between them and
 //! observe a "deleted" key whose credential is still live).
 //!
-//! CONNECTIONS. The 1.5.x store held one mutex-guarded connection for its life; this one holds
-//! none. Each op dials through the host (its one declared `tcp` need, `operator-infrastructure`),
-//! authenticates (SCRAM-SHA-256, md5 or cleartext, as the server asks) and runs its 1.5.5 SQL body
-//! on that connection; the schema is ensured once, by `open`'s connect step, so an unreachable or
-//! refusing server still fails the load at boot, in the driver's words.
+//! CONNECTIONS. The 1.5.x store held one mutex-guarded connection for its life; this one keeps one
+//! too (ARCHITECT ruling 2026-10-03, STORE-KEEP: the store SDK's kept set, bounded at
+//! [`KEPT_CONNECTIONS`] = 1, so ops take turns on it as they took the mutex). `open`'s connect step
+//! dials through the host (its one declared `tcp` need, `operator-infrastructure`), authenticates
+//! (SCRAM-SHA-256, md5 or cleartext, as the server asks) and ensures the schema, so an unreachable
+//! or refusing server still fails the load at boot, in the driver's words; the connection is then
+//! kept, and every op runs its 1.5.5 SQL body on it. A connection is kept only while its session is
+//! idle (no transaction open or failed); one that failed or was left mid-transaction is closed, and
+//! the next op connects afresh (where 1.5.x needed a restart).
 //!
 //! ## Known limitations (documented honestly, not papered over)
 //!
 //! - **TLS through the host.** `sslmode=require` / `verify-ca` / `verify-full` asks the server for
 //!   TLS and secures the connection through the host's connector (its trust anchors); `disable`,
 //!   `allow` and `prefer` connect in plaintext, as the 1.5.x build (`NoTls`) did.
-//! - **One connection per op.** No pool yet (the host's `checkout`/`checkin` are not offered), so
-//!   every op pays a connect and an authentication.
+//! - **`sslmode=require` verifies.** The host's TLS always verifies the server's certificate and
+//!   name (libpq's `require` would not); a server that answers the `SSLRequest` with `N` fails the
+//!   load (`error performing TLS handshake: server does not support TLS`).
 //! - **No partitioning, no LISTEN/NOTIFY-accelerated hydration, no column-level secret grants in
 //!   this pass.** The design session that produced this schema recommended all three as scale/perf
 //!   layers on top of this contract — deliberately deferred here in favor of getting the
@@ -546,13 +551,16 @@ ALTER TABLE usage_metering ADD COLUMN IF NOT EXISTS priced_from_ms BIGINT NOT NU
 ";
 
 /// Postgres `Store` backend (durable, shared across a cluster). The instance holds the parsed
-/// connection settings, never a connection: every op is ONE connection over the host's connector
-/// (the store SDK's `wire`), opened, authenticated and closed inside the op, so no socket of the
-/// store's own exists and no op blocks a thread (busbar THE DESIGN, the connections section and
-/// the plugin ABI). The schema is ensured once, by `open`'s connect step.
+/// connection settings and its kept connection (the store SDK's `wire::Pool`, one connection, as
+/// 1.5.x held one), reached over the host's connector, so no socket of the store's own exists and
+/// no op blocks a thread (busbar THE DESIGN, the connections section and the plugin ABI). The
+/// schema is ensured once, by `open`'s connect step.
 pub struct PostgresStore {
     shared: std::sync::Arc<Shared>,
 }
+
+/// How many connections an instance keeps: the 1.5.5 store held exactly one.
+pub const KEPT_CONNECTIONS: usize = 1;
 
 /// What every op of one instance shares.
 pub(crate) struct Shared {
@@ -562,6 +570,10 @@ pub(crate) struct Shared {
     pub(crate) secret: Option<String>,
     /// When this instance last swept `store_ops` past its retention (`v3`).
     pub(crate) ops_swept_at: AtomicU64,
+    /// The instance's KEPT connections (ARCHITECT ruling 2026-10-03, STORE-KEEP): bounded at ONE,
+    /// the 1.5.5 store's one mutex-guarded connection (it had no pool setting). An op waits for it
+    /// while another holds it, as 1.5.5's ops waited on the mutex.
+    pub(crate) pool: std::sync::Arc<busbar_contract::abi::sdk::store::wire::Pool>,
 }
 
 /// ONE OP'S CONNECTION: the 1.5.5 bodies run on it, as they ran on the mutex-guarded client.
@@ -611,7 +623,7 @@ fn now_secs() -> u64 {
 }
 
 impl PostgresStore {
-    /// The store on the connection string `conn_str`: parsed here, connected per op. A string
+    /// The store on the connection string `conn_str`: parsed here, connected by the connect step. A string
     /// the driver refuses is refused in its words, scrubbed of the DSN password.
     ///
     /// # Errors
@@ -625,6 +637,7 @@ impl PostgresStore {
                 config,
                 secret,
                 ops_swept_at: AtomicU64::new(0),
+                pool: busbar_contract::abi::sdk::store::wire::Pool::new(KEPT_CONNECTIONS),
             }),
         })
     }
@@ -648,9 +661,10 @@ impl Session {
         }
     }
 
-    /// Say goodbye to the server; the op's connection closes when the op answers.
+    /// The op is done: its connection is kept for the next op if the session is idle, else
+    /// discarded ([`Client::release`]).
     pub(crate) async fn close(mut self) {
-        self.client.terminate().await;
+        self.client.release();
     }
 
     fn lock(&mut self) -> &mut Client {

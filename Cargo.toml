@@ -23,5 +23,5 @@ publish = false
 repository = "https://github.com/GetBusbar/busbar-store-postgres"
 
 [workspace.dependencies]
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "180d92c205a7bdc70d1b6de012929757642543c6" }
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "180d92c205a7bdc70d1b6de012929757642543c6" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8faed15ca46ec48d5818dc0bd0c22a9c15218de1" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "8faed15ca46ec48d5818dc0bd0c22a9c15218de1" }

@@ -22,14 +22,14 @@ crate-type = ["cdylib", "rlib"]
 # THE LOGIC, same repo. Its `store_door!` defines the store's one `door`; this crate only exports
 # that door as the image's one symbol (`busbar_plugin_door`, the contract's `export_door!`).
 busbar-store-postgres = { path = "../store-postgres" }
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "180d92c205a7bdc70d1b6de012929757642543c6" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8faed15ca46ec48d5818dc0bd0c22a9c15218de1" }
 
 [dev-dependencies]
 # The conformance and end-to-end tests load the built cdylib over the REAL loader (sign, pack, scan,
 # open) and the linked row through the same registry — dev-only, never in the shipped artifact. Same
 # pinned rev as the logic crate's busbar-contract, so one busbar source resolves.
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "180d92c205a7bdc70d1b6de012929757642543c6", features = ["test-support"] }
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "180d92c205a7bdc70d1b6de012929757642543c6" }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "8faed15ca46ec48d5818dc0bd0c22a9c15218de1", features = ["test-support"] }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8faed15ca46ec48d5818dc0bd0c22a9c15218de1" }
 serde_json = "1"
 postgres = "0.19"
 # For admin_api_e2e.rs: drives the real busbar admin HTTP API (install/mint) against an

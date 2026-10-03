@@ -2236,3 +2236,6 @@ mod v160_shapes;
 
 // ── THE STORE v3 SLOTS (the door's table beyond the 1.5.5 op set) ──────────────────────────────
 mod v3_slots;
+
+// ── TLS through the host (the connector's TLS wrap; ARCHITECT ruling 2026-10-03) ─────────────
+mod tls;
