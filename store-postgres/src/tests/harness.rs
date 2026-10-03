@@ -98,23 +98,6 @@ pub(crate) struct TestStore {
     raw: Mutex<Option<postgres::Client>>,
 }
 
-/// Close the instance (the loader's `close` slot), as busbar does when it lets a store go: its kept
-/// connection closes with it, so a test run never piles connections up on the server.
-pub(crate) fn close_instance(store: &LoadedStore) {
-    use busbar_plugin_loader::dispatch::{in_head, out_head, Frame};
-    let mut f = Frame::new(in_head(), out_head());
-    let _ = store.plugin().call(
-        busbar_contract::abi::mechanism::lifecycle::slot::CLOSE,
-        &mut f,
-    );
-}
-
-impl Drop for TestStore {
-    fn drop(&mut self) {
-        close_instance(&self.store);
-    }
-}
-
 impl std::ops::Deref for TestStore {
     type Target = LoadedStore;
     fn deref(&self) -> &LoadedStore {
