@@ -13,7 +13,7 @@ license = "Apache-2.0"
 # into it as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`;
 # a busbar build that links this crate `[patch]`es the busbar git source to its own tree, so ONE
 # copy of the contract links.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "8faed15ca46ec48d5818dc0bd0c22a9c15218de1" }
+busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "1c9e599003ad2b2789b271482824b52f390c3200" }
 # The Postgres frontend protocol WITHOUT a socket (busbar THE DESIGN, the connections section: the
 # store reaches its server only over the host's connector): the message codec, SCRAM-SHA-256 and md5
 # (`postgres-protocol`) and the binary value encodings (`postgres-types`), the same two crates the
@@ -34,7 +34,7 @@ serde = { version = "1", features = ["derive"] }
 # The live tests open the store through the REAL loader on a dispatcher, its connections over the
 # loader's test connection table (`tcp_conns`, `test-support`), and verify on an independent
 # connection of the `postgres` driver's own.
-busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "8faed15ca46ec48d5818dc0bd0c22a9c15218de1", features = ["test-support"] }
+busbar-plugin-loader = { git = "https://github.com/GetBusbar/busbar", rev = "1c9e599003ad2b2789b271482824b52f390c3200", features = ["test-support"] }
 postgres = "0.19"
 # The TLS test (`src/tests/tls.rs`): an in-test TLS proxy in front of the live server, its CA minted
 # per run; the store's side is the loader's test table trusting that CA. Test-only.
