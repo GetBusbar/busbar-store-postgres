@@ -118,7 +118,7 @@ fn demotion(server: &str, reason: &str, recorded_at: u64) -> PlaneRecord {
 }
 
 /// Live Postgres is SHARED across tests, so each test owns its own ids and clears them first.
-fn reset(store: &PostgresStore, kind: &str, ids: &[&str]) {
+fn reset(store: &TestStore, kind: &str, ids: &[&str]) {
     let mut c = store.lock();
     for id in ids {
         c.execute(
@@ -134,7 +134,7 @@ fn reset(store: &PostgresStore, kind: &str, ids: &[&str]) {
     }
 }
 
-fn reset_tokens(store: &PostgresStore, kind: &str, tokens: &[&str]) {
+fn reset_tokens(store: &TestStore, kind: &str, tokens: &[&str]) {
     let mut c = store.lock();
     for t in tokens {
         let _ = c.execute(
@@ -146,7 +146,7 @@ fn reset_tokens(store: &PostgresStore, kind: &str, tokens: &[&str]) {
 
 /// Own the whole low band of a kind: a previous run's leftovers would otherwise be counted by the
 /// exact-count assertions the purge tests make.
-fn clear_purge_band(store: &PostgresStore) {
+fn clear_purge_band(store: &TestStore) {
     let top = clamp(PURGE_BAND_TOP);
     let mut c = store.lock();
     c.execute(
@@ -167,7 +167,7 @@ fn clear_purge_band(store: &PostgresStore) {
     .expect("clear the purge band's chains");
 }
 
-fn chain(store: &PostgresStore, kind: &str, parent: &str) -> Vec<serde_json::Value> {
+fn chain(store: &TestStore, kind: &str, parent: &str) -> Vec<serde_json::Value> {
     store
         .list_plane_records(kind, &PlaneSelector::Parent(parent.to_string().into()))
         .unwrap()
@@ -176,14 +176,14 @@ fn chain(store: &PostgresStore, kind: &str, parent: &str) -> Vec<serde_json::Val
         .collect()
 }
 
-fn task_state(store: &PostgresStore, id: &str) -> Option<String> {
+fn task_state(store: &TestStore, id: &str) -> Option<String> {
     store
         .get_plane_record("task", id)
         .unwrap()
         .map(|b| decode(&b)["state"].as_str().unwrap().to_string())
 }
 
-fn listed_task_ids(store: &PostgresStore) -> Vec<String> {
+fn listed_task_ids(store: &TestStore) -> Vec<String> {
     store
         .list_plane_records("task", &PlaneSelector::All)
         .unwrap()
@@ -864,7 +864,7 @@ fn trust_ns(tag: &str) -> String {
 
 const TRUST_NOW: u64 = 2_000_000_000;
 
-fn demotions(store: &PostgresStore) -> Vec<serde_json::Value> {
+fn demotions(store: &TestStore) -> Vec<serde_json::Value> {
     store
         .list_plane_records("demotion", &PlaneSelector::All)
         .unwrap()

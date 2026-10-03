@@ -29,7 +29,7 @@
 //!   5. Boot a SECOND real `busbar` process against that config. Busbar's own first-boot store
 //!      resolution (`plugin_registry.open_store`, called synchronously during construction, before
 //!      the listener ever binds) dlopens the plugin that landed on disk via the admin API in step 2.
-//!      Poll — via a RAW independent `postgres::Client`, never `PostgresStore::connect` — for the
+//!      Poll — via a RAW independent `postgres::Client`, never the store itself — for the
 //!      `keys` table to appear, proving the real dlopen + `Store::connect`/`migrate()` path executed.
 //!   6. `POST /api/v1/admin/keys` (with `issue_aws_credential: true`) against this SECOND process —
 //!      REAL WORK: mint a virtual key AND a credential through the running instance, over the same
