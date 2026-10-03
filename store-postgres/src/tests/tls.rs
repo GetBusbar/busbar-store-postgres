@@ -20,7 +20,7 @@ use std::time::Duration;
 use busbar_contract::records::RecordStore;
 use busbar_plugin_loader::tcp_conns::TcpConns;
 
-use super::harness::{close_instance, open_loaded_over};
+use super::harness::open_loaded_over;
 use super::live_url;
 use crate::pgwire::Config;
 
@@ -177,7 +177,6 @@ fn verify_full_secures_the_connection_through_the_host() {
             .contains(&sub),
         "the write is read back over TLS"
     );
-    close_instance(&store);
 }
 
 /// TLS: a host that does not trust the server's certificate refuses the handshake, and the load
@@ -232,5 +231,11 @@ fn the_store_keeps_one_connection_across_its_ops() {
         after_open,
         "every op ran on the one kept backend"
     );
-    close_instance(&store);
+    // Dropping the store closes its instance, and its kept connection with it.
+    drop(store);
+    let gone = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(20));
+        backends(&mut raw).is_empty()
+    });
+    assert!(gone, "closing the instance closes its kept connection");
 }
