@@ -8,7 +8,7 @@
 
 use super::*;
 use busbar_contract::abi::sdk::store::{
-    Cap, CapsRefused, Cell, CellKey, Dimension, Grant, OpRefused, ReserveRefused, StoreSlots,
+    Cap, CapsRefused, Cell, CellKey, Dimension, Grant, OpRefused, ReserveRefused,
 };
 use busbar_contract::abi::store::OpId;
 use busbar_contract::kinds::RecordBytes;
@@ -33,7 +33,7 @@ fn op() -> OpId {
     OpId::from_parts(node, N.fetch_add(1, Ordering::Relaxed))
 }
 
-fn store(url: &str) -> PostgresStore {
+fn store(url: &str) -> TestStore {
     connect_store_with_retry(url).expect("connect")
 }
 
@@ -46,13 +46,13 @@ fn requests(bucket: &str) -> CellKey<'_> {
     }
 }
 
-fn reserve(s: &PostgresStore, op: OpId, cells: &[Cell<'_>]) -> Result<Vec<Grant>, ReserveRefused> {
+fn reserve(s: &TestStore, op: OpId, cells: &[Cell<'_>]) -> Result<Vec<Grant>, ReserveRefused> {
     let mut grants = Vec::new();
     s.reserve(op, 0, cells.iter().copied(), &mut grants)
         .map(|()| grants)
 }
 
-fn release(s: &PostgresStore, op: OpId, items: &[(u64, u64)]) -> Result<Vec<u64>, OpRefused> {
+fn release(s: &TestStore, op: OpId, items: &[(u64, u64)]) -> Result<Vec<u64>, OpRefused> {
     let mut back = Vec::new();
     s.slice_release(op, 0, items.iter().copied(), &mut back)
         .map(|()| back)
@@ -70,12 +70,12 @@ fn open_refuses_settings_without_a_url() {
         &br#"{"url": "  "}"#[..],
     ] {
         assert_eq!(
-            PostgresStore::open(settings).err().as_deref(),
+            TestStore::open_slot(settings).err().as_deref(),
             Some(want),
             "{settings:?}"
         );
     }
-    let e = PostgresStore::open(b"{ not json").err().unwrap();
+    let e = TestStore::open_slot(b"{ not json").err().unwrap();
     assert!(e.starts_with("invalid postgres plugin config:"), "{e}");
 }
 
