@@ -14,7 +14,14 @@ license = "Apache-2.0"
 # a busbar build that links this crate `[patch]`es the busbar git source to its own tree, so ONE
 # copy of the contract links.
 busbar-contract = { workspace = true }
-postgres = { workspace = true }
+# The Postgres frontend protocol WITHOUT a socket (busbar THE DESIGN, the connections section: the
+# store reaches its server only over the host's connector): the message codec, SCRAM-SHA-256 and md5
+# (`postgres-protocol`) and the binary value encodings (`postgres-types`), the same two crates the
+# 1.5.5 `postgres` driver encoded and decoded with, so every parameter and column reads as before.
+postgres-protocol = "0.6"
+postgres-types = "0.2"
+bytes = { workspace = true }
+fallible-iterator = "0.2"
 serde_json = { workspace = true }
 
 [dev-dependencies]
@@ -24,3 +31,8 @@ serde_json = { workspace = true }
 # Its plane-record checks serialize stand-in rows with serde derive, hence this one dev-dependency;
 # no busbar crate beyond `busbar-contract` is needed.
 serde = { workspace = true }
+# The live tests open the store through the REAL loader on a dispatcher, its connections over the
+# loader's test connection table (`tcp_conns`, `test-support`), and verify on an independent
+# connection of the `postgres` driver's own.
+busbar-plugin-loader = { workspace = true, features = ["test-support"] }
+postgres = { workspace = true }

@@ -608,7 +608,10 @@ fn metering_splits_on_priced_from_ms_and_carries_open_classes() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
     let key_id = format!("vk_meter_units_{}", unique_suffix());
-    let bucket = 20_270_601u64;
+    // Not 20_270_601: `purge_windows_and_metering_delete_only_what_is_older_than_the_boundary`
+    // writes and purges that whole bucket in parallel, and a whole-bucket purge here would take its
+    // row (a test-isolation race the slower per-op connections exposed).
+    let bucket = 20_270_611u64;
     let delta = |priced_from_ms: u64, input: u64, classes: &[(&str, u64)]| MeteringDelta {
         key_id: key_id.clone(),
         bucket,
