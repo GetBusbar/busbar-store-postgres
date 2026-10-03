@@ -70,9 +70,10 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "busbar-contract"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=e1d3d8b097201859751d77208e66249d98b50a4b#e1d3d8b097201859751d77208e66249d98b50a4b"
+source = "git+https://github.com/GetBusbar/busbar?rev=c7cc4f6696d53654ba1ac4f8e8c4fad0b9cd9df8#c7cc4f6696d53654ba1ac4f8e8c4fad0b9cd9df8"
 dependencies = [
  "async-trait",
+ "base64",
  "futures",
  "hex",
  "http",
@@ -81,7 +82,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
- "sha2 0.11.0",
+ "sha2 0.10.9",
  "smallvec",
  "tracing",
  "tracing-core",
@@ -92,28 +93,27 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-ledger"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=e1d3d8b097201859751d77208e66249d98b50a4b#e1d3d8b097201859751d77208e66249d98b50a4b"
+source = "git+https://github.com/GetBusbar/busbar?rev=c7cc4f6696d53654ba1ac4f8e8c4fad0b9cd9df8#c7cc4f6696d53654ba1ac4f8e8c4fad0b9cd9df8"
 dependencies = [
  "busbar-contract",
+ "ring",
  "serde",
- "sha2 0.11.0",
 ]
 
 [[package]]
 name = "busbar-kernel-wal"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=e1d3d8b097201859751d77208e66249d98b50a4b#e1d3d8b097201859751d77208e66249d98b50a4b"
+source = "git+https://github.com/GetBusbar/busbar?rev=c7cc4f6696d53654ba1ac4f8e8c4fad0b9cd9df8#c7cc4f6696d53654ba1ac4f8e8c4fad0b9cd9df8"
 dependencies = [
  "busbar-contract",
- "sha2 0.11.0",
+ "ring",
 ]
 
 [[package]]
 name = "busbar-plugin-loader"
 version = "1.5.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=e1d3d8b097201859751d77208e66249d98b50a4b#e1d3d8b097201859751d77208e66249d98b50a4b"
+source = "git+https://github.com/GetBusbar/busbar?rev=c7cc4f6696d53654ba1ac4f8e8c4fad0b9cd9df8#c7cc4f6696d53654ba1ac4f8e8c4fad0b9cd9df8"
 dependencies = [
- "async-trait",
  "busbar-contract",
  "busbar-kernel-ledger",
  "busbar-kernel-wal",
@@ -126,7 +126,6 @@ dependencies = [
  "libloading",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tar",
  "tokio",
  "tracing",
@@ -137,7 +136,12 @@ name = "busbar-store-postgres"
 version = "1.0.0"
 dependencies = [
  "busbar-contract",
+ "busbar-plugin-loader",
+ "bytes",
+ "fallible-iterator",
  "postgres",
+ "postgres-protocol",
+ "postgres-types",
  "serde",
  "serde_json",
 ]
@@ -372,16 +376,6 @@ name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
-
-[[package]]
-name = "errno"
-version = "0.3.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
-dependencies = [
- "libc",
- "windows-sys 0.52.0",
-]
 
 [[package]]
 name = "fallible-iterator"
@@ -859,12 +853,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "linux-raw-sys"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
-
-[[package]]
 name = "litemap"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1268,19 +1256,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustix"
-version = "1.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
-dependencies = [
- "bitflags",
- "errno",
- "libc",
- "linux-raw-sys",
- "windows-sys 0.52.0",
-]
-
-[[package]]
 name = "rustls"
 version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1561,7 +1536,6 @@ checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
 dependencies = [
  "filetime",
  "libc",
- "xattr",
 ]
 
 [[package]]
@@ -2080,16 +2054,6 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
-
-[[package]]
-name = "xattr"
-version = "1.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
-dependencies = [
- "libc",
- "rustix",
-]
 
 [[package]]
 name = "yoke"

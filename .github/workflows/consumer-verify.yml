@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   consumer:
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@e1d3d8b097201859751d77208e66249d98b50a4b
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@c7cc4f6696d53654ba1ac4f8e8c4fad0b9cd9df8
     with:
       version: ${{ inputs.version || '' }}
       asset_prefix: busbar-store-postgres
