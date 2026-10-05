@@ -124,7 +124,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "busbar-contract"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=1c9e599003ad2b2789b271482824b52f390c3200#1c9e599003ad2b2789b271482824b52f390c3200"
+source = "git+https://github.com/GetBusbar/busbar?rev=d85c166728f0bc17b68477248c8d86cf648187ad#d85c166728f0bc17b68477248c8d86cf648187ad"
 dependencies = [
  "async-trait",
  "base64",
@@ -147,7 +147,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-ledger"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=1c9e599003ad2b2789b271482824b52f390c3200#1c9e599003ad2b2789b271482824b52f390c3200"
+source = "git+https://github.com/GetBusbar/busbar?rev=d85c166728f0bc17b68477248c8d86cf648187ad#d85c166728f0bc17b68477248c8d86cf648187ad"
 dependencies = [
  "busbar-contract",
  "ring",
@@ -157,7 +157,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-wal"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=1c9e599003ad2b2789b271482824b52f390c3200#1c9e599003ad2b2789b271482824b52f390c3200"
+source = "git+https://github.com/GetBusbar/busbar?rev=d85c166728f0bc17b68477248c8d86cf648187ad#d85c166728f0bc17b68477248c8d86cf648187ad"
 dependencies = [
  "busbar-contract",
  "ring",
@@ -166,7 +166,7 @@ dependencies = [
 [[package]]
 name = "busbar-plugin-loader"
 version = "1.5.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=1c9e599003ad2b2789b271482824b52f390c3200#1c9e599003ad2b2789b271482824b52f390c3200"
+source = "git+https://github.com/GetBusbar/busbar?rev=d85c166728f0bc17b68477248c8d86cf648187ad#d85c166728f0bc17b68477248c8d86cf648187ad"
 dependencies = [
  "busbar-contract",
  "busbar-kernel-ledger",
@@ -178,8 +178,6 @@ dependencies = [
  "hex",
  "libc",
  "libloading",
- "rustls",
- "rustls-pki-types",
  "serde",
  "serde_json",
  "tar",
@@ -1299,12 +1297,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
 ]
@@ -2022,6 +2022,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a929b2c61f11ba3e9bc35b50c1f25cb38e0e892c0c231ae2b8cf78d5dad4437"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
