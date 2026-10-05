@@ -26,10 +26,41 @@ mod common;
 // THE PUBLISHED SUITE (busbar-plugin-loader's `conformance` feature, at the pin): the linked door and
 // the built cdylib, each through the one loader, driven by the store kind's script over the live
 // Postgres `conformance.json` names; exact crossing counts, the two folds equal, its RED arms.
+//
+// Each fold opens over its own schema: conformance.json's url names `search_path={fold}`, and the
+// hooks below create that schema before the fold and drop it after, on an independent connection
+// of the `postgres` driver (the store never creates a schema; nothing in its behaviour changes).
 busbar_plugin_loader::conformance_suite! {
     door: busbar_store_postgres::door,
     cdylib: "busbar_store_postgres_plugin",
     inputs: include_str!("conformance.json"),
+    namespace: (create_fold_schema, drop_fold_schema),
+}
+
+/// The live server a fold's filled settings name, on a connection of the `postgres` driver's own.
+fn fold_client(settings: &[u8]) -> postgres::Client {
+    let v: serde_json::Value =
+        serde_json::from_slice(settings).expect("conformance.json's settings are JSON");
+    let url = v["url"]
+        .as_str()
+        .expect("conformance.json's settings name a url");
+    postgres::Client::connect(url, postgres::NoTls)
+        .expect("the live Postgres accepts the test client")
+}
+
+/// The suite's namespace hook: the fold's schema, made before its open.
+fn create_fold_schema(namespace: &str, settings: &[u8]) {
+    fold_client(settings)
+        .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{namespace}\""))
+        .expect("the fold's schema is created");
+}
+
+/// The suite's namespace hook: the fold's schema and everything the store made in it, dropped after
+/// the fold.
+fn drop_fold_schema(namespace: &str, settings: &[u8]) {
+    fold_client(settings)
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS \"{namespace}\" CASCADE"))
+        .expect("the fold's schema is dropped");
 }
 
 use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};

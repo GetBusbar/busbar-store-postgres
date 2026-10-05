@@ -1,6 +1,7 @@
 {
-  "settings": { "url": "postgres://busbar:busbar@localhost:5432/busbar_test" },
+  "settings": { "url": "postgres://busbar:busbar@localhost:5432/busbar_test?options=-c%20search_path%3D{fold}" },
   "store": {
+    "credential_kind": "sigv4",
     "node": 7,
     "caps": { "bucket": "conf-cap", "window_start": 1700000000000, "requests": 3, "input": 100 },
     "draw": { "requests": 2, "input": 60 },
