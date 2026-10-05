@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
-    load_dropped, load_linked, rendering_of, Bind, DispatchConfig, Dispatcher, LinkedRow, NoSink,
+    load_dropped, load_linked, rendering_of, Bind, ConnTable, DispatchConfig, Dispatcher,
+    LinkedRow, NoSink,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
 use busbar_plugin_loader::tcp_conns::TcpConns;
@@ -70,7 +71,7 @@ fn bind(d: &Dispatcher) -> Bind {
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: Some(Arc::new(TcpConns::new(d.conn_waker()))),
+        conns: ConnTable::Host(Arc::new(TcpConns::new(d.conn_waker()))),
     }
 }
 

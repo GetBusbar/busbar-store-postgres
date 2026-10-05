@@ -34,7 +34,9 @@ busbar_plugin_loader::conformance_suite! {
 
 use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
 use busbar_plugin_loader::dispatch::kinds::secret::Secret;
-use busbar_plugin_loader::dispatch::{load_dropped, Bind, DispatchConfig, Dispatcher, NoSink};
+use busbar_plugin_loader::dispatch::{
+    load_dropped, Bind, ConnTable, DispatchConfig, Dispatcher, NoSink,
+};
 use busbar_plugin_loader::store_v3::LoadedStore;
 use std::sync::Arc;
 
@@ -223,7 +225,7 @@ fn the_postgres_store_library_loaded_as_another_kind_is_refused() {
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: None,
+        conns: ConnTable::Probe,
     };
     assert!(
         load_dropped::<Secret>(&lib, &common::stated(), bind).is_err(),
