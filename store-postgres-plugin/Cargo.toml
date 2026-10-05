@@ -41,3 +41,9 @@ postgres = { workspace = true }
 # in-process axum server.
 reqwest = { workspace = true, features = ["blocking", "json"] }
 base64 = "0.22"
+# THE SUITE'S HOST CONNECTOR (tests/support/conformance_host.rs, rendered by the fleet template for a
+# repo whose declares state network needs): busbar's connector and its TLS test kit, and the tcp
+# framer the store's need names. Dev-only.
+busbar-core-connector = { workspace = true }
+busbar-transport-tcp = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
