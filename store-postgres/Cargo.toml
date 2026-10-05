@@ -13,9 +13,9 @@ license = "Apache-2.0"
 # into it as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`;
 # a busbar build that links this crate `[patch]`es the busbar git source to its own tree, so ONE
 # copy of the contract links.
-busbar-contract = { git = "https://github.com/GetBusbar/busbar", rev = "e1d3d8b097201859751d77208e66249d98b50a4b" }
-postgres = "0.19"
-serde_json = "1"
+busbar-contract = { workspace = true }
+postgres = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # The `Store` contract conformance suite used to arrive here as `busbar-plugin-testkit`; the owner
@@ -23,4 +23,4 @@ serde_json = "1"
 # this crate owns its copy at `src/tests/store_conformance.rs` (verbatim from busbar's in-tree copy).
 # Its plane-record checks serialize stand-in rows with serde derive, hence this one dev-dependency;
 # no busbar crate beyond `busbar-contract` is needed.
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true }
