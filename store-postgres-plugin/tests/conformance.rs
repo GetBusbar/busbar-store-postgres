@@ -23,6 +23,15 @@
 
 mod common;
 
+// THE PUBLISHED SUITE (busbar-plugin-loader's `conformance` feature, at the pin): the linked door and
+// the built cdylib, each through the one loader, driven by the store kind's script over the live
+// Postgres `conformance.json` names; exact crossing counts, the two folds equal, its RED arms.
+busbar_plugin_loader::conformance_suite! {
+    door: busbar_store_postgres::door,
+    cdylib: "busbar_store_postgres_plugin",
+    inputs: include_str!("conformance.json"),
+}
+
 use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
 use busbar_plugin_loader::dispatch::kinds::secret::Secret;
 use busbar_plugin_loader::dispatch::{load_dropped, Bind, DispatchConfig, Dispatcher, NoSink};
