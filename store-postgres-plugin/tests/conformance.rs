@@ -30,11 +30,58 @@ mod common;
 // Each fold opens over its own schema: conformance.json's url names `search_path={fold}`, and the
 // hooks below create that schema before the fold and drop it after, on an independent connection
 // of the `postgres` driver (the store never creates a schema; nothing in its behaviour changes).
+//
+// THE HOST (ARCHITECT Q-P4-9): the store's `tcp` need is served by busbar's own connector, composed
+// as the root composes it (`conformance_host`, rendered by the fleet template), and the store asks
+// for TLS (`sslmode=require`): its `SSLRequest` is answered by the suite's TLS front, whose
+// certificate chains to the suite's test CA, the anchors only the HOST's TLS is handed (`tls:`);
+// the front carries the secured connection to the live Postgres. So every fold proves the store's
+// connection is secured by the host, verified against the anchors.
+#[path = "support/conformance_host.rs"]
+mod conformance_host;
+
 busbar_plugin_loader::conformance_suite! {
     door: busbar_store_postgres::door,
     cdylib: "busbar_store_postgres_plugin",
     inputs: include_str!("conformance.json"),
+    host: host,
+    tls: conformance_host::anchors(),
     namespace: (create_fold_schema, drop_fold_schema),
+}
+
+/// The live Postgres's address (`BUSBAR_TEST_POSTGRES_URL`'s authority; the service container's
+/// default when unset).
+fn upstream() -> &'static str {
+    static AT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    AT.get_or_init(|| {
+        let url = std::env::var("BUSBAR_TEST_POSTGRES_URL").unwrap_or_default();
+        url.split_once("://")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.rsplit_once('@').map_or(Some(rest), |(_, at)| Some(at)))
+            .and_then(|at| at.split('/').next())
+            .filter(|at| !at.is_empty())
+            .unwrap_or("localhost:5432")
+            .to_owned()
+    })
+}
+
+/// Postgres's cleartext negotiation: the client's `SSLRequest` (length 8, code 80877103) answered
+/// `S`; anything else is not a TLS client.
+fn ssl_request(tcp: &mut std::net::TcpStream) -> bool {
+    use std::io::{Read, Write};
+    let mut req = [0_u8; 8];
+    tcp.read_exact(&mut req).is_ok()
+        && req == [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f]
+        && tcp.write_all(b"S").is_ok()
+}
+
+/// The host the suite binds the store over, with the TLS front its settings name already listening.
+fn host(
+    wake: std::sync::Arc<dyn Fn(u64) + Send + Sync>,
+    anchors: Option<&str>,
+) -> std::sync::Arc<dyn busbar_contract::conn::DeclaredConns> {
+    conformance_host::tls_front(ssl_request, upstream());
+    conformance_host::host(wake, anchors)
 }
 
 /// The live server a fold's filled settings name, on a connection of the `postgres` driver's own.
@@ -44,7 +91,11 @@ fn fold_client(settings: &[u8]) -> postgres::Client {
     let url = v["url"]
         .as_str()
         .expect("conformance.json's settings name a url");
-    postgres::Client::connect(url, postgres::NoTls)
+    // Straight to the live server, in the clear: the TLS front is the store's, not this client's.
+    let url = url
+        .replace(conformance_host::FAR_END, upstream())
+        .replace("sslmode=require", "sslmode=disable");
+    postgres::Client::connect(&url, postgres::NoTls)
         .expect("the live Postgres accepts the test client")
 }
 
