@@ -18,11 +18,78 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use busbar_contract::records::RecordStore;
-use busbar_plugin_loader::tcp_conns::TcpConns;
+use busbar_plugin_loader::tcp_conns::{SecureDial, SecuredSock, TcpConns};
 
 use super::harness::open_loaded_over;
 use super::live_url;
 use crate::pgwire::Config;
+
+/// The host's TLS for the test table ([`TcpConns::with_tls`]): rustls trusting `ca_der` alone,
+/// verifying the certificate and the name; the handshake runs to completion on the blocking socket
+/// the table hands it.
+struct Trusting(Arc<rustls::ClientConfig>);
+
+fn trusting(ca_der: &[u8]) -> Arc<dyn SecureDial> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls_pki_types::CertificateDer::from(ca_der.to_vec()))
+        .expect("the test CA is a root certificate");
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("the default protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Arc::new(Trusting(Arc::new(config)))
+}
+
+impl SecureDial for Trusting {
+    fn secure(
+        &self,
+        server: &str,
+        _verify_off: bool,
+        mut tcp: TcpStream,
+    ) -> std::io::Result<Box<dyn SecuredSock>> {
+        let name = rustls_pki_types::ServerName::try_from(server.to_owned())
+            .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
+        let mut tls = rustls::ClientConnection::new(Arc::clone(&self.0), name)
+            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+        while tls.is_handshaking() {
+            tls.complete_io(&mut tcp)?;
+        }
+        Ok(Box::new(Secured(rustls::StreamOwned::new(tls, tcp))))
+    }
+}
+
+/// A stream [`Trusting`] secured.
+struct Secured(rustls::StreamOwned<rustls::ClientConnection, TcpStream>);
+
+impl Read for Secured {
+    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(b)
+    }
+}
+
+impl Write for Secured {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl SecuredSock for Secured {
+    fn tcp(&self) -> &TcpStream {
+        self.0.get_ref()
+    }
+    fn close(&mut self) {
+        self.0.conn.send_close_notify();
+        let _ = self.0.flush();
+        let _ = self.0.sock.shutdown(std::net::Shutdown::Both);
+    }
+}
 
 /// A CA and a `localhost` server config it signed: (ca_der, server config).
 fn minted() -> (Vec<u8>, Arc<rustls::ServerConfig>) {
@@ -166,7 +233,7 @@ fn verify_full_secures_the_connection_through_the_host() {
     let (_, tls_url) = through_proxy(&url, port);
     let settings = serde_json::json!({ "url": tls_url }).to_string();
     let store = open_loaded_over(&settings, |d| {
-        Arc::new(TcpConns::with_roots(d.conn_waker(), &ca_der))
+        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&ca_der)))
     })
     .expect("the store opens over TLS");
     let sub = format!("tls-{}", std::process::id());
