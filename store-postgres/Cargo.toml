@@ -40,4 +40,4 @@ postgres = { workspace = true }
 # per run; the store's side is the loader's test table trusting that CA. Test-only.
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+rcgen = { workspace = true }
