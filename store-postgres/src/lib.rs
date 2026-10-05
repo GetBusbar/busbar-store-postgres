@@ -2,8 +2,11 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The **Postgres** backend for busbar's durable governance store — the shared, multi-node `db`
-//! plugin. Implements `busbar_contract::records::RecordStore` over a mutex-guarded synchronous `postgres` client,
-//! depending only on the `busbar-contract` crate (plus the `postgres` driver), never on the engine.
+//! plugin. Serves the store kind's table (`StoreSlots`) over the HOST'S CONNECTOR: every op runs on
+//! the instance's kept connection as straight-line async code (`pgwire`, the Postgres frontend
+//! protocol over the store SDK's `wire`), so the store opens no socket of its own and no op blocks
+//! a thread. Depends only on the `busbar-contract` crate (plus the sans-IO
+//! `postgres-protocol`/`postgres-types` codec), never on the engine.
 //!
 //! Served through the store kind's ONE door (`store_door!` in `v3`, the store v3 table of busbar
 //! 1.6.0): linked into a busbar build as `door`, or dropped in as the sibling plugin cdylib.
@@ -24,15 +27,24 @@
 //! credentials in another would let a `REPEATABLE READ` hydration snapshot land between them and
 //! observe a "deleted" key whose credential is still live).
 //!
-//! Like the prior schema, this is a **single mutex-guarded connection** used off the request hot
-//! path (key CRUD + the write-behind usage flush) — governance is off the reactor entirely.
+//! CONNECTIONS. The 1.5.x store held one mutex-guarded connection for its life; this one keeps one
+//! too (ARCHITECT ruling 2026-10-03, STORE-KEEP: the store SDK's kept set, bounded at
+//! [`KEPT_CONNECTIONS`] = 1, so ops take turns on it as they took the mutex). `open`'s connect step
+//! dials through the host (its one declared `tcp` need, `operator-infrastructure`), authenticates
+//! (SCRAM-SHA-256, md5 or cleartext, as the server asks) and ensures the schema, so an unreachable
+//! or refusing server still fails the load at boot, in the driver's words; the connection is then
+//! kept, and every op runs its 1.5.5 SQL body on it. A connection is kept only while its session is
+//! idle (no transaction open or failed); one that failed or was left mid-transaction is closed, and
+//! the next op connects afresh (where 1.5.x needed a restart).
 //!
 //! ## Known limitations (documented honestly, not papered over)
 //!
-//! - **No TLS in this build (`NoTls`).** Run the connection over a trusted network segment, a local
-//!   socket, or a TLS-terminating proxy (pgbouncer/stunnel).
-//! - **No automatic reconnect.** A persistently dropped connection surfaces as store errors; a
-//!   permanently broken connection requires a process restart.
+//! - **TLS through the host.** `sslmode=require` / `verify-ca` / `verify-full` asks the server for
+//!   TLS and secures the connection through the host's connector (its trust anchors); `disable`,
+//!   `allow` and `prefer` connect in plaintext, as the 1.5.x build (`NoTls`) did.
+//! - **`sslmode=require` verifies.** The host's TLS always verifies the server's certificate and
+//!   name (libpq's `require` would not); a server that answers the `SSLRequest` with `N` fails the
+//!   load (`error performing TLS handshake: server does not support TLS`).
 //! - **No partitioning, no LISTEN/NOTIFY-accelerated hydration, no column-level secret grants in
 //!   this pass.** The design session that produced this schema recommended all three as scale/perf
 //!   layers on top of this contract — deliberately deferred here in favor of getting the
@@ -43,24 +55,25 @@
 
 #![forbid(unsafe_code)]
 
+mod pgwire;
+
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
-    PlaneDisposition, PlaneRecord, PlaneRecordRef, PlaneSelector, RecordStore, RecordStoreError,
+    PlaneDisposition, PlaneRecord, PlaneRecordRef, PlaneSelector, RecordStoreError,
     RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
     UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
-use postgres::types::ToSql;
-use postgres::{Client, NoTls, Row, Transaction};
+use pgwire::{Client, Row, Transaction};
+use postgres_types::ToSql;
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
-use std::sync::Mutex;
 
 // postgres driver error -> the api's backend-agnostic `RecordStoreError` (the contract crate stays
 // storage-free, so the `From` impl that powers `?` cannot live there).
 trait IntoStoreResult<T> {
     fn store(self) -> RecordStoreResult<T>;
 }
-impl<T> IntoStoreResult<T> for Result<T, postgres::Error> {
+impl<T> IntoStoreResult<T> for Result<T, pgwire::Error> {
     fn store(self) -> RecordStoreResult<T> {
         self.map_err(|e| RecordStoreError(render_pg_error(&e)))
     }
@@ -76,7 +89,7 @@ impl<T> IntoStoreResult<T> for Result<T, postgres::Error> {
 /// The server's `detail` field is deliberately NOT included: on a unique violation Postgres puts
 /// the offending ROW VALUES in it, and this string reaches logs. The SQLSTATE, the primary message
 /// and the constraint name identify the failure without echoing data.
-fn render_pg_error(e: &postgres::Error) -> String {
+fn render_pg_error(e: &pgwire::Error) -> String {
     match e.as_db_error() {
         Some(db) => {
             let mut out = format!("{}: {}", db.code().code(), db.message());
@@ -93,8 +106,8 @@ fn render_pg_error(e: &postgres::Error) -> String {
 /// as an unversioned (version 0) database. Every other error class (connection, timeout, permission)
 /// is transient/fatal and must never be read as "fresh DB": treating a connection or permission
 /// failure as version 0 would drop and recreate a populated database.
-fn is_undefined_table(e: &postgres::Error) -> bool {
-    e.code() == Some(&postgres::error::SqlState::UNDEFINED_TABLE)
+fn is_undefined_table(e: &pgwire::Error) -> bool {
+    e.code().map(pgwire::SqlState::code) == Some(pgwire::SqlState::UNDEFINED_TABLE)
 }
 
 /// Extract the PASSWORD from a Postgres DSN. Supports both the URL form
@@ -537,12 +550,43 @@ ALTER TABLE keys ADD COLUMN IF NOT EXISTS allowed_scopes_by_kind TEXT;
 ALTER TABLE usage_metering ADD COLUMN IF NOT EXISTS priced_from_ms BIGINT NOT NULL DEFAULT 0;
 ";
 
-/// Postgres `Store` backend (durable, shared across a cluster). A single mutex-guarded connection —
-/// governance is off the request hot path, so serializing access is fine.
+/// Postgres `Store` backend (durable, shared across a cluster). The instance holds the parsed
+/// connection settings and its kept connection (the store SDK's `wire::Pool`, one connection, as
+/// 1.5.x held one), reached over the host's connector, so no socket of the store's own exists and
+/// no op blocks a thread (busbar THE DESIGN, the connections section and the plugin ABI). The
+/// schema is ensured once, by `open`'s connect step.
 pub struct PostgresStore {
-    client: Mutex<Client>,
+    shared: std::sync::Arc<Shared>,
+}
+
+/// How many connections an instance keeps: the 1.5.5 store held exactly one.
+pub const KEPT_CONNECTIONS: usize = 1;
+
+/// What every op of one instance shares.
+pub(crate) struct Shared {
+    /// The connection settings.
+    pub(crate) config: pgwire::Config,
+    /// The DSN's password, scrubbed from every connect-error text.
+    pub(crate) secret: Option<String>,
     /// When this instance last swept `store_ops` past its retention (`v3`).
-    ops_swept_at: AtomicU64,
+    pub(crate) ops_swept_at: AtomicU64,
+    /// The instance's KEPT connections (ARCHITECT ruling 2026-10-03, STORE-KEEP): bounded at ONE,
+    /// the 1.5.5 store's one mutex-guarded connection (it had no pool setting). An op waits for it
+    /// while another holds it, as 1.5.5's ops waited on the mutex.
+    pub(crate) pool: std::sync::Arc<busbar_contract::abi::sdk::store::wire::Pool>,
+}
+
+/// ONE OP'S CONNECTION: the 1.5.5 bodies run on it, as they ran on the mutex-guarded client.
+pub(crate) struct Session {
+    client: Client,
+    shared: std::sync::Arc<Shared>,
+}
+
+impl std::ops::Deref for Session {
+    type Target = Shared;
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
 }
 
 /// Clamp a `u64` into `i64` for a BIGINT column (a value above `i64::MAX` pins to `i64::MAX`, never
@@ -579,59 +623,91 @@ fn now_secs() -> u64 {
 }
 
 impl PostgresStore {
-    /// Connect to Postgres with the given libpq connection string / URL and ensure the schema. TLS
-    /// is not wired in this build (`NoTls`); front the database with a TLS-terminating proxy or a
-    /// local socket.
-    pub fn connect(conn_str: &str) -> RecordStoreResult<Self> {
+    /// The store on the connection string `conn_str`: parsed here, connected by the connect step. A string
+    /// the driver refuses is refused in its words, scrubbed of the DSN password.
+    ///
+    /// # Errors
+    /// The connection string does not parse.
+    pub fn new(conn_str: &str) -> RecordStoreResult<Self> {
         let secret = dsn_password(conn_str);
-        // `render_pg_error`, not `e.to_string()`. A server-side refusal (bad database name, failed
-        // authentication, an unavailable extension) is a `db_error` whose Display is the literal
-        // two words "db error" — so the ONE error an operator hits before anything else works
-        // rendered as the least actionable string in the crate, while every query error had already
-        // been fixed to carry its SQLSTATE and message. Still scrubbed of the DSN password.
-        let client = Client::connect(conn_str, NoTls)
-            .map_err(|e| RecordStoreError(scrub(render_pg_error(&e), secret.as_deref())))?;
-        let store = Self {
-            client: Mutex::new(client),
-            ops_swept_at: AtomicU64::new(0),
-        };
-        store.migrate()?;
-        Ok(store)
+        let config = pgwire::Config::parse(conn_str)
+            .map_err(|e| RecordStoreError(scrub(e.to_string(), secret.as_deref())))?;
+        Ok(Self {
+            shared: std::sync::Arc::new(Shared {
+                config,
+                secret,
+                ops_swept_at: AtomicU64::new(0),
+                pool: busbar_contract::abi::sdk::store::wire::Pool::new(KEPT_CONNECTIONS),
+            }),
+        })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Client> {
-        self.client.lock().unwrap_or_else(|p| p.into_inner())
+    pub(crate) fn shared(&self) -> std::sync::Arc<Shared> {
+        self.shared.clone()
+    }
+}
+
+impl Session {
+    /// Open one op's connection over `wire`: connect through the host's connector, secure it when
+    /// the settings ask, authenticate. A failure is the driver's words (`error connecting to
+    /// server: ...`, or the server's SQLSTATE and message), scrubbed of the DSN password.
+    pub(crate) async fn open(
+        wire: busbar_contract::abi::sdk::store::wire::Wire,
+        shared: std::sync::Arc<Shared>,
+    ) -> Result<Self, String> {
+        match Client::connect(wire, &shared.config).await {
+            Ok(client) => Ok(Self { client, shared }),
+            Err(e) => Err(scrub(render_pg_error(&e), shared.secret.as_deref())),
+        }
+    }
+
+    /// The op is done: its connection is kept for the next op if the session is idle, else
+    /// discarded ([`Client::release`]).
+    pub(crate) async fn close(mut self) {
+        self.client.release();
+    }
+
+    fn lock(&mut self) -> &mut Client {
+        &mut self.client
+    }
+
+    pub(crate) fn lock_client(&mut self) -> &mut Client {
+        &mut self.client
     }
 
     /// Open a transaction that gives every statement inside it ONE consistent snapshot, taken at the
     /// transaction's first statement — REPEATABLE READ, not the default READ COMMITTED (which gives
     /// each statement its own fresh snapshot, a torn-read hazard for any multi-statement read like
     /// `get_usage` or the hydration delta queries).
-    pub(crate) fn snapshot_consistent_tx<'a>(
+    pub(crate) async fn snapshot_consistent_tx<'a>(
         client: &'a mut Client,
-    ) -> RecordStoreResult<postgres::Transaction<'a>> {
+    ) -> RecordStoreResult<Transaction<'a>> {
         client
             .build_transaction()
-            .isolation_level(postgres::IsolationLevel::RepeatableRead)
+            .isolation_level(pgwire::IsolationLevel::RepeatableRead)
             .start()
+            .await
             .store()
     }
 
     const MIGRATE_LOCK_KEY: i64 = 0x6275_7362_6172_5f70; // ASCII "busbar_p"
 
-    fn migrate(&self) -> RecordStoreResult<()> {
-        let mut client = self.lock();
+    pub(crate) async fn migrate(&mut self) -> RecordStoreResult<()> {
+        let client = self.lock();
         client
             .batch_execute(&format!(
                 "SELECT pg_advisory_lock({})",
                 Self::MIGRATE_LOCK_KEY
             ))
+            .await
             .store()?;
-        let result = Self::migrate_locked(&mut client);
-        let unlocked = client.batch_execute(&format!(
-            "SELECT pg_advisory_unlock({})",
-            Self::MIGRATE_LOCK_KEY
-        ));
+        let result = Self::migrate_locked(client).await;
+        let unlocked = client
+            .batch_execute(&format!(
+                "SELECT pg_advisory_unlock({})",
+                Self::MIGRATE_LOCK_KEY
+            ))
+            .await;
         // A migration failure is the more important thing to report; don't mask it with an unlock
         // failure. But if the migration itself SUCCEEDED and the unlock did not, that must not be
         // swallowed: an un-released session-held advisory lock can hang a sibling node's connect()
@@ -646,17 +722,20 @@ impl PostgresStore {
         }
     }
 
-    fn migrate_locked(client: &mut Client) -> RecordStoreResult<()> {
+    async fn migrate_locked(client: &mut Client) -> RecordStoreResult<()> {
         client
             .batch_execute("CREATE TABLE IF NOT EXISTS busbar_schema (version BIGINT PRIMARY KEY)")
+            .await
             .store()?;
-        let version: i64 =
-            match client.query_opt("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[]) {
-                Ok(Some(r)) => r.get(0),
-                Ok(None) => 0,
-                Err(e) if is_undefined_table(&e) => 0,
-                Err(e) => return Err(RecordStoreError(e.to_string())),
-            };
+        let version: i64 = match client
+            .query_opt("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[])
+            .await
+        {
+            Ok(Some(r)) => r.get(0),
+            Ok(None) => 0,
+            Err(e) if is_undefined_table(&e) => 0,
+            Err(e) => return Err(RecordStoreError(render_pg_error(&e))),
+        };
         // ALREADY CURRENT: run no DDL at all. Every node runs `migrate()` on every connect, and
         // `SCHEMA`'s `CREATE INDEX IF NOT EXISTS` takes a SHARE lock on its table before it
         // discovers the index exists — first on `keys`, then on `credentials`. A `delete_key` on
@@ -667,7 +746,7 @@ impl PostgresStore {
         if version >= SCHEMA_VERSION {
             return Ok(());
         }
-        let mut tx = client.transaction().store()?;
+        let mut tx = client.transaction().await.store()?;
         if version < 5 {
             let legacy: bool = tx
                 .query_one(
@@ -676,6 +755,7 @@ impl PostgresStore {
                         OR to_regclass('aws_credentials') IS NOT NULL",
                     &[],
                 )
+                .await
                 .store()?
                 .get(0);
             if legacy {
@@ -692,10 +772,11 @@ impl PostgresStore {
                      DROP TABLE IF EXISTS denylist;
                      DROP TABLE IF EXISTS store_revision;",
                 )
+                .await
                 .store()?;
             }
         }
-        tx.batch_execute(SCHEMA).store()?;
+        tx.batch_execute(SCHEMA).await.store()?;
         // v6 one-time backfill — see SCHEMA_VERSION's doc comment for why this is safe as a
         // gated-once value backfill and would NOT be safe as a repeated/per-boot heuristic. Only
         // fires when crossing INTO v6 (a store already at v6+ never re-runs this).
@@ -705,6 +786,7 @@ impl PostgresStore {
                  WHERE billable_requests = 0 AND requests > 0",
                 &[],
             )
+            .await
             .store()?;
         }
         // v10 — see SCHEMA_VERSION. `SCHEMA`'s `CREATE TABLE IF NOT EXISTS` never alters a table
@@ -719,7 +801,7 @@ impl PostgresStore {
         // also touches). The whole migration is ONE transaction with the version stamp, so a crash
         // part-way leaves `version < 10` and the next connect re-runs it from the start.
         if version < 10 {
-            tx.batch_execute(MIGRATE_V10_COLUMNS).store()?;
+            tx.batch_execute(MIGRATE_V10_COLUMNS).await.store()?;
             // The one v10 step that is not a pure addition: `priced_from_ms` joins the metering
             // primary key. Every existing row carries `priced_from_ms = 0` (the column default),
             // so the old key `(key_id, bucket, model, provider)` was already unique and the widened
@@ -729,14 +811,16 @@ impl PostgresStore {
                  ALTER TABLE usage_metering ADD CONSTRAINT usage_metering_pkey
                      PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms);",
             )
+            .await
             .store()?;
         }
         tx.execute(
             "INSERT INTO busbar_schema (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
             &[&SCHEMA_VERSION],
         )
+        .await
         .store()?;
-        tx.commit().store()?;
+        tx.commit().await.store()?;
         Ok(())
     }
 
@@ -746,11 +830,12 @@ impl PostgresStore {
     /// and credentials do): calling it first fixes a single lock-acquisition order
     /// (`store_revision` row, then whatever else the transaction touches) across every mutating
     /// method, which is what makes cross-method deadlock structurally impossible.
-    fn next_revision(tx: &mut Transaction<'_>) -> RecordStoreResult<i64> {
+    async fn next_revision(tx: &mut Transaction<'_>) -> RecordStoreResult<i64> {
         tx.query_one(
             "UPDATE store_revision SET revision = revision + 1 WHERE only_row RETURNING revision",
             &[],
         )
+        .await
         .store()?
         .try_get(0)
         .store()
@@ -895,16 +980,16 @@ fn row_to_cred_meta(r: &Row) -> CredentialMeta {
     }
 }
 
-impl RecordStore for PostgresStore {
-    fn put_key(&self, key: &VirtualKey) -> RecordStoreResult<()> {
+impl Session {
+    pub(crate) async fn put_key(&mut self, key: &VirtualKey) -> RecordStoreResult<()> {
         let (pools, by_kind) = scopes_to_storage(&key.allowed_scopes);
         let labels = labels_to_storage(&key.labels);
         let created = clamp(key.created_at);
         let expires = key.expires_at.map(clamp);
         let deleted = key.deleted_at.map(clamp);
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
-        let rev = Self::next_revision(&mut tx)?;
+        let client = self.lock();
+        let mut tx = client.transaction().await.store()?;
+        let rev = Self::next_revision(&mut tx).await?;
         // The `WHERE` on the conflict branch is the TOMBSTONE PRECONDITION (see `Store::put_key`):
         // a live-shaped write (`EXCLUDED.deleted_at IS NULL`) must not overwrite a tombstoned row,
         // which would reissue an id the contract says is never reissued and revive every token
@@ -932,7 +1017,7 @@ impl RecordStore for PostgresStore {
                 &key.group, &labels, &expires, &deleted, &rev, &key.idp_subject,
                 &key.binding_mode, &key.minted_by, &by_kind,
             ],
-        )
+        ).await
         .store()?;
         if changed == 0 {
             // The conflict branch matched a row but its WHERE rejected the write: the stored row is
@@ -943,32 +1028,35 @@ impl RecordStore for PostgresStore {
                 key.id
             )));
         }
-        tx.commit().store()?;
+        tx.commit().await.store()?;
         Ok(())
     }
 
-    fn get_key(&self, id: &str) -> RecordStoreResult<Option<VirtualKey>> {
+    pub(crate) async fn get_key(&mut self, id: &str) -> RecordStoreResult<Option<VirtualKey>> {
         let sql = format!("SELECT {KEY_COLUMNS} FROM keys WHERE id=$1");
-        let row = self.lock().query_opt(&sql, &[&id]).store()?;
+        let row = self.lock().query_opt(&sql, &[&id]).await.store()?;
         Ok(row.map(|r| row_to_key(&r)))
     }
 
-    fn list_keys(&self) -> RecordStoreResult<Vec<VirtualKey>> {
+    pub(crate) async fn list_keys(&mut self) -> RecordStoreResult<Vec<VirtualKey>> {
         // Deliberately UNFILTERED (tombstoned rows included) -- see the trait doc: this serves both
         // the admin-listing caller (which filters deleted_at.is_none() itself) and list_keys_since's
         // default fallback, which needs tombstones visible to drive credential eviction downstream.
         let sql = format!("SELECT {KEY_COLUMNS} FROM keys ORDER BY created_at");
-        let rows = self.lock().query(&sql, &[]).store()?;
+        let rows = self.lock().query(&sql, &[]).await.store()?;
         Ok(rows.iter().map(row_to_key).collect())
     }
 
-    fn list_keys_since(&self, since: u64) -> RecordStoreResult<Vec<VirtualKey>> {
+    pub(crate) async fn list_keys_since(
+        &mut self,
+        since: u64,
+    ) -> RecordStoreResult<Vec<VirtualKey>> {
         let sql = format!("SELECT {KEY_COLUMNS} FROM keys WHERE revision > $1 ORDER BY revision");
-        let rows = self.lock().query(&sql, &[&clamp(since)]).store()?;
+        let rows = self.lock().query(&sql, &[&clamp(since)]).await.store()?;
         Ok(rows.iter().map(row_to_key).collect())
     }
 
-    fn delete_key(&self, id: &str) -> RecordStoreResult<()> {
+    pub(crate) async fn delete_key(&mut self, id: &str) -> RecordStoreResult<()> {
         // TOMBSTONE, not a hard delete: the `keys` row survives (billing/audit attribution keeps
         // resolving it forever) while every credential row for it is destroyed. Both happen in ONE
         // transaction stamped with the SAME revision, which is the load-bearing property for
@@ -977,13 +1065,14 @@ impl RecordStore for PostgresStore {
         // reacts to "this key's revision-delta shows deleted_at newly set" by evicting all its
         // cached credentials is provably correct -- there is no window where the credential rows'
         // own (now-nonexistent) deltas would have been needed to convey the deletion.
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
+        let client = self.lock();
+        let mut tx = client.transaction().await.store()?;
         let already_deleted: Option<bool> = tx
             .query_opt(
                 "SELECT deleted_at IS NOT NULL FROM keys WHERE id=$1",
                 &[&id],
             )
+            .await
             .store()?
             .map(|r| r.get(0));
         match already_deleted {
@@ -997,12 +1086,12 @@ impl RecordStore for PostgresStore {
             }
             Some(true) => {
                 // Already tombstoned: no-op, not an error.
-                tx.commit().store()?;
+                tx.commit().await.store()?;
                 return Ok(());
             }
             Some(false) => {}
         }
-        let rev = Self::next_revision(&mut tx)?;
+        let rev = Self::next_revision(&mut tx).await?;
         // `deleted_at` is a WALL-CLOCK stamp and `revision` is the store-global counter. They are
         // both BIGINT, so binding one value to both columns compiles, round-trips and satisfies
         // every "is this key tombstoned" check -- while telling every operator, retention job and
@@ -1011,6 +1100,7 @@ impl RecordStore for PostgresStore {
         // `delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision`.
         let now = clamp(now_secs());
         tx.execute("DELETE FROM credentials WHERE key_id=$1", &[&id])
+            .await
             .store()?;
         // `AND deleted_at IS NULL` re-states the guard the SELECT above already checked, IN the
         // UPDATE's own WHERE clause: under Postgres' READ COMMITTED semantics, an UPDATE takes a row
@@ -1024,28 +1114,30 @@ impl RecordStore for PostgresStore {
                  WHERE id=$1 AND deleted_at IS NULL",
                 &[&id, &now, &rev],
             )
+            .await
             .store()?;
         // A concurrent delete_key committed between our SELECT and this UPDATE: idempotent no-op,
         // same as the `Some(true)` branch above -- not an error.
         if changed == 0 {
-            tx.commit().store()?;
+            tx.commit().await.store()?;
             return Ok(());
         }
-        tx.commit().store()?;
+        tx.commit().await.store()?;
         Ok(())
     }
 
-    fn scrub_key(&self, id: &str) -> RecordStoreResult<()> {
+    pub(crate) async fn scrub_key(&mut self, id: &str) -> RecordStoreResult<()> {
         // PII-erasure only: null name/labels on an ALREADY-tombstoned key. Errors if unknown or
         // still live -- scrubbing a live key would be silent, un-auditable data loss on an active
         // principal (the trait doc's own guard: go through delete_key first).
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
+        let client = self.lock();
+        let mut tx = client.transaction().await.store()?;
         let deleted: Option<bool> = tx
             .query_opt(
                 "SELECT deleted_at IS NOT NULL FROM keys WHERE id=$1",
                 &[&id],
             )
+            .await
             .store()?
             .map(|r| r.get(0));
         match deleted {
@@ -1057,7 +1149,7 @@ impl RecordStore for PostgresStore {
             }
             Some(true) => {}
         }
-        let rev = Self::next_revision(&mut tx)?;
+        let rev = Self::next_revision(&mut tx).await?;
         // `AND deleted_at IS NOT NULL` re-states the "must already be tombstoned" guard IN the
         // UPDATE's own WHERE clause, closing the same TOCTOU class as delete_key above: the SELECT
         // this function just ran is not atomic with this write, so without the re-check here a
@@ -1071,6 +1163,7 @@ impl RecordStore for PostgresStore {
                  WHERE id=$1 AND deleted_at IS NOT NULL",
                 &[&id, &rev],
             )
+            .await
             .store()?;
         if changed == 0 {
             return Err(RecordStoreError(format!(
@@ -1078,20 +1171,25 @@ impl RecordStore for PostgresStore {
                  call -- refusing to scrub a key that is live by the time the write landed"
             )));
         }
-        tx.commit().store()?;
+        tx.commit().await.store()?;
         Ok(())
     }
 
-    fn get_usage(&self, bucket_id: &str, window_start: u64) -> RecordStoreResult<UsageLedger> {
+    pub(crate) async fn get_usage(
+        &mut self,
+        bucket_id: &str,
+        window_start: u64,
+    ) -> RecordStoreResult<UsageLedger> {
         let ws = clamp(window_start);
-        let mut client = self.lock();
-        let mut tx = Self::snapshot_consistent_tx(&mut client)?;
+        let client = self.lock();
+        let mut tx = Self::snapshot_consistent_tx(client).await?;
         let (requests, billable_requests): (u64, u64) = tx
             .query_opt(
                 "SELECT requests, billable_requests
                  FROM usage_windows WHERE bucket_id=$1 AND window_start=$2",
                 &[&bucket_id, &ws],
             )
+            .await
             .store()?
             .map(|r| (read_u64(r.get::<_, i64>(0)), read_u64(r.get::<_, i64>(1))))
             .unwrap_or((0, 0));
@@ -1101,6 +1199,7 @@ impl RecordStore for PostgresStore {
                  FROM usage_ledger WHERE bucket_id=$1 AND window_start=$2 ORDER BY model",
                 &[&bucket_id, &ws],
             )
+            .await
             .store()?;
         let unit_rows = tx
             .query(
@@ -1108,8 +1207,9 @@ impl RecordStore for PostgresStore {
                  WHERE bucket_id=$1 AND window_start=$2 ORDER BY model, unit",
                 &[&bucket_id, &ws],
             )
+            .await
             .store()?;
-        tx.commit().store()?;
+        tx.commit().await.store()?;
         // One ModelTokens per model, in model order. The four reserved classes come off their
         // columns and every open class off `usage_ledger_units`, all into the one name-keyed map.
         // Zero counts are left out, so the map stays sparse the way busbar's own ledger keeps it.
@@ -1140,8 +1240,8 @@ impl RecordStore for PostgresStore {
         })
     }
 
-    fn put_usage(
-        &self,
+    pub(crate) async fn put_usage(
+        &mut self,
         bucket_id: &str,
         window_start: u64,
         ledger: &UsageLedger,
@@ -1149,17 +1249,19 @@ impl RecordStore for PostgresStore {
         let ws = clamp(window_start);
         let rq = clamp(ledger.requests);
         let brq = clamp(ledger.billable_requests);
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
+        let client = self.lock();
+        let mut tx = client.transaction().await.store()?;
         tx.execute(
             "DELETE FROM usage_ledger WHERE bucket_id=$1 AND window_start=$2",
             &[&bucket_id, &ws],
         )
+        .await
         .store()?;
         tx.execute(
             "DELETE FROM usage_ledger_units WHERE bucket_id=$1 AND window_start=$2",
             &[&bucket_id, &ws],
         )
+        .await
         .store()?;
         tx.execute(
             "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
@@ -1169,6 +1271,7 @@ impl RecordStore for PostgresStore {
                 billable_requests = EXCLUDED.billable_requests",
             &[&bucket_id, &ws, &rq, &brq],
         )
+        .await
         .store()?;
         if !ledger.models.is_empty() {
             let rows: Vec<[i64; 4]> = ledger
@@ -1202,7 +1305,7 @@ impl RecordStore for PostgresStore {
                     params.push(v);
                 }
             }
-            tx.execute(&sql, &params).store()?;
+            tx.execute(&sql, &params).await.store()?;
 
             // The OPEN unit classes: an absolute set too (the window's rows were cleared above).
             let opens: Vec<(&String, &String, i64)> = ledger
@@ -1238,38 +1341,22 @@ impl RecordStore for PostgresStore {
                     " ON CONFLICT (bucket_id, window_start, model, unit) DO UPDATE SET \
                      count = usage_ledger_units.count + EXCLUDED.count",
                 );
-                tx.execute(&sql, &params).store()?;
+                tx.execute(&sql, &params).await.store()?;
             }
         }
-        tx.commit().store()?;
+        tx.commit().await.store()?;
         Ok(())
     }
 
-    fn add_usage(
-        &self,
-        bucket_id: &str,
-        window_start: u64,
-        delta: &UsageDelta,
-    ) -> RecordStoreResult<()> {
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
-        Self::add_usage_in(&mut tx, bucket_id, window_start, delta)?;
-        tx.commit().store()
-    }
-
-    fn add_metering(&self, d: &MeteringDelta) -> RecordStoreResult<()> {
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
-        Self::add_metering_in(&mut tx, d)?;
-        tx.commit().store()
-    }
-
-    fn list_metering(&self, bucket: u64) -> RecordStoreResult<Vec<MeteringRow>> {
+    pub(crate) async fn list_metering(
+        &mut self,
+        bucket: u64,
+    ) -> RecordStoreResult<Vec<MeteringRow>> {
         let b = clamp(bucket);
-        let mut client = self.lock();
+        let client = self.lock();
         // ONE snapshot for both reads, so a row's open classes are never read from a different
         // moment than its token columns.
-        let mut tx = Self::snapshot_consistent_tx(&mut client)?;
+        let mut tx = Self::snapshot_consistent_tx(client).await?;
         let rows = tx
             .query(
                 "SELECT key_id, model, provider,
@@ -1279,6 +1366,7 @@ impl RecordStore for PostgresStore {
                  ORDER BY key_id, model, provider, priced_from_ms",
                 &[&b],
             )
+            .await
             .store()?;
         let unit_rows = tx
             .query(
@@ -1286,8 +1374,9 @@ impl RecordStore for PostgresStore {
                  FROM usage_metering_units WHERE bucket=$1",
                 &[&b],
             )
+            .await
             .store()?;
-        tx.commit().store()?;
+        tx.commit().await.store()?;
         type RowKey = (String, String, String, i64);
         let mut units: std::collections::HashMap<RowKey, BTreeMap<String, u64>> =
             std::collections::HashMap::new();
@@ -1324,25 +1413,28 @@ impl RecordStore for PostgresStore {
             .collect())
     }
 
-    fn purge_windows_before(&self, before: u64) -> RecordStoreResult<u64> {
+    pub(crate) async fn purge_windows_before(&mut self, before: u64) -> RecordStoreResult<u64> {
         let b = clamp(before);
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
+        let client = self.lock();
+        let mut tx = client.transaction().await.store()?;
         let n1 = tx
             .execute("DELETE FROM usage_windows WHERE window_start < $1", &[&b])
+            .await
             .store()?;
         tx.execute("DELETE FROM usage_ledger WHERE window_start < $1", &[&b])
+            .await
             .store()?;
         tx.execute(
             "DELETE FROM usage_ledger_units WHERE window_start < $1",
             &[&b],
         )
+        .await
         .store()?;
-        tx.commit().store()?;
+        tx.commit().await.store()?;
         Ok(n1)
     }
 
-    fn purge_metering_before(&self, bucket: &str) -> RecordStoreResult<u64> {
+    pub(crate) async fn purge_metering_before(&mut self, bucket: &str) -> RecordStoreResult<u64> {
         // The trait's purge_metering_before takes `bucket: &str` while list_metering/add_metering
         // use `bucket: u64` -- an inconsistency in the core trait itself, not introduced here.
         // usage_metering.bucket is genuinely BIGINT, so this parses the string form.
@@ -1351,27 +1443,32 @@ impl RecordStore for PostgresStore {
                 "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
             ))
         })?;
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
+        let client = self.lock();
+        let mut tx = client.transaction().await.store()?;
         let n = tx
             .execute("DELETE FROM usage_metering WHERE bucket=$1", &[&b])
+            .await
             .store()?;
         tx.execute("DELETE FROM usage_metering_units WHERE bucket=$1", &[&b])
+            .await
             .store()?;
-        tx.commit().store()?;
+        tx.commit().await.store()?;
         Ok(n)
     }
 
-    fn put_credential(&self, secret: &CredentialSecret) -> RecordStoreResult<()> {
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
-        Self::put_credential_tx(&mut tx, secret)?;
-        tx.commit().store()?;
+    pub(crate) async fn put_credential(
+        &mut self,
+        secret: &CredentialSecret,
+    ) -> RecordStoreResult<()> {
+        let client = self.lock();
+        let mut tx = client.transaction().await.store()?;
+        Self::put_credential_tx(&mut tx, secret).await?;
+        tx.commit().await.store()?;
         Ok(())
     }
 
-    fn put_key_with_credential(
-        &self,
+    pub(crate) async fn put_key_with_credential(
+        &mut self,
         key: &VirtualKey,
         secret: &CredentialSecret,
     ) -> RecordStoreResult<()> {
@@ -1380,9 +1477,9 @@ impl RecordStore for PostgresStore {
         let labels = labels_to_storage(&key.labels);
         let created = clamp(key.created_at);
         let expires = key.expires_at.map(clamp);
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
-        let rev = Self::next_revision(&mut tx)?;
+        let client = self.lock();
+        let mut tx = client.transaction().await.store()?;
+        let rev = Self::next_revision(&mut tx).await?;
         // Same TOMBSTONE PRECONDITION as `put_key`, and this is the path where it MATTERS MOST: the
         // conflict branch used to set `deleted_at=NULL` outright, so re-minting over a tombstoned id
         // deliberately cleared the tombstone. That was written to avoid leaving a row both enabled
@@ -1410,7 +1507,7 @@ impl RecordStore for PostgresStore {
                 &key.group, &labels, &expires, &rev, &key.idp_subject, &key.binding_mode,
                 &key.minted_by, &by_kind,
             ],
-        )
+        ).await
         .store()?;
         if changed == 0 {
             return Err(RecordStoreError(format!(
@@ -1419,26 +1516,33 @@ impl RecordStore for PostgresStore {
                 key.id
             )));
         }
-        Self::put_credential_tx(&mut tx, secret)?;
-        tx.commit().store()?;
+        Self::put_credential_tx(&mut tx, secret).await?;
+        tx.commit().await.store()?;
         Ok(())
     }
 
-    fn list_credentials(&self, key_id: &str) -> RecordStoreResult<Vec<CredentialMeta>> {
+    pub(crate) async fn list_credentials(
+        &mut self,
+        key_id: &str,
+    ) -> RecordStoreResult<Vec<CredentialMeta>> {
         let sql = format!("SELECT {CRED_META_COLUMNS} FROM credentials WHERE key_id=$1");
-        let rows = self.lock().query(&sql, &[&key_id]).store()?;
+        let rows = self.lock().query(&sql, &[&key_id]).await.store()?;
         Ok(rows.iter().map(row_to_cred_meta).collect())
     }
 
-    fn lookup_credential_secret(
-        &self,
+    pub(crate) async fn lookup_credential_secret(
+        &mut self,
         kind: &str,
         public_id: &str,
     ) -> RecordStoreResult<Option<CredentialSecret>> {
         let sql = format!(
             "SELECT {CRED_META_COLUMNS},secret FROM credentials WHERE kind=$1 AND public_id=$2"
         );
-        let row = self.lock().query_opt(&sql, &[&kind, &public_id]).store()?;
+        let row = self
+            .lock()
+            .query_opt(&sql, &[&kind, &public_id])
+            .await
+            .store()?;
         Ok(row.map(|r| CredentialSecret {
             meta: row_to_cred_meta(&r),
             secret: r
@@ -1447,14 +1551,19 @@ impl RecordStore for PostgresStore {
         }))
     }
 
-    fn revoke_credential(&self, id: &str, reason: &str) -> RecordStoreResult<()> {
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
+    pub(crate) async fn revoke_credential(
+        &mut self,
+        id: &str,
+        reason: &str,
+    ) -> RecordStoreResult<()> {
+        let client = self.lock();
+        let mut tx = client.transaction().await.store()?;
         let exists: bool = tx
             .query_one(
                 "SELECT EXISTS(SELECT 1 FROM credentials WHERE id=$1)",
                 &[&id],
             )
+            .await
             .store()?
             .get(0);
         if !exists {
@@ -1469,7 +1578,7 @@ impl RecordStore for PostgresStore {
                 "revoke_credential: unknown credential id {id}; nothing was revoked"
             )));
         }
-        let rev = Self::next_revision(&mut tx)?;
+        let rev = Self::next_revision(&mut tx).await?;
         let now = now_secs();
         // `AND revoked_at IS NULL`: mirrors delete_key's `already_deleted` idempotency (see above) --
         // a repeat revoke_credential call on an already-revoked row must be a true no-op, not bump
@@ -1484,6 +1593,7 @@ impl RecordStore for PostgresStore {
                  WHERE id=$1 AND revoked_at IS NULL",
                 &[&id, &clamp(now), &reason, &rev],
             )
+            .await
             .store()?;
         if changed == 0 {
             // Zero rows means one of two very different things, and the row count alone cannot tell
@@ -1499,6 +1609,7 @@ impl RecordStore for PostgresStore {
                     "SELECT EXISTS(SELECT 1 FROM credentials WHERE id=$1)",
                     &[&id],
                 )
+                .await
                 .store()?
                 .get(0);
             if !still_exists {
@@ -1512,15 +1623,18 @@ impl RecordStore for PostgresStore {
             // trait promises. The revision bump above goes unused, which its own doc allows (a
             // monotonic counter with gaps).
         }
-        tx.commit().store()?;
+        tx.commit().await.store()?;
         Ok(())
     }
 
-    fn list_credentials_since(&self, since: u64) -> RecordStoreResult<Vec<CredentialSecret>> {
+    pub(crate) async fn list_credentials_since(
+        &mut self,
+        since: u64,
+    ) -> RecordStoreResult<Vec<CredentialSecret>> {
         let sql = format!(
             "SELECT {CRED_META_COLUMNS},secret FROM credentials WHERE revision > $1 ORDER BY revision"
         );
-        let rows = self.lock().query(&sql, &[&clamp(since)]).store()?;
+        let rows = self.lock().query(&sql, &[&clamp(since)]).await.store()?;
         Ok(rows
             .iter()
             .map(|r| CredentialSecret {
@@ -1532,45 +1646,28 @@ impl RecordStore for PostgresStore {
             .collect())
     }
 
-    fn append_audit(&self, entry: &AuditRecord) -> RecordStoreResult<()> {
-        // The loop covers the one case the share lock cannot: the conflicting row disappearing
-        // BEFORE the read takes its lock. Then the seq is genuinely free again and the next
-        // iteration inserts. Bounded, and exhausting the bound is an error rather than a success,
-        // so no path here returns Ok without the record being stored.
-        const MAX_ATTEMPTS: u32 = 3;
-        for _ in 0..MAX_ATTEMPTS {
-            let mut client = self.lock();
-            let mut tx = client.transaction().store()?;
-            if Self::append_audit_in(&mut tx, entry)? {
-                return tx.commit().store();
-            }
-        }
-        Err(RecordStoreError(format!(
-            "append_audit: seq {} kept being freed between the insert and the read-back after \
-             {MAX_ATTEMPTS} attempts; something is deleting audit rows concurrently and the record \
-             was NOT stored",
-            entry.seq
-        )))
-    }
-
-    fn list_audit(&self) -> RecordStoreResult<Vec<AuditRecord>> {
+    pub(crate) async fn list_audit(&mut self) -> RecordStoreResult<Vec<AuditRecord>> {
         let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log ORDER BY seq");
-        let rows = self.lock().query(&sql, &[]).store()?;
+        let rows = self.lock().query(&sql, &[]).await.store()?;
         Ok(rows.iter().map(row_to_audit).collect())
     }
 
-    fn list_audit_tail(&self, limit: u64) -> RecordStoreResult<Vec<AuditRecord>> {
+    pub(crate) async fn list_audit_tail(
+        &mut self,
+        limit: u64,
+    ) -> RecordStoreResult<Vec<AuditRecord>> {
         let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log ORDER BY seq DESC LIMIT $1");
         let rows = self
             .lock()
             .query(&sql, &[&i64::try_from(limit).unwrap_or(i64::MAX)])
+            .await
             .store()?;
         let mut out: Vec<AuditRecord> = rows.iter().map(row_to_audit).collect();
         out.reverse();
         Ok(out)
     }
 
-    fn add_denylist(&self, sub: &str, reason: &str) -> RecordStoreResult<()> {
+    pub(crate) async fn add_denylist(&mut self, sub: &str, reason: &str) -> RecordStoreResult<()> {
         // `created_at` is a clock read, not the literal 0 it used to be. Same shape as the
         // `deleted_at` defect: the row lands, every "is this subject denied" check keeps working,
         // and only a question about WHEN it was denied reads back the epoch. store-sqlite writes
@@ -1581,12 +1678,17 @@ impl RecordStore for PostgresStore {
                  ON CONFLICT (sub) DO UPDATE SET reason = EXCLUDED.reason",
                 &[&sub, &reason, &clamp(now_secs())],
             )
+            .await
             .store()?;
         Ok(())
     }
 
-    fn list_denylist(&self) -> RecordStoreResult<Vec<String>> {
-        let rows = self.lock().query("SELECT sub FROM denylist", &[]).store()?;
+    pub(crate) async fn list_denylist(&mut self) -> RecordStoreResult<Vec<String>> {
+        let rows = self
+            .lock()
+            .query("SELECT sub FROM denylist", &[])
+            .await
+            .store()?;
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
@@ -1596,7 +1698,10 @@ impl RecordStore for PostgresStore {
     // in `plane_records` keyed `(kind, id)`; an APPENDED one in `plane_chain` keyed
     // `(kind, parent, seq)`. Identity, ordering and retention read only the typed sidecar columns.
 
-    fn upsert_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
+    pub(crate) async fn upsert_plane_record(
+        &mut self,
+        record: PlaneRecordRef<'_>,
+    ) -> RecordStoreResult<()> {
         // This store binds owned rows: the one copy of the borrowed view happens here.
         let record = &record.to_record();
         // REFUSED rather than clamped: `clamp` pins a value above i64::MAX, so the row read back
@@ -1623,11 +1728,16 @@ impl RecordStore for PostgresStore {
                     &record.body,
                 ],
             )
+            .await
             .store()?;
         Ok(())
     }
 
-    fn get_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<Option<Vec<u8>>> {
+    pub(crate) async fn get_plane_record(
+        &mut self,
+        kind: &str,
+        id: &str,
+    ) -> RecordStoreResult<Option<Vec<u8>>> {
         // No principal filter, deliberately: caller scoping is ENGINE-side, because an
         // authorization check living in the backend is one an unauthorized reader bypasses by
         // configuring a different backend.
@@ -1637,50 +1747,32 @@ impl RecordStore for PostgresStore {
                 "SELECT body FROM plane_records WHERE kind=$1 AND id=$2",
                 &[&kind, &id],
             )
+            .await
             .store()?;
         Ok(row.map(|r| r.get(0)))
     }
 
-    fn append_plane_record(&self, record: PlaneRecordRef<'_>) -> RecordStoreResult<()> {
-        // This store binds owned rows: the one copy of the borrowed view happens here.
-        let record = &record.to_record();
-        // The bounded loop covers the conflicting row vanishing before the share lock lands (the
-        // position is then free, so insert). No path returns Ok without the record being stored.
-        const MAX_ATTEMPTS: u32 = 3;
-        for _ in 0..MAX_ATTEMPTS {
-            let mut client = self.lock();
-            let mut tx = client.transaction().store()?;
-            if Self::append_plane_record_in(&mut tx, record)? {
-                return tx.commit().store();
-            }
-        }
-        Err(RecordStoreError(format!(
-            "append_plane_record: kind '{}' seq {} kept being freed between the insert and the \
-             read-back after {MAX_ATTEMPTS} attempts; something is deleting chain rows \
-             concurrently and the record was NOT stored",
-            record.kind, record.seq
-        )))
-    }
-
-    fn list_plane_records(
-        &self,
+    pub(crate) async fn list_plane_records(
+        &mut self,
         kind: &str,
         selector: &PlaneSelector<'_>,
     ) -> RecordStoreResult<Vec<Vec<u8>>> {
-        let mut client = self.lock();
+        let client = self.lock();
         // One snapshot across both tables.
-        let mut tx = Self::snapshot_consistent_tx(&mut client)?;
+        let mut tx = Self::snapshot_consistent_tx(client).await?;
         let (records, chain) = match selector {
             PlaneSelector::All => (
                 tx.query(
                     "SELECT body FROM plane_records WHERE kind=$1 ORDER BY seq, id",
                     &[&kind],
                 )
+                .await
                 .store()?,
                 tx.query(
                     "SELECT body FROM plane_chain WHERE kind=$1 ORDER BY parent, seq",
                     &[&kind],
                 )
+                .await
                 .store()?,
             ),
             // Oldest-first by seq — the order the engine's chain verifier reads a parent's chain.
@@ -1690,17 +1782,17 @@ impl RecordStore for PostgresStore {
                     tx.query(
                         "SELECT body FROM plane_records WHERE kind=$1 AND parent=$2 ORDER BY seq, id",
                         &[&kind, &p],
-                    )
+                    ).await
                     .store()?,
                     tx.query(
                         "SELECT body FROM plane_chain WHERE kind=$1 AND parent=$2 ORDER BY seq",
                         &[&kind, &p],
-                    )
+                    ).await
                     .store()?,
                 )
             }
         };
-        tx.commit().store()?;
+        tx.commit().await.store()?;
         Ok(records
             .iter()
             .chain(chain.iter())
@@ -1708,7 +1800,10 @@ impl RecordStore for PostgresStore {
             .collect())
     }
 
-    fn list_plane_record_parents(&self, kind: &str) -> RecordStoreResult<Vec<String>> {
+    pub(crate) async fn list_plane_record_parents(
+        &mut self,
+        kind: &str,
+    ) -> RecordStoreResult<Vec<String>> {
         // The boot enumeration a restart resumes chains from: every parent holding a record of
         // `kind`, each exactly once.
         let rows = self
@@ -1720,18 +1815,23 @@ impl RecordStore for PostgresStore {
                  ORDER BY 1",
                 &[&kind],
             )
+            .await
             .store()?;
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    fn purge_plane_records_before(&self, kind: &str, before: u64) -> RecordStoreResult<u64> {
+    pub(crate) async fn purge_plane_records_before(
+        &mut self,
+        kind: &str,
+        before: u64,
+    ) -> RecordStoreResult<u64> {
         // STRICTLY older than the cutoff: a row exactly at `before` is kept. WHICH rows go is the
         // kind's own contract, read off the typed `disposition` column and never out of the body —
         // see TERMINAL_ONLY_RETENTION_KINDS.
         let cutoff = clamp(before);
         let terminal_only = TERMINAL_ONLY_RETENTION_KINDS.contains(&kind);
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
+        let client = self.lock();
+        let mut tx = client.transaction().await.store()?;
         let purged: Vec<String> = tx
             .query(
                 "DELETE FROM plane_records
@@ -1739,6 +1839,7 @@ impl RecordStore for PostgresStore {
                  RETURNING id",
                 &[&kind, &cutoff, &terminal_only],
             )
+            .await
             .store()?
             .iter()
             .map(|r| r.get(0))
@@ -1748,6 +1849,7 @@ impl RecordStore for PostgresStore {
                 "DELETE FROM plane_chain WHERE kind=$1 AND ts < $2",
                 &[&kind, &cutoff],
             )
+            .await
             .store()?;
         // CASCADE, in the SAME transaction: a purged parent's child chain goes with it, and only
         // the chains under a record that actually went — so this can never be a second, wider
@@ -1758,36 +1860,43 @@ impl RecordStore for PostgresStore {
                     "DELETE FROM plane_chain WHERE kind=$1 AND parent = ANY($2)",
                     &[child, &purged],
                 )
+                .await
                 .store()?;
             }
         }
-        tx.commit().store()?;
+        tx.commit().await.store()?;
         // `execute`/`RETURNING` report the rows actually removed, so the count is one performed.
         Ok(purged.len() as u64 + chain)
     }
 
-    fn delete_plane_record(&self, kind: &str, id: &str) -> RecordStoreResult<()> {
+    pub(crate) async fn delete_plane_record(
+        &mut self,
+        kind: &str,
+        id: &str,
+    ) -> RecordStoreResult<()> {
         // Absent is a NO-OP, not an error: the engine clears on every observation that agrees with
         // the operator rather than tracking whether it had written one. A chain whose parent is
         // `id` goes too, so deleting a record cannot leave part of its chain behind.
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
+        let client = self.lock();
+        let mut tx = client.transaction().await.store()?;
         tx.execute(
             "DELETE FROM plane_records WHERE kind=$1 AND id=$2",
             &[&kind, &id],
         )
+        .await
         .store()?;
         tx.execute(
             "DELETE FROM plane_chain WHERE kind=$1 AND parent=$2",
             &[&kind, &id],
         )
+        .await
         .store()?;
-        tx.commit().store()?;
+        tx.commit().await.store()?;
         Ok(())
     }
 
-    fn redeem_plane_token(
-        &self,
+    pub(crate) async fn redeem_plane_token(
+        &mut self,
         kind: &str,
         token: &str,
         expires_at: u64,
@@ -1799,8 +1908,8 @@ impl RecordStore for PostgresStore {
         // every spent token. An error is refused by the engine, so it is the direction to fail in.
         let expires = as_storable_i64("redeem_plane_token", "expires_at", expires_at)?;
         let cutoff = as_storable_i64("redeem_plane_token", "now", now)?;
-        let mut client = self.lock();
-        let mut tx = client.transaction().store()?;
+        let client = self.lock();
+        let mut tx = client.transaction().await.store()?;
         // The eviction sweep the redemption carries, bounding the ledger by one validity window: an
         // entry recording a token that can no longer be presented protects nothing. STRICTLY
         // less-than (an entry expiring exactly at `now` is kept), and BEFORE the insert, so it can
@@ -1809,6 +1918,7 @@ impl RecordStore for PostgresStore {
             "DELETE FROM plane_tokens WHERE kind=$1 AND expires_at < $2",
             &[&kind, &cutoff],
         )
+        .await
         .store()?;
         // THE TEST AND SET, as ONE statement: `execute` returns the rows this INSERT wrote, so 1
         // means THIS call recorded the redemption and 0 means it was already there. A read then a
@@ -1820,13 +1930,14 @@ impl RecordStore for PostgresStore {
                  ON CONFLICT (kind, token) DO NOTHING",
                 &[&kind, &token, &expires],
             )
+            .await
             .store()?;
-        tx.commit().store()?;
+        tx.commit().await.store()?;
         Ok(inserted == 1)
     }
 
-    fn plane_token_live(
-        &self,
+    pub(crate) async fn plane_token_live(
+        &mut self,
         kind: &str,
         token: &str,
         expires_at: u64,
@@ -1845,6 +1956,7 @@ impl RecordStore for PostgresStore {
                 "SELECT disposition FROM plane_records WHERE kind=$1 AND id=$2",
                 &[&kind, &token],
             )
+            .await
             .store()?;
         Ok(row.is_some_and(|r| r.get::<_, &str>(0) == "active"))
     }
@@ -1885,19 +1997,19 @@ fn row_to_audit(r: &Row) -> AuditRecord {
     }
 }
 
-impl PostgresStore {
+impl Session {
     /// Shared body of `put_credential`/`put_key_with_credential`: upsert on `(key_id, kind, slot)`.
     /// Minting into an OCCUPIED LIVE slot (revoked_at IS NULL) MUST fail rather than silently
     /// destroy a working credential mid-overlap-window -- the `WHERE credentials.revoked_at IS NOT
     /// NULL` guard on the `DO UPDATE` makes that structural: the upsert simply does not apply if
     /// the existing row is live, and the subsequent `changed` check turns that into a real error
     /// instead of a silent no-op.
-    fn put_credential_tx(
+    async fn put_credential_tx(
         tx: &mut Transaction<'_>,
         secret: &CredentialSecret,
     ) -> RecordStoreResult<()> {
         let m = &secret.meta;
-        let rev = Self::next_revision(tx)?;
+        let rev = Self::next_revision(tx).await?;
         // The owning key must EXIST and be LIVE (`put_credential`'s precondition, pinned by the
         // conformance suite). `delete_key` cascades a key's credentials away precisely so the
         // secret material stops resolving; accepting a mint afterwards puts it back under a key an
@@ -1911,6 +2023,7 @@ impl PostgresStore {
                 "SELECT deleted_at IS NULL FROM keys WHERE id=$1",
                 &[&m.key_id],
             )
+            .await
             .store()?
             .map(|r| r.get(0));
         match owner_live {
@@ -1961,7 +2074,7 @@ impl PostgresStore {
                     &expires,
                     &rev,
                 ],
-            )
+            ).await
             .store()?;
         if changed == 0 {
             // Either the slot is occupied by a LIVE credential (the WHERE guard blocked it), or this
@@ -1971,7 +2084,7 @@ impl PostgresStore {
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM credentials WHERE key_id=$1 AND kind=$2 AND slot=$3)",
                     &[&m.key_id, &m.kind, &(m.slot as i16)],
-                )
+                ).await
                 .store()?
                 .get(0);
             if exists {
@@ -1992,10 +2105,10 @@ impl PostgresStore {
 }
 
 /// The writes the store v3 `op_id` slots run inside their dedupe transaction ([`v3`]).
-impl PostgresStore {
+impl Session {
     /// `add_usage` inside the caller's transaction (the store v3 `op_id` writes and batches run
     /// it with their dedupe record, in one transaction).
-    pub(crate) fn add_usage_in(
+    pub(crate) async fn add_usage_in(
         tx: &mut Transaction<'_>,
         bucket_id: &str,
         window_start: u64,
@@ -2010,6 +2123,7 @@ impl PostgresStore {
                 billable_requests = GREATEST(0, usage_windows.billable_requests + $4::bigint)",
             &[&bucket_id, &ws, &delta.requests, &delta.billable_requests],
         )
+        .await
         .store()?;
         if !delta.models.is_empty() {
             // TWO statements, both batched over every model, and the split is what makes a
@@ -2068,8 +2182,8 @@ impl PostgresStore {
                 ") AS v(model, di, do_, dcr, dcw) \
                  WHERE u.bucket_id = $1 AND u.window_start = $2 AND u.model = v.model",
             );
-            tx.execute(&ensure, &ensure_params).store()?;
-            tx.execute(&update, &update_params).store()?;
+            tx.execute(&ensure, &ensure_params).await.store()?;
+            tx.execute(&update, &update_params).await.store()?;
 
             // The OPEN unit classes, the same ensure-then-signed-update shape.
             let opens: Vec<(&String, &String, i64)> = delta
@@ -2123,15 +2237,15 @@ impl PostgresStore {
                      WHERE u.bucket_id = $1 AND u.window_start = $2 \
                        AND u.model = v.model AND u.unit = v.unit",
                 );
-                tx.execute(&ensure, &ensure_params).store()?;
-                tx.execute(&update, &update_params).store()?;
+                tx.execute(&ensure, &ensure_params).await.store()?;
+                tx.execute(&update, &update_params).await.store()?;
             }
         }
         Ok(())
     }
 
     /// `add_metering` inside the caller's transaction.
-    pub(crate) fn add_metering_in(
+    pub(crate) async fn add_metering_in(
         tx: &mut Transaction<'_>,
         d: &MeteringDelta,
     ) -> RecordStoreResult<()> {
@@ -2164,7 +2278,7 @@ impl PostgresStore {
                 &d.key_id, &bucket, &d.model, &d.provider, &ti, &to, &tcr, &tcw, &requests,
                 &brequests, &d.key_group_at_use, &d.pricing_version, &priced_from,
             ],
-        )
+        ).await
         .store()?;
         // Every ledgered class the token columns do not hold, additive like them, in the SAME
         // transaction so a metering row never shows its tokens without its other classes.
@@ -2198,7 +2312,7 @@ impl PostgresStore {
                 " ON CONFLICT (key_id, bucket, model, provider, priced_from_ms, unit) DO UPDATE SET \
                  count = usage_metering_units.count + EXCLUDED.count",
             );
-            tx.execute(&sql, &params).store()?;
+            tx.execute(&sql, &params).await.store()?;
         }
         Ok(())
     }
@@ -2206,7 +2320,7 @@ impl PostgresStore {
     /// `append_audit` inside the caller's transaction: `Ok(true)` once the record is stored (or an
     /// identical one already was), `Ok(false)` when the conflicting row vanished before the share
     /// lock held it (the seq is free again: retry in a fresh transaction), `Err` on a fork.
-    pub(crate) fn append_audit_in(
+    pub(crate) async fn append_audit_in(
         tx: &mut Transaction<'_>,
         entry: &AuditRecord,
     ) -> RecordStoreResult<bool> {
@@ -2266,6 +2380,7 @@ impl PostgresStore {
                     &entry.hash,
                 ],
             )
+            .await
             .store()?;
         if inserted == 1 {
             return Ok(true);
@@ -2273,6 +2388,7 @@ impl PostgresStore {
         let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log WHERE seq=$1 FOR SHARE");
         let stored = tx
             .query_opt(&sql, &[&seq])
+            .await
             .store()?
             .map(|r| row_to_audit(&r));
         match stored {
@@ -2290,7 +2406,7 @@ impl PostgresStore {
     /// `append_plane_record` inside the caller's transaction: `Ok(true)` once the record is stored
     /// (or an identical one already was), `Ok(false)` when the conflicting row vanished before the
     /// share lock held it (retry in a fresh transaction), `Err` on a fork.
-    pub(crate) fn append_plane_record_in(
+    pub(crate) async fn append_plane_record_in(
         tx: &mut Transaction<'_>,
         record: &PlaneRecord,
     ) -> RecordStoreResult<bool> {
@@ -2325,6 +2441,7 @@ impl PostgresStore {
                     &record.body,
                 ],
             )
+            .await
             .store()?;
         if inserted == 1 {
             return Ok(true);
@@ -2335,6 +2452,7 @@ impl PostgresStore {
                  WHERE kind=$1 AND parent=$2 AND seq=$3 FOR SHARE",
                 &[&record.kind, &parent, &seq],
             )
+            .await
             .store()?;
         match stored {
             Some(r) => {

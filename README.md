@@ -97,13 +97,18 @@ the engine's JSON config (`{"url": "postgres://..."}`) into a
 
 ### Known limitations (documented honestly, not papered over)
 
-- **No TLS in this build (`NoTls`).** Run the connection over a trusted
-  network segment, a local socket, or a TLS-terminating proxy
-  (pgbouncer/stunnel).
-- **No automatic reconnect.** A persistently dropped connection
-  surfaces as store errors on the write-behind flush path and on admin
-  operations; a permanently broken connection requires a process
-  restart (let your supervisor handle it).
+- **The store opens no socket of its own.** It reaches Postgres through
+  busbar's connector (the store declares one outbound `tcp` need in the
+  `operator-infrastructure` egress class).
+- **One kept connection, as 1.5.x.** The store connects and authenticates
+  once and keeps that connection; operations take turns on it. A
+  connection that fails (or is left inside a transaction) is closed, and
+  the next operation connects afresh rather than needing a restart.
+- **TLS through busbar.** `sslmode=require`, `verify-ca` and
+  `verify-full` secure the connection through busbar's connector and its
+  trust anchors (always verifying the certificate and name); `disable`,
+  `allow` and `prefer` connect in plaintext, as 1.5.x (`NoTls`) did. A Unix-socket `host` is refused: the store
+  reaches its server over TCP.
 
 See the doc comments at the top of
 [`store-postgres/src/lib.rs`](store-postgres/src/lib.rs)
@@ -115,7 +120,7 @@ thin `cdylib` adapter around it.
 
 | Setting | Required | Default | Notes |
 |---|---|---|---|
-| `url` | yes | — | A libpq connection string, e.g. `postgres://user:pass@host:5432/busbar`. Connects `NoTls`; run it over a trusted network segment or a TLS-terminating proxy. **No connect timeout is set by default** — a blackholed host wedges engine boot indefinitely. libpq honors a `connect_timeout` query param in the DSN, e.g. `postgres://user:pass@host:5432/busbar?connect_timeout=10`; set one if boot hanging on a dead host is a concern. |
+| `url` | yes | — | A libpq connection string, URL (`postgres://user:pass@host:5432/busbar?sslmode=require`) or keyword form (`host=... user=... password=... dbname=...`). Connections go through busbar's connector, whose deadlines bound every connect (`connect_timeout` is accepted and ignored). `sslmode=require`/`verify-*` secures the connection through busbar; the other modes are plaintext. |
 
 ## Build
 
