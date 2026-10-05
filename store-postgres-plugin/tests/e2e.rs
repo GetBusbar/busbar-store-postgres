@@ -24,14 +24,14 @@
 //! Persistence is then proven the same two independent ways the prior direct-call test used (kept —
 //! this part was always sound, only the LOADING mechanism was wrong):
 //!   1. The boot runs against a DISPOSABLE, freshly created, genuinely empty database, and is polled
-//!      via a RAW independent `postgres::Client` connection (never `PostgresStore::connect`, so this
+//!      via a RAW independent `postgres::Client` connection (never the store itself, so this
 //!      check can't create the schema itself) for the `keys` table to appear within a timeout. The
 //!      empty database is what makes this a proof rather than a formality: against the shared test
 //!      database, every live unit test in this workspace has already migrated a `keys` table into
 //!      existence, so the same poll would break true on its first iteration even if `busbar` had
 //!      failed to load the plugin and exited immediately. Then the schema VERSION the boot wrote is
 //!      read back, and the child is confirmed still running rather than having died after migrating.
-//!   2. Only AFTER those proofs, a second, independent `PostgresStore::connect` (bypassing the
+//!   2. Only AFTER those proofs, a second, independent open of the LINKED door (bypassing the
 //!      plugin/ABI/loader entirely) confirms the store type itself can talk to the same schema.
 //!
 //! The two ABI-contract error-path tests below (`bad_config_fails_over_abi`, `refuses_non_plugin`)
@@ -43,7 +43,6 @@
 
 mod common;
 
-use busbar_store_postgres::PostgresStore;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -484,7 +483,7 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
 
     // REAL BOOT: run the actual gateway process (no --validate) against the same file-dropped
     // plugin + config, and poll -- via a RAW independent postgres::Client connection, never
-    // PostgresStore::connect, so this check can't accidentally create the schema itself -- for the
+    // the store, so this check can't accidentally create the schema itself -- for the
     // `keys` table to appear. This is the only genuine proof that boot actually dlopened the plugin
     // and called Store::connect (which runs migrate()) before ever handling a request, and it is a
     // proof only because the database above was created empty for this test alone: against the
@@ -541,7 +540,7 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
 
     // The boot did not just create a table, it landed the CURRENT schema: read the version the
     // plugin-loaded migrate() wrote, over a raw client. Checked before the direct connect below,
-    // because `PostgresStore::connect` runs migrate() itself and would write this row if the boot
+    // because the store's connect step runs migrate() itself and would write this row if the boot
     // had not.
     let mut raw = postgres::Client::connect(&url, postgres::NoTls)
         .expect("raw connect to the fresh database");
@@ -562,10 +561,10 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
         guard.output()
     );
 
-    // Only AFTER those proofs: a second, independent PostgresStore::connect (bypassing the
+    // Only AFTER those proofs: a second, independent open of the LINKED door (bypassing the
     // plugin/ABI/loader entirely) confirms the store type itself can talk to the same schema the
     // real boot process just created.
-    let _direct = PostgresStore::connect(&url).expect(
+    let _direct = common::linked(&cfg(&url)).expect(
         "connect directly, bypassing the plugin entirely, to confirm the schema the real boot \
          created is usable",
     );
@@ -642,7 +641,7 @@ fn plane_decode(b: &[u8]) -> serde_json::Value {
 /// cdylib, the real store v3 table, the real `LoadedStore`. It writes AT ARITY > 1 (three chained
 /// records for one principal and one for a second), DROPS the handle — which closes the instance, so
 /// nothing this process still holds can answer the reads — then `dlopen`s AGAIN over the same file
-/// and reads everything back. A third leg reads the same rows through the plain `PostgresStore`,
+/// and reads everything back. A third leg reads the same rows through the linked door,
 /// never touching the cdylib, the door or the loader — so a plugin that answered from its own
 /// in-process cache still fails here.
 #[test]
@@ -660,7 +659,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // assertions below meaningless. A purge at the top of the range is the store's own
     // contract-level wipe, so this needs no raw-SQL knowledge of the schema. No other test in this
     // binary touches the `call` kind.
-    let direct = PostgresStore::connect(&url).expect("connect directly to clean up and verify");
+    let direct = common::linked(&cfg).expect("connect directly to clean up and verify");
     RecordStore::purge_plane_records_before(&direct, "call", i64::MAX as u64)
         .expect("wipe the call log before this run");
 
@@ -800,8 +799,8 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     );
     drop(store);
 
-    // LEG 3 — read the surviving rows through the plain `PostgresStore`, a code path that never
-    // touches the cdylib, the door or the loader.
+    // LEG 3 — read the surviving rows through the LINKED door (`common::linked`), a code path
+    // that never touches the cdylib or its dlopen.
     let direct_calls = chain(&direct, &p_main);
     assert_eq!(
         direct_calls
@@ -828,7 +827,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 ///
 /// A REAL `dlopen`, the real store v3 table, the real `LoadedStore`. Write at arity > 1 (two tasks, one of them
 /// UPSERTED a second time, plus two independent provenance chains), DROP the handle, `dlopen` again
-/// and read everything back; a third leg reads through the plain `PostgresStore`.
+/// and read everything back; a third leg reads through the linked door.
 #[test]
 fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
@@ -842,7 +841,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // Start from no TERMINAL tasks. The task purge is GLOBAL and terminal-only, and its count is
     // asserted exactly below, so a leftover terminal row from an earlier run would make that
     // assertion meaningless. The store's own contract-level sweep of exactly that population.
-    let direct = PostgresStore::connect(&url).expect("connect directly to clean up and verify");
+    let direct = common::linked(&cfg).expect("connect directly to clean up and verify");
     RecordStore::purge_plane_records_before(&direct, "task", i64::MAX as u64)
         .expect("wipe terminal tasks before this run");
 
@@ -1042,7 +1041,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     );
     drop(store);
 
-    // LEG 3 — the surviving rows through the plain `PostgresStore`.
+    // LEG 3 — the surviving rows through the linked door.
     let direct_task = RecordStore::get_plane_record(&direct, "task", &t_live)
         .expect("get_plane_record via the direct connection")
         .expect("the task must be physically present in Postgres, not just cached in-process");
@@ -1075,7 +1074,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 /// written, reported successful and DISCARDED (a restart hands a quarantined upstream the operator's
 /// approval back), and every redeemer of one single-use approval is told the trait default's answer.
 /// Two simultaneous loads are the fleet; a drop and a reload is the restart; a third leg reads
-/// through the plain `PostgresStore`.
+/// through the linked door.
 ///
 /// PANICS rather than skipping when no Postgres is configured: these are the only over-the-ABI
 /// coverage of two properties whose unimplemented form is silently green.
@@ -1201,8 +1200,8 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "a freshly minted approval is not the one that was spent"
     );
 
-    // LEG 3 — the same rows through the plain `PostgresStore`.
-    let direct = PostgresStore::connect(&url).expect("connect directly to verify and clean up");
+    // LEG 3 — the same rows through the linked door.
+    let direct = common::linked(&cfg).expect("connect directly to verify and clean up");
     assert!(
         demotions(&direct)
             .iter()

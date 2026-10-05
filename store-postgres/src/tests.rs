@@ -8,8 +8,11 @@
 use super::*;
 use busbar_contract::records::{
     CredentialMeta, CredentialSecret, ModelTokensDelta, PlaneDisposition, PlaneRecord,
-    PlaneSelector, SecretForm,
+    PlaneSelector, RecordStore, SecretForm,
 };
+
+mod harness;
+pub(crate) use harness::TestStore;
 
 /// One model's ledger row from the four RESERVED token classes (zero classes left out, the way the
 /// store reads them back).
@@ -169,23 +172,19 @@ fn connect_client_with_retry(url: &str) -> postgres::Client {
     panic!("connect (after retries): {:?}", last_err.unwrap());
 }
 
-/// `PostgresStore::connect` with bounded retry-with-backoff. Each connect opens a fresh connection
-/// AND runs `migrate()`, so under the core gate's parallel-test load against a shared Postgres a
-/// single connect can be TRANSIENTLY refused when the server is momentarily at its connection
-/// ceiling (surfacing as `RecordStoreError("db error")` / too-many-clients) -- the exact class of flake
-/// the gate hit on the isolation test's connect. Every live-DB test needs at least this one store
-/// connection, so footprint reduction alone can't harden the primary connect; retrying ~10 times
-/// over a couple of seconds absorbs the transient. Returns the same `RecordStoreResult` `connect` does, so
-/// each caller keeps its own `.expect(...)` message. NOT used where a connect is EXPECTED to fail
-/// (the permission test asserts `.is_err()` directly and must not spin on a genuine, persistent
-/// error).
-fn connect_store_with_retry(url: &str) -> RecordStoreResult<PostgresStore> {
+/// The store under test, opened with bounded retry-with-backoff: through the REAL loader on a
+/// dispatcher, its connections over the host's connection path (the loader's test `TcpConns`), so
+/// every op goes through the door exactly as busbar runs it. Each open runs the connect step (a
+/// connection and `migrate()`), so under parallel-test load against a shared Postgres a single
+/// open can be TRANSIENTLY refused on connection pressure; retrying ~10 times over a couple of
+/// seconds absorbs that. NOT used where an open is EXPECTED to fail.
+fn connect_store_with_retry(url: &str) -> Result<TestStore, String> {
     let mut last_err = None;
     for attempt in 0..10u32 {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(50 * attempt as u64));
         }
-        match PostgresStore::connect(url) {
+        match TestStore::open(url) {
             Ok(store) => return Ok(store),
             Err(e) => last_err = Some(e),
         }
@@ -198,7 +197,7 @@ fn connect_store_with_retry(url: &str) -> RecordStoreResult<PostgresStore> {
 /// re-running the suite (or running it twice in a row) never sees stale state
 /// from a prior run leaking into the CHECK constraints (e.g. re-minting into a row still marked
 /// `deleted_at` from a previous run's tombstone would violate `keys_tombstone_disabled`).
-fn hard_reset(store: &PostgresStore, id: &str) {
+fn hard_reset(store: &TestStore, id: &str) {
     let mut client = store.lock();
     let _ = client.execute("DELETE FROM credentials WHERE key_id=$1", &[&id]);
     let _ = client.execute("DELETE FROM keys WHERE id=$1", &[&id]);
@@ -790,24 +789,22 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
 fn get_usage_transaction_is_actually_repeatable_read() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    // Drive the isolation check through the store's OWN connection -- the exact same client
-    // get_usage uses -- rather than opening a second raw `postgres::Client`. That extra, uncounted
-    // connection was pure connection-footprint overhead here (this assertion never needed a
-    // *separate* connection, only a real one), and under the core gate's parallel-test load against
-    // a shared Postgres its `.connect()` transiently failed on connection pressure -- the observed
-    // flake panicked at this test's connect path (`connect: RecordStoreError("db error")`), never on the
-    // isolation assertion below. Reusing the store's client (extending what b2f3804 did for the
-    // sibling torn-read test) halves this test's connection count and removes the refuse-able
-    // connect, while testing the real helper against a real client just as faithfully. The scope
-    // guard releases the store lock before `get_usage` (which re-locks the same mutex) is called.
+    // The store's connections are its ops' own (one per op, over the host's connector), so the
+    // isolation check runs the helper's exact statement (`pgwire::begin_sql`, the
+    // `IsolationLevel::RepeatableRead` arm `snapshot_consistent_tx` uses) on an independent driver
+    // connection and asks the server what it opened.
     let level: String = {
         let mut client = store.lock();
-        let mut tx = PostgresStore::snapshot_consistent_tx(&mut client).unwrap();
-        let level: String = tx
+        client
+            .batch_execute(crate::pgwire::begin_sql(Some(
+                crate::pgwire::IsolationLevel::RepeatableRead,
+            )))
+            .unwrap();
+        let level: String = client
             .query_one("SHOW transaction_isolation", &[])
             .unwrap()
             .get(0);
-        tx.commit().unwrap();
+        client.batch_execute("COMMIT").unwrap();
         level
     };
     assert_eq!(
@@ -861,7 +858,12 @@ fn get_usage_snapshot_does_not_observe_a_concurrent_add_usage_between_its_two_re
     // test's -- instead its connect is bounded-retried to absorb transient connection-pressure
     // refusals under the gate's parallel load.
     let mut client = connect_client_with_retry(&url);
-    let mut tx = PostgresStore::snapshot_consistent_tx(&mut client).unwrap();
+    // `snapshot_consistent_tx`'s statement, on this independent connection.
+    let mut tx = client
+        .build_transaction()
+        .isolation_level(postgres::IsolationLevel::RepeatableRead)
+        .start()
+        .unwrap();
     let _requests_row = tx
         .query_one(
             "SELECT requests, billable_requests FROM usage_windows WHERE bucket_id=$1 AND window_start=$2",
@@ -984,30 +986,25 @@ fn percent_decode_edge_cases() {
 }
 
 /// `is_undefined_table` must discriminate the ONE SQLSTATE (`42P01`/undefined_table) it exists to
-/// recognize from every other error class -- pinned against two REAL postgres errors (never a
-/// hand-built one, since `postgres::Error` has no public constructor), so neither an inverted
-/// comparison nor an unconditional true/false would pass.
+/// recognize from every other error class, so neither an inverted comparison nor an unconditional
+/// true/false passes. The errors are the store's own driver's server-failure shape (`pgwire`'s
+/// `ErrorResponse` decode), carrying the codes a real server sends for a missing table and for a
+/// syntax error; the permission test below proves the classification against a live server.
 #[test]
 fn is_undefined_table_matches_only_the_real_sqlstate() {
-    let Some(url) = live_url() else { return };
-    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-
-    let missing = client
-        .query_opt(
-            "SELECT 1 FROM spg_this_table_definitely_does_not_exist_xyz",
-            &[],
-        )
-        .unwrap_err();
+    let missing = crate::pgwire::Error::server("42P01", "relation \"x\" does not exist");
     assert!(
         is_undefined_table(&missing),
-        "a query against a genuinely missing table must be classified as undefined_table: {missing}"
+        "a missing table must be classified as undefined_table: {missing}"
     );
-
-    let syntax_err = client.query_opt("SELEC 1", &[]).unwrap_err();
+    let syntax_err = crate::pgwire::Error::server("42601", "syntax error at or near \"SELEC\"");
     assert!(
         !is_undefined_table(&syntax_err),
         "a syntax error must NOT be misclassified as undefined_table: {syntax_err}"
     );
+    assert!(!is_undefined_table(&crate::pgwire::Error::connect(
+        "refused"
+    )));
 }
 
 /// `labels_to_storage`'s serialization -- not just the empty-map default -- must round-trip a
@@ -1942,11 +1939,14 @@ fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() 
             "test setup sanity: the probe query must fail with insufficient_privilege, not \
              undefined_table, for this test to mean anything: {probe_err}"
         );
-        assert!(!is_undefined_table(&probe_err));
+        assert_ne!(
+            probe_err.code(),
+            Some(&postgres::error::SqlState::UNDEFINED_TABLE)
+        );
     }
 
     assert!(
-        PostgresStore::connect(&limited_url).is_err(),
+        TestStore::open(&limited_url).is_err(),
         "migrate must never silently succeed against a role that can't actually read its own \
          bookkeeping table"
     );
@@ -1970,7 +1970,7 @@ mod store_conformance;
 mod conformance {
     use super::plane_records::lock_plane_purge;
     use super::store_conformance as conf;
-    use super::{clamp, connect_store_with_retry, live_url, PostgresStore};
+    use super::{clamp, connect_store_with_retry, live_url, TestStore};
 
     /// A per-process, PER-CHECK namespace. Short enough for every id column in the schema.
     ///
@@ -1984,7 +1984,7 @@ mod conformance {
     /// Delete every row this suite is about to write, so a rerun (or a crashed prior run that left
     /// rows behind) starts from the same state as a first run. Plane rows are matched on the
     /// EXACT `{ns}_` prefix every plane fixture id carries (not `LIKE`, whose `_` is a wildcard).
-    fn reset(store: &PostgresStore, ns: &str, seq: u64) {
+    fn reset(store: &TestStore, ns: &str, seq: u64) {
         let mut client = store.lock();
         for id in conf::key_ids(ns) {
             let _ = client.execute("DELETE FROM credentials WHERE key_id=$1", &[&id]);
@@ -2010,7 +2010,7 @@ mod conformance {
         );
     }
 
-    fn setup(check: &str, seq: u64) -> Option<(PostgresStore, String)> {
+    fn setup(check: &str, seq: u64) -> Option<(TestStore, String)> {
         let url = live_url()?;
         let store = connect_store_with_retry(&url).expect("connect");
         let ns = ns(check);
@@ -2023,7 +2023,7 @@ mod conformance {
         let Some((store, ns)) = setup("put", 0) else {
             return;
         };
-        conf::assert_put_key_does_not_resurrect_a_tombstone(&store, &ns);
+        conf::assert_put_key_does_not_resurrect_a_tombstone(&*store, &ns);
     }
 
     #[test]
@@ -2031,7 +2031,7 @@ mod conformance {
         let Some((store, ns)) = setup("del", 0) else {
             return;
         };
-        conf::assert_delete_key_unknown_id_is_an_error(&store, &ns);
+        conf::assert_delete_key_unknown_id_is_an_error(&*store, &ns);
     }
 
     #[test]
@@ -2039,7 +2039,7 @@ mod conformance {
         let Some((store, ns)) = setup("rev", 0) else {
             return;
         };
-        conf::assert_revoke_credential_unknown_id_is_an_error(&store, &ns);
+        conf::assert_revoke_credential_unknown_id_is_an_error(&*store, &ns);
     }
 
     #[test]
@@ -2047,7 +2047,7 @@ mod conformance {
         let Some((store, ns)) = setup("live", 0) else {
             return;
         };
-        conf::assert_put_credential_requires_a_live_key(&store, &ns);
+        conf::assert_put_credential_requires_a_live_key(&*store, &ns);
     }
 
     #[test]
@@ -2055,7 +2055,7 @@ mod conformance {
         let Some((store, ns)) = setup("atom", 0) else {
             return;
         };
-        conf::assert_put_key_with_credential_is_atomic(&store, &ns);
+        conf::assert_put_key_with_credential_is_atomic(&*store, &ns);
     }
 
     #[test]
@@ -2067,7 +2067,7 @@ mod conformance {
             return;
         };
         let _audit_guard = super::lock_audit_table();
-        conf::assert_append_audit_duplicate_seq(&store, seq);
+        conf::assert_append_audit_duplicate_seq(&*store, seq);
     }
 
     #[test]
@@ -2075,7 +2075,7 @@ mod conformance {
         let Some((store, ns)) = setup("ptask", 0) else {
             return;
         };
-        conf::assert_plane_task_upsert_get_list(&store, &ns);
+        conf::assert_plane_task_upsert_get_list(&*store, &ns);
     }
 
     #[test]
@@ -2083,7 +2083,7 @@ mod conformance {
         let Some((store, ns)) = setup("pchain", 0) else {
             return;
         };
-        conf::assert_plane_event_chain_is_ordered_by_seq(&store, &ns);
+        conf::assert_plane_event_chain_is_ordered_by_seq(&*store, &ns);
     }
 
     #[test]
@@ -2091,7 +2091,7 @@ mod conformance {
         let Some((store, ns)) = setup("pprin", 0) else {
             return;
         };
-        conf::assert_plane_call_parents_enumerated(&store, &ns);
+        conf::assert_plane_call_parents_enumerated(&*store, &ns);
     }
 
     #[test]
@@ -2099,7 +2099,7 @@ mod conformance {
         let Some((store, ns)) = setup("pdem", 0) else {
             return;
         };
-        conf::assert_plane_demotion_upsert_list_delete(&store, &ns);
+        conf::assert_plane_demotion_upsert_list_delete(&*store, &ns);
     }
 
     #[test]
@@ -2110,7 +2110,7 @@ mod conformance {
         // This binary's own purge tests sweep the same kinds with a HIGHER cutoff, which would
         // reach this check's newer-than-cutoff survivor; they hold the same lock.
         let _guard = lock_plane_purge();
-        conf::assert_plane_purge_honours_the_cutoff(&store, &ns);
+        conf::assert_plane_purge_honours_the_cutoff(&*store, &ns);
     }
 
     #[test]
@@ -2119,7 +2119,7 @@ mod conformance {
             return;
         };
         let _guard = lock_plane_purge();
-        conf::assert_plane_purge_task_keeps_active_rows(&store, &ns);
+        conf::assert_plane_purge_task_keeps_active_rows(&*store, &ns);
     }
 
     #[test]
@@ -2127,7 +2127,7 @@ mod conformance {
         let Some((store, ns)) = setup("ptok", 0) else {
             return;
         };
-        conf::assert_plane_token_is_single_use(&store, &ns);
+        conf::assert_plane_token_is_single_use(&*store, &ns);
     }
 }
 
@@ -2236,3 +2236,6 @@ mod v160_shapes;
 
 // ── THE STORE v3 SLOTS (the door's table beyond the 1.5.5 op set) ──────────────────────────────
 mod v3_slots;
+
+// ── TLS through the host (the connector's TLS wrap; ARCHITECT ruling 2026-10-03) ─────────────
+mod tls;

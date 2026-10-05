@@ -17,15 +17,57 @@
 //!   tests use: unset under CI is a FAILURE, unset locally skips only this scenario), one durable
 //!   scenario per door — upsert, point read, a child chain, single-use token redemption, delete.
 //!
-//! RED ARMS, in the same test and always run (no database needed): the library asked for as
+//! RED ARMS, each its own test and always run (no database needed): the library asked for as
 //! `kind: secret` is refused before any slot is called, and DIFFERENT bytes (the cdylib with its
 //! object magic broken) are not the store — so the comparison above cannot pass vacuously.
 
 mod common;
 
+// THE PUBLISHED SUITE (busbar-plugin-loader's `conformance` feature, at the pin): the linked door and
+// the built cdylib, each through the one loader, driven by the store kind's script over the live
+// Postgres `conformance.json` names; exact crossing counts, the two folds equal, its RED arms.
+//
+// Each fold opens over its own schema: conformance.json's url names `search_path={fold}`, and the
+// hooks below create that schema before the fold and drop it after, on an independent connection
+// of the `postgres` driver (the store never creates a schema; nothing in its behaviour changes).
+busbar_plugin_loader::conformance_suite! {
+    door: busbar_store_postgres::door,
+    cdylib: "busbar_store_postgres_plugin",
+    inputs: include_str!("conformance.json"),
+    namespace: (create_fold_schema, drop_fold_schema),
+}
+
+/// The live server a fold's filled settings name, on a connection of the `postgres` driver's own.
+fn fold_client(settings: &[u8]) -> postgres::Client {
+    let v: serde_json::Value =
+        serde_json::from_slice(settings).expect("conformance.json's settings are JSON");
+    let url = v["url"]
+        .as_str()
+        .expect("conformance.json's settings name a url");
+    postgres::Client::connect(url, postgres::NoTls)
+        .expect("the live Postgres accepts the test client")
+}
+
+/// The suite's namespace hook: the fold's schema, made before its open.
+fn create_fold_schema(namespace: &str, settings: &[u8]) {
+    fold_client(settings)
+        .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{namespace}\""))
+        .expect("the fold's schema is created");
+}
+
+/// The suite's namespace hook: the fold's schema and everything the store made in it, dropped after
+/// the fold.
+fn drop_fold_schema(namespace: &str, settings: &[u8]) {
+    fold_client(settings)
+        .batch_execute(&format!("DROP SCHEMA IF EXISTS \"{namespace}\" CASCADE"))
+        .expect("the fold's schema is dropped");
+}
+
 use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
 use busbar_plugin_loader::dispatch::kinds::secret::Secret;
-use busbar_plugin_loader::dispatch::{load_dropped, Bind, DispatchConfig, Dispatcher, NoSink};
+use busbar_plugin_loader::dispatch::{
+    load_dropped, Bind, ConnTable, DispatchConfig, Dispatcher, NoSink,
+};
 use busbar_plugin_loader::store_v3::LoadedStore;
 use std::sync::Arc;
 
@@ -137,30 +179,11 @@ fn transcript(
     })
 }
 
-/// The Postgres store behaves as ONE store through either door — and the RED arms show the
+/// The Postgres store behaves as ONE store through either door; the RED arms below show the
 /// comparison is not vacuous.
 #[test]
 fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
     let live = live_url();
-    let lib = common::cdylib();
-
-    // RED ARM 1 — RUN FIRST: DIFFERENT bytes (the object's magic broken) are not the store. It must
-    // run before ANY good image is loaded from a path the loader may have mapped already.
-    let mut foreign = std::fs::read(&lib).expect("read the cdylib");
-    foreign[..4].copy_from_slice(b"XXXX");
-    let dir = std::env::temp_dir().join(format!("store-postgres-conf-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let broken = dir.join(lib.file_name().unwrap());
-    std::fs::write(&broken, &foreign).unwrap();
-    let red = match common::dropped_at(&broken, "{}") {
-        Ok(_) => panic!("foreign bytes opened as the store"),
-        Err(e) => e,
-    };
-    assert!(
-        !red.contains("requires a \"url\""),
-        "foreign bytes cannot speak the store's own refusal: {red}"
-    );
 
     let linked = transcript("linked", &common::linked, live.as_deref());
     let dropped_in = transcript("dropped", &common::dropped, live.as_deref());
@@ -197,19 +220,46 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
             })
         );
     }
+}
 
-    // RED ARM 2: the store's library asked for as another kind is refused before any slot runs.
+/// RED: DIFFERENT bytes (the object's magic broken) are not the store. The foreign image is
+/// written under its own directory, so the loader `dlopen`s a path no good image was ever loaded
+/// from, whatever order the tests in this target run in.
+#[test]
+fn foreign_bytes_dropped_in_are_not_the_postgres_store() {
+    let lib = common::cdylib();
+    let mut foreign = std::fs::read(&lib).expect("read the cdylib");
+    foreign[..4].copy_from_slice(b"XXXX");
+    let dir = std::env::temp_dir().join(format!("store-postgres-conf-red-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let broken = dir.join(lib.file_name().unwrap());
+    std::fs::write(&broken, &foreign).unwrap();
+    let red = match common::dropped_at(&broken, "{}") {
+        Ok(_) => panic!("foreign bytes opened as the store"),
+        Err(e) => e,
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        !red.contains("requires a \"url\""),
+        "foreign bytes cannot speak the store's own refusal: {red}"
+    );
+}
+
+/// RED: the store's library asked for as another kind is refused before any slot runs.
+#[test]
+fn the_postgres_store_library_loaded_as_another_kind_is_refused() {
+    let lib = common::cdylib();
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let bind = Bind {
         instance: Arc::from("store-postgres-as-secret"),
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: None,
+        conns: ConnTable::Probe,
     };
     assert!(
         load_dropped::<Secret>(&lib, &common::stated(), bind).is_err(),
         "a store library loaded as kind secret"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
