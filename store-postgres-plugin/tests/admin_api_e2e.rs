@@ -6,8 +6,8 @@
 //! real and still kept as its own proof), but the REAL admin HTTP API:
 //!
 //!   1. Boot a real `busbar` process (no `--validate`) with its admin listener up and the compiled-in
-//!      `memory` store active (`store:` block absent — see `busbar`'s own `StoreCfg` doc: "Absent
-//!      block = the compiled-in ephemeral RAM store").
+//!      `memory` store active (`store: {module: memory}`: busbar 1.6.0 requires the block and names
+//!      the RAM store this way).
 //!   2. `POST /api/v1/admin/plugins` with the REAL built cdylib, base64-encoded, guarded by a real
 //!      `x-admin-token` — the exact wire shape `crates/busbar/src/admin/v1/json/handlers.rs`'s
 //!      `install_plugin` and its own admin test (`test_admin_v1_plugin_install_list_reload_remove`
@@ -433,11 +433,15 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         plugins_dir.display()
     );
 
-    // BOOT #1: no `store:` block at all -- the compiled-in `memory` store, per StoreCfg's own doc
-    // ("Absent block = the compiled-in ephemeral RAM store"). The postgres plugin is NOT on disk
-    // yet: this process only exists to serve the admin API that installs it.
+    // BOOT #1: the compiled-in `memory` store (`store: {module: memory}`; busbar 1.6.0 refuses a
+    // config without a `store:` block, BUSBAR-9007). The postgres plugin is NOT on disk yet: this
+    // process only exists to serve the admin API that installs it.
     let config1 = work.join("config1.yaml");
-    std::fs::write(&config1, &providers_and_common).unwrap();
+    std::fs::write(
+        &config1,
+        format!("{providers_and_common}store:\n  module: memory\n"),
+    )
+    .unwrap();
 
     let mut guard1 = spawn_busbar(
         Command::new(&busbar_bin)
