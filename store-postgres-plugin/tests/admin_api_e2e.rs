@@ -277,6 +277,7 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
     ] {
         let status = Command::new("cargo")
             .args(args)
+            .env("BUSBAR_RELEASE_PUBKEY", E2E_RELEASE_PUBKEY)
             .current_dir(&root)
             .status()
             .expect("run cargo build for busbar + busbar-plugin-pack");
@@ -292,6 +293,33 @@ fn build_real_binaries() -> (PathBuf, PathBuf) {
         .unwrap_or_else(|| root.join("target"))
         .join("release");
     (release.join("busbar"), release.join("busbar-plugin-pack"))
+}
+
+/// THE TEST-ONLY FIRST-PARTY KEYPAIR (ed25519, `busbar-plugin-pack keygen`), never the release key.
+/// busbar grants the `operator-infrastructure` egress class this store's `tcp` need declares to a
+/// FIRST-PARTY plugin only (`busbar_plugin_loader::sign::egress_grant`): the busbar built here
+/// embeds the public half (`BUSBAR_RELEASE_PUBKEY`, compile time, as busbar's signing gate builds
+/// it) and the tarball is signed with the private half, so the plugin under test is first-party.
+/// Fixed, so the cached busbar build is reused across runs.
+const E2E_RELEASE_PUBKEY: &str = "9209607c315f66473c8cca8bf9a7b8031115d01bb47341613cebf57f0e4f271c";
+const E2E_RELEASE_PRIVKEY: &str =
+    "290f2453f236650ab21b85a95d49b9dab088518e829e4d524b01e441636ab327";
+
+/// The built busbar's version (`busbar --version`): a first-party plugin below it is refused by
+/// the first-party anti-downgrade floor, so the tarball is packed at exactly this version.
+fn busbar_version(busbar_bin: &std::path::Path) -> String {
+    let out = Command::new(busbar_bin)
+        .arg("--version")
+        .output()
+        .expect("run busbar --version");
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .find_map(|w| {
+            let v = w.trim_start_matches('v');
+            (v.split('.').count() == 3 && v.split('.').all(|p| p.parse::<u64>().is_ok()))
+                .then(|| v.to_owned())
+        })
+        .unwrap_or_else(|| panic!("busbar --version names no version: {text}"))
 }
 
 /// Reserve a free loopback port for the admin listener (bind-then-drop; the standard, small-TOCTOU
@@ -394,7 +422,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             "--kind",
             "store",
             "--version",
-            "0.0.0-e2e",
+            busbar_version(&busbar_bin).as_str(),
             "--publisher",
             "busbar",
             "--description",
@@ -403,8 +431,8 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             "Apache-2.0",
             "--out",
             tarball_path.to_str().unwrap(),
-            "--allow-unsigned",
         ])
+        .env("BUSBAR_SIGN_KEY", E2E_RELEASE_PRIVKEY)
         .status()
         .expect("run busbar-plugin-pack");
     assert!(status.success(), "packing the plugin must succeed");
