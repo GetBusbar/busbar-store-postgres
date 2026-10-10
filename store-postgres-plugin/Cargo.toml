@@ -40,7 +40,7 @@ postgres = { workspace = true }
 # crates/busbar/src/admin/tests/tests.rs uses, minus the async-only features it needs for its
 # in-process axum server.
 reqwest = { workspace = true, features = ["blocking", "json"] }
-base64 = "0.22"
+base64 = { workspace = true }
 # THE SUITE'S HOST CONNECTOR (tests/support/conformance_host.rs, rendered by the fleet template for a
 # repo whose declares state network needs): busbar's connector and its TLS test kit, and the tcp
 # framer the store's need names. Dev-only.
