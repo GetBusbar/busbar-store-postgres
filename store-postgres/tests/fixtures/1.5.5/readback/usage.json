@@ -1,0 +1,60 @@
+{
+  "by_key": [
+    {
+      "id": "vk_4f0b2b4954ccf1f562928c9c9fb06a13",
+      "name": "fixture-grouped",
+      "requests": 3,
+      "spend_micros": 7230000,
+      "tokens_cache_creation": 0,
+      "tokens_cache_read": 4,
+      "tokens_input": 29,
+      "tokens_output": 21
+    },
+    {
+      "id": "vk_72f933cc5b48d4eb4b2bda3d1adbb71a",
+      "name": "fixture-ungrouped",
+      "requests": 2,
+      "spend_micros": 4700000,
+      "tokens_cache_creation": 0,
+      "tokens_cache_read": 4,
+      "tokens_input": 18,
+      "tokens_output": 14
+    }
+  ],
+  "by_key_truncated": false,
+  "by_model": [
+    {
+      "model": "m-cache",
+      "provider": "fixture-openai",
+      "requests": 2,
+      "spend_micros": 4340000,
+      "tokens_cache_creation": 0,
+      "tokens_cache_read": 8,
+      "tokens_input": 14,
+      "tokens_output": 14
+    },
+    {
+      "model": "m-chat",
+      "provider": "fixture-openai",
+      "requests": 3,
+      "spend_micros": 7590000,
+      "tokens_cache_creation": 0,
+      "tokens_cache_read": 0,
+      "tokens_input": 33,
+      "tokens_output": 21
+    }
+  ],
+  "currency": "USD",
+  "total": {
+    "requests": 5,
+    "spend_micros": 11930000,
+    "tokens_cache_creation": 0,
+    "tokens_cache_read": 8,
+    "tokens_input": 47,
+    "tokens_output": 35
+  },
+  "window": {
+    "end": 1792022400,
+    "start": 1791936000
+  }
+}

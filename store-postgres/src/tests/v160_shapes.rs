@@ -714,3 +714,243 @@ fn a_mint_racing_a_delete_never_leaves_a_credential_under_the_tombstone() {
         hard_reset(&setup, &id);
     }
 }
+
+// MIGRATION CONFORMANCE (busbar 1.6.0 #33 / M5): rows the PUBLISHED 1.5.5 binary wrote through the
+// published store-postgres v1.0.6 plugin read back through this build's `migrate`. The fixture in
+// `tests/fixtures/1.5.5/` was RECORDED by busbar's `scripts/store-migration-fixture.sh` driving the
+// v1.5.5 binary and the v1.0.6 plugin against postgres:16@sha256:95206741..., the binary, plugin
+// and image digests and every file's sha256 are in its `MANIFEST.tsv`. `dump.sql` is the whole
+// database as 1.5.5 left it (plain SQL), `rows.json` every table's rows as written.
+const FIXTURE_DUMP_1_5_5: &str = include_str!("../../tests/fixtures/1.5.5/dump.sql");
+const FIXTURE_ROWS_1_5_5: &str = include_str!("../../tests/fixtures/1.5.5/rows.json");
+
+fn fixture_rows(table: &str) -> Vec<serde_json::Value> {
+    let all: serde_json::Value = serde_json::from_str(FIXTURE_ROWS_1_5_5).unwrap();
+    all[table]
+        .as_array()
+        .unwrap_or_else(|| panic!("rows.json has no table {table}"))
+        .clone()
+}
+
+fn fx_u64(row: &serde_json::Value, col: &str) -> u64 {
+    row[col]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{col} is not an unsigned integer in {row}"))
+}
+
+fn fx_str<'a>(row: &'a serde_json::Value, col: &str) -> &'a str {
+    row[col]
+        .as_str()
+        .unwrap_or_else(|| panic!("{col} is not a string in {row}"))
+}
+
+/// A fresh database holding exactly what the 1.5.5 binary left. `dump.sql` is executed whole by
+/// the crate's own postgres client, nothing stripped.
+fn restore_1_5_5(url: &str) -> TempDb {
+    let tmp = TempDb::create(url, "spg_155");
+    let mut c = postgres::Client::connect(&tmp.url(), postgres::NoTls).unwrap();
+    c.batch_execute(FIXTURE_DUMP_1_5_5)
+        .expect("the 1.5.5 dump restores");
+    tmp
+}
+
+fn reserved_units(row: &serde_json::Value) -> BTreeMap<String, u64> {
+    let mut m = BTreeMap::new();
+    for (unit, col) in [
+        (UNIT_INPUT, "tokens_input"),
+        (UNIT_OUTPUT, "tokens_output"),
+        (UNIT_CACHE_READ, "tokens_cache_read"),
+        (UNIT_CACHE_WRITE, "tokens_cache_write"),
+    ] {
+        let v = fx_u64(row, col);
+        if v != 0 {
+            m.insert(unit.to_string(), v);
+        }
+    }
+    m
+}
+
+/// Every row of `rows.json` read back through the 1.6.0 surface, and no extra rows.
+fn assert_1_5_5_rows_read_back(store: &TestStore) {
+    // METERING: every row, per bucket, and nothing else.
+    let metering = fixture_rows("usage_metering");
+    assert!(!metering.is_empty(), "the fixture carries metering rows");
+    let buckets: std::collections::BTreeSet<u64> =
+        metering.iter().map(|r| fx_u64(r, "bucket")).collect();
+    let mut seen = 0;
+    for bucket in &buckets {
+        let got = store.list_metering(*bucket).unwrap();
+        let want: Vec<&serde_json::Value> = metering
+            .iter()
+            .filter(|r| fx_u64(r, "bucket") == *bucket)
+            .collect();
+        assert_eq!(got.len(), want.len(), "metering rows in bucket {bucket}");
+        for w in want {
+            let row = got
+                .iter()
+                .find(|g| {
+                    g.key_id == fx_str(w, "key_id")
+                        && g.model == fx_str(w, "model")
+                        && g.provider == fx_str(w, "provider")
+                })
+                .unwrap_or_else(|| panic!("metering row missing after migrate: {w}"));
+            assert_eq!(row.requests, fx_u64(w, "requests"), "{w}");
+            assert_eq!(row.billable_requests, fx_u64(w, "billable_requests"), "{w}");
+            assert_eq!(row.key_group_at_use, fx_str(w, "key_group_at_use"), "{w}");
+            assert_eq!(row.pricing_version, fx_str(w, "pricing_version"), "{w}");
+            assert_eq!(row.tokens_input, fx_u64(w, "tokens_input"), "{w}");
+            assert_eq!(row.tokens_output, fx_u64(w, "tokens_output"), "{w}");
+            assert_eq!(row.tokens_cache_read, fx_u64(w, "tokens_cache_read"), "{w}");
+            assert_eq!(
+                row.tokens_cache_write,
+                fx_u64(w, "tokens_cache_write"),
+                "{w}"
+            );
+            assert_eq!(row.priced_from_ms, 0, "a 1.5.5 row is undated: {w}");
+            assert!(row.usage_units.is_empty(), "{w}");
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, metering.len());
+
+    // USAGE WINDOWS: the counts, and the ledger's token classes under their unit names.
+    let windows = fixture_rows("usage_windows");
+    assert!(!windows.is_empty(), "the fixture carries usage windows");
+    let ledger = fixture_rows("usage_ledger");
+    for w in &windows {
+        let bucket = fx_str(w, "bucket_id");
+        let start = fx_u64(w, "window_start");
+        let got = store.get_usage(bucket, start).unwrap();
+        assert_eq!(got.requests, fx_u64(w, "requests"), "{w}");
+        assert_eq!(got.billable_requests, fx_u64(w, "billable_requests"), "{w}");
+        let mut want: Vec<ModelTokens> = ledger
+            .iter()
+            .filter(|l| fx_str(l, "bucket_id") == bucket && fx_u64(l, "window_start") == start)
+            .map(|l| ModelTokens {
+                model: fx_str(l, "model").to_string(),
+                usage_units: reserved_units(l),
+            })
+            .collect();
+        let mut have = got.models.clone();
+        want.sort_by(|a, b| a.model.cmp(&b.model));
+        have.sort_by(|a, b| a.model.cmp(&b.model));
+        assert_eq!(have, want, "ledger of {bucket}@{start}");
+    }
+    let ledger_windows: std::collections::BTreeSet<(String, u64)> = ledger
+        .iter()
+        .map(|l| {
+            (
+                fx_str(l, "bucket_id").to_string(),
+                fx_u64(l, "window_start"),
+            )
+        })
+        .collect();
+    for (bucket, start) in ledger_windows {
+        assert!(
+            windows
+                .iter()
+                .any(|w| fx_str(w, "bucket_id") == bucket && fx_u64(w, "window_start") == start),
+            "ledger rows of {bucket}@{start} have a usage_windows row"
+        );
+    }
+
+    // KEYS.
+    let keys = fixture_rows("keys");
+    assert!(!keys.is_empty(), "the fixture carries keys");
+    assert_eq!(store.list_keys().unwrap().len(), keys.len());
+    for k in &keys {
+        let got = store
+            .get_key(fx_str(k, "id"))
+            .unwrap()
+            .unwrap_or_else(|| panic!("key missing after migrate: {k}"));
+        assert_eq!(got.name, fx_str(k, "name"), "{k}");
+        assert_eq!(got.generation_hash, fx_str(k, "generation_hash"), "{k}");
+        assert_eq!(got.enabled, k["enabled"].as_bool().unwrap(), "{k}");
+        assert_eq!(got.group.as_deref(), k["key_group"].as_str(), "{k}");
+        assert_eq!(got.created_at, fx_u64(k, "created_at"), "{k}");
+        assert_eq!(got.revision, fx_u64(k, "revision"), "{k}");
+        assert_eq!(got.expires_at, k["expires_at"].as_u64(), "{k}");
+        assert_eq!(got.deleted_at, k["deleted_at"].as_u64(), "{k}");
+        assert!(k["allowed_pools"].is_null() && got.allowed_scopes.is_none());
+        assert_eq!(
+            (got.idp_subject, got.binding_mode, got.minted_by),
+            (None, None, None),
+            "{k}"
+        );
+    }
+
+    // AUDIT: the hash chain, verbatim and in order.
+    let audit = fixture_rows("audit_log");
+    assert!(!audit.is_empty(), "the fixture carries audit rows");
+    let got = store.list_audit().unwrap();
+    assert_eq!(got.len(), audit.len());
+    for (g, w) in got.iter().zip(&audit) {
+        assert_eq!(g.seq, fx_u64(w, "seq"), "{w}");
+        assert_eq!(g.ts, fx_u64(w, "ts"), "{w}");
+        assert_eq!(g.action, fx_str(w, "action"), "{w}");
+        assert_eq!(g.resource, fx_str(w, "resource"), "{w}");
+        assert_eq!(g.outcome, fx_str(w, "outcome"), "{w}");
+        assert_eq!(g.principal, fx_str(w, "principal"), "{w}");
+        assert_eq!(g.prev_hash, fx_str(w, "prev_hash"), "{w}");
+        assert_eq!(g.hash, fx_str(w, "hash"), "{w}");
+    }
+}
+
+/// Every read the assertions above make, as sorted text, so two opens compare whole.
+fn read_everything_1_5_5(store: &TestStore) -> Vec<String> {
+    let mut out = vec![
+        format!("{:?}", store.list_keys().unwrap()),
+        format!("{:?}", store.list_audit().unwrap()),
+    ];
+    for r in fixture_rows("usage_metering") {
+        out.push(format!(
+            "{:?}",
+            store.list_metering(fx_u64(&r, "bucket")).unwrap()
+        ));
+    }
+    for w in fixture_rows("usage_windows") {
+        out.push(format!(
+            "{:?}",
+            store
+                .get_usage(fx_str(&w, "bucket_id"), fx_u64(&w, "window_start"))
+                .unwrap()
+        ));
+    }
+    out
+}
+
+fn schema_version_of(url: &str) -> i64 {
+    let mut c = postgres::Client::connect(url, postgres::NoTls).unwrap();
+    c.query_one("SELECT MAX(version) FROM busbar_schema", &[])
+        .unwrap()
+        .get(0)
+}
+
+/// Rows written by the 1.5.5 binary read back through this build's migrate, field for field.
+#[test]
+fn the_1_5_5_binarys_rows_read_back_through_migrate() {
+    let Some(url) = live_url() else { return };
+    let tmp = restore_1_5_5(&url);
+    let iso_url = tmp.url();
+    let store = connect_store_with_retry(&iso_url).expect("this build opens the 1.5.5 database");
+    assert_eq!(schema_version_of(&iso_url), SCHEMA_VERSION);
+    assert_1_5_5_rows_read_back(&store);
+}
+
+/// A second open over the migrated 1.5.5 database changes nothing.
+#[test]
+fn migrate_over_the_1_5_5_rows_is_idempotent() {
+    let Some(url) = live_url() else { return };
+    let tmp = restore_1_5_5(&url);
+    let iso_url = tmp.url();
+    let first = {
+        let store = connect_store_with_retry(&iso_url).expect("first open");
+        assert_eq!(schema_version_of(&iso_url), SCHEMA_VERSION);
+        assert_1_5_5_rows_read_back(&store);
+        read_everything_1_5_5(&store)
+    };
+    let store = connect_store_with_retry(&iso_url).expect("second open");
+    assert_eq!(schema_version_of(&iso_url), SCHEMA_VERSION);
+    assert_1_5_5_rows_read_back(&store);
+    assert_eq!(read_everything_1_5_5(&store), first);
+}
