@@ -25,7 +25,7 @@ jobs:
     secrets: inherit
   release:
     needs: ci
-    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@1d111f29049842e66f4ce3419e1219302a249b4f
+    uses: GetBusbar/busbar/.github/workflows/plugin-release.yml@14fe4c7e0da540631fdb6291f6b8c06a55902d66
     with:
       plugin_crate: busbar-store-postgres-plugin
       manifest_name: busbar-store-postgres
@@ -42,7 +42,7 @@ jobs:
   consumer-verify:
     needs: release
     if: ${{ !cancelled() }}
-    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@1d111f29049842e66f4ce3419e1219302a249b4f
+    uses: GetBusbar/busbar/.github/workflows/plugin-consumer-verify.yml@14fe4c7e0da540631fdb6291f6b8c06a55902d66
     with:
       version: ${{ github.ref_name }}
       asset_prefix: busbar-store-postgres
