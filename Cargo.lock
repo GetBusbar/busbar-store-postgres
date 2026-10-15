@@ -210,7 +210,7 @@ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 [[package]]
 name = "busbar-contract"
 version = "1.6.0"
-source = "git+https://www.github.com/GetBusbar/busbar?rev=14fe4c7e0da540631fdb6291f6b8c06a55902d66#14fe4c7e0da540631fdb6291f6b8c06a55902d66"
+source = "git+https://www.github.com/GetBusbar/busbar?rev=179abf2c10cf1406778300ef1f1b3964cc229727#179abf2c10cf1406778300ef1f1b3964cc229727"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -233,8 +233,9 @@ dependencies = [
 [[package]]
 name = "busbar-core-connector"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=14fe4c7e0da540631fdb6291f6b8c06a55902d66#14fe4c7e0da540631fdb6291f6b8c06a55902d66"
+source = "git+https://github.com/GetBusbar/busbar?rev=179abf2c10cf1406778300ef1f1b3964cc229727#179abf2c10cf1406778300ef1f1b3964cc229727"
 dependencies = [
+ "base64 0.22.1",
  "busbar-contract",
  "busbar-kernel",
  "busbar-kernel-egress",
@@ -251,6 +252,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "url",
  "webpki-roots",
  "zeroize",
 ]
@@ -258,7 +260,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=14fe4c7e0da540631fdb6291f6b8c06a55902d66#14fe4c7e0da540631fdb6291f6b8c06a55902d66"
+source = "git+https://github.com/GetBusbar/busbar?rev=179abf2c10cf1406778300ef1f1b3964cc229727#179abf2c10cf1406778300ef1f1b3964cc229727"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -307,7 +309,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-audit"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=14fe4c7e0da540631fdb6291f6b8c06a55902d66#14fe4c7e0da540631fdb6291f6b8c06a55902d66"
+source = "git+https://github.com/GetBusbar/busbar?rev=179abf2c10cf1406778300ef1f1b3964cc229727#179abf2c10cf1406778300ef1f1b3964cc229727"
 dependencies = [
  "busbar-contract",
  "ed25519-dalek",
@@ -318,7 +320,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-breaker"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=14fe4c7e0da540631fdb6291f6b8c06a55902d66#14fe4c7e0da540631fdb6291f6b8c06a55902d66"
+source = "git+https://github.com/GetBusbar/busbar?rev=179abf2c10cf1406778300ef1f1b3964cc229727#179abf2c10cf1406778300ef1f1b3964cc229727"
 dependencies = [
  "busbar-contract",
  "httpdate",
@@ -327,7 +329,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-egress"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=14fe4c7e0da540631fdb6291f6b8c06a55902d66#14fe4c7e0da540631fdb6291f6b8c06a55902d66"
+source = "git+https://github.com/GetBusbar/busbar?rev=179abf2c10cf1406778300ef1f1b3964cc229727#179abf2c10cf1406778300ef1f1b3964cc229727"
 dependencies = [
  "busbar-contract",
  "bytes",
@@ -337,7 +339,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-identity"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=14fe4c7e0da540631fdb6291f6b8c06a55902d66#14fe4c7e0da540631fdb6291f6b8c06a55902d66"
+source = "git+https://github.com/GetBusbar/busbar?rev=179abf2c10cf1406778300ef1f1b3964cc229727#179abf2c10cf1406778300ef1f1b3964cc229727"
 dependencies = [
  "busbar-contract",
  "hex",
@@ -347,7 +349,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-ledger"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=14fe4c7e0da540631fdb6291f6b8c06a55902d66#14fe4c7e0da540631fdb6291f6b8c06a55902d66"
+source = "git+https://github.com/GetBusbar/busbar?rev=179abf2c10cf1406778300ef1f1b3964cc229727#179abf2c10cf1406778300ef1f1b3964cc229727"
 dependencies = [
  "busbar-contract",
  "ring",
@@ -357,7 +359,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-scope"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=14fe4c7e0da540631fdb6291f6b8c06a55902d66#14fe4c7e0da540631fdb6291f6b8c06a55902d66"
+source = "git+https://github.com/GetBusbar/busbar?rev=179abf2c10cf1406778300ef1f1b3964cc229727#179abf2c10cf1406778300ef1f1b3964cc229727"
 dependencies = [
  "busbar-contract",
 ]
@@ -365,7 +367,7 @@ dependencies = [
 [[package]]
 name = "busbar-kernel-wal"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=14fe4c7e0da540631fdb6291f6b8c06a55902d66#14fe4c7e0da540631fdb6291f6b8c06a55902d66"
+source = "git+https://github.com/GetBusbar/busbar?rev=179abf2c10cf1406778300ef1f1b3964cc229727#179abf2c10cf1406778300ef1f1b3964cc229727"
 dependencies = [
  "busbar-contract",
  "ring",
@@ -374,7 +376,7 @@ dependencies = [
 [[package]]
 name = "busbar-plugin-loader"
 version = "1.5.0"
-source = "git+https://github.com/GetBusbar/busbar?rev=14fe4c7e0da540631fdb6291f6b8c06a55902d66#14fe4c7e0da540631fdb6291f6b8c06a55902d66"
+source = "git+https://github.com/GetBusbar/busbar?rev=179abf2c10cf1406778300ef1f1b3964cc229727#179abf2c10cf1406778300ef1f1b3964cc229727"
 dependencies = [
  "base64 0.22.1",
  "busbar-contract",
@@ -430,7 +432,7 @@ dependencies = [
 [[package]]
 name = "busbar-transport-tcp"
 version = "1.6.0"
-source = "git+https://github.com/GetBusbar/busbar-transport-tcp?rev=eb334dd6e9d3dcd62ae1616f77a5ed56311b255a#eb334dd6e9d3dcd62ae1616f77a5ed56311b255a"
+source = "git+https://github.com/GetBusbar/busbar-transport-tcp?rev=9cb4a0dd92a4a03622754a112b74746114e2126a#9cb4a0dd92a4a03622754a112b74746114e2126a"
 dependencies = [
  "busbar-contract",
 ]
@@ -1926,9 +1928,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "once_cell",
  "ring",
