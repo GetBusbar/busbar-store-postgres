@@ -77,7 +77,7 @@ fn ssl_request(tcp: &mut std::net::TcpStream) -> bool {
 
 /// The host the suite binds the store over, with the TLS front its settings name already listening.
 fn host(
-    wake: std::sync::Arc<dyn Fn(u64) + Send + Sync>,
+    wake: busbar_contract::conn::ConnWake,
     anchors: Option<&str>,
 ) -> std::sync::Arc<dyn busbar_contract::conn::DeclaredConns> {
     conformance_host::tls_front(ssl_request, upstream());
