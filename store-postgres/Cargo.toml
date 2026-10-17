@@ -18,10 +18,10 @@ busbar-contract = { workspace = true }
 # store reaches its server only over the host's connector): the message codec, SCRAM-SHA-256 and md5
 # (`postgres-protocol`) and the binary value encodings (`postgres-types`), the same two crates the
 # 1.5.5 `postgres` driver encoded and decoded with, so every parameter and column reads as before.
-postgres-protocol = "0.6"
-postgres-types = "0.2"
+postgres-protocol = { workspace = true }
+postgres-types = { workspace = true }
 bytes = { workspace = true }
-fallible-iterator = "0.2"
+fallible-iterator = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
