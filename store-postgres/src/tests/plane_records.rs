@@ -15,7 +15,7 @@
 
 use super::*;
 
-/// Timestamps are BANDED. `purge_plane_records_before` is GLOBAL per kind and cannot be scoped to a
+/// Timestamps are BANDED. `purge_plane_records` is GLOBAL per kind and cannot be scoped to a
 /// task or a principal, so against the SHARED live database a purge test's cutoff would delete every
 /// other test's old rows if the timestamps overlapped. Everything below the top of this band belongs
 /// to the purge tests (this file's and the conformance suite's, which sweep at 100_000); every other
@@ -314,7 +314,11 @@ fn purge_calls_before_deletes_and_returns_a_real_count() {
 
     assert_eq!(
         store
-            .purge_plane_records_before("call", 1_000_000_200)
+            .purge_plane_records(
+                "call",
+                1_000_000_200,
+                busbar_contract::records::Retention::Age
+            )
             .unwrap(),
         1,
         "exactly the one row strictly older than the cutoff goes, and the count is one performed"
@@ -329,7 +333,11 @@ fn purge_calls_before_deletes_and_returns_a_real_count() {
     );
     assert_eq!(
         store
-            .purge_plane_records_before("call", 1_000_001_000)
+            .purge_plane_records(
+                "call",
+                1_000_001_000,
+                busbar_contract::records::Retention::Age
+            )
             .unwrap(),
         2,
         "the remaining two rows must actually be removed"
@@ -338,7 +346,11 @@ fn purge_calls_before_deletes_and_returns_a_real_count() {
     // A sweep of one kind never reaches another kind's rows.
     assert_eq!(
         store
-            .purge_plane_records_before("no_such_kind", u64::MAX)
+            .purge_plane_records(
+                "no_such_kind",
+                u64::MAX,
+                busbar_contract::records::Retention::Age
+            )
             .unwrap(),
         0
     );
@@ -655,7 +667,11 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
 
     assert_eq!(
         store
-            .purge_plane_records_before("task", 1_000_000_200)
+            .purge_plane_records(
+                "task",
+                1_000_000_200,
+                busbar_contract::records::Retention::TerminalOnly
+            )
             .unwrap(),
         4,
         "only the four TERMINAL rows strictly older than the cutoff go, and the count must be one \
@@ -682,7 +698,11 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     );
     assert_eq!(
         store
-            .purge_plane_records_before("task", 1_000_000_200)
+            .purge_plane_records(
+                "task",
+                1_000_000_200,
+                busbar_contract::records::Retention::TerminalOnly
+            )
             .unwrap(),
         0,
         "re-running the same purge removes nothing"
@@ -722,7 +742,11 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
 
     assert_eq!(
         store
-            .purge_plane_records_before("task", 1_000_000_200)
+            .purge_plane_records(
+                "task",
+                1_000_000_200,
+                busbar_contract::records::Retention::TerminalOnly
+            )
             .unwrap(),
         1,
         "exactly the one terminal task in this band is swept"

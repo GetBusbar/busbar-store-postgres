@@ -688,8 +688,13 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // contract-level wipe, so this needs no raw-SQL knowledge of the schema. No other test in this
     // binary touches the `call` kind.
     let direct = common::linked(&cfg).expect("connect directly to clean up and verify");
-    RecordStore::purge_plane_records_before(&direct, "call", i64::MAX as u64)
-        .expect("wipe the call log before this run");
+    RecordStore::purge_plane_records(
+        &direct,
+        "call",
+        i64::MAX as u64,
+        busbar_contract::records::Retention::Age,
+    )
+    .expect("wipe the call log before this run");
 
     // Per-run principal ids: a read that only THIS run's writes can answer. Two of them, because one
     // principal's chain leaking into another's is a real defect class.
@@ -810,7 +815,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // because a relay that dropped the return value would read as 0 and look like a no-op sweep.
     assert_eq!(
         store
-            .purge_plane_records_before("call", 2_002)
+            .purge_plane_records("call", 2_002, busbar_contract::records::Retention::Age)
             .expect("purge"),
         2,
         "both records at ts 2001 go (one per principal); the one sitting exactly at the cutoff stays"
@@ -840,8 +845,13 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     );
     assert_eq!(direct_calls[1]["hash"], "h3");
 
-    RecordStore::purge_plane_records_before(&direct, "call", i64::MAX as u64)
-        .expect("clean up this run's records");
+    RecordStore::purge_plane_records(
+        &direct,
+        "call",
+        i64::MAX as u64,
+        busbar_contract::records::Retention::Age,
+    )
+    .expect("clean up this run's records");
 }
 
 /// THE DURABILITY PROOF FOR THE `task` / `task_event` PLANE KINDS (the A2A task store), OVER THE REAL
@@ -870,8 +880,13 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // asserted exactly below, so a leftover terminal row from an earlier run would make that
     // assertion meaningless. The store's own contract-level sweep of exactly that population.
     let direct = common::linked(&cfg).expect("connect directly to clean up and verify");
-    RecordStore::purge_plane_records_before(&direct, "task", i64::MAX as u64)
-        .expect("wipe terminal tasks before this run");
+    RecordStore::purge_plane_records(
+        &direct,
+        "task",
+        i64::MAX as u64,
+        busbar_contract::records::Retention::TerminalOnly,
+    )
+    .expect("wipe terminal tasks before this run");
 
     let stamp = format!(
         "{}_{}",
@@ -1049,8 +1064,8 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // Retention crosses the ABI too, COUNT AND ALL.
     assert_eq!(
         store
-            .purge_plane_records_before("task", BASE_TS + 100)
-            .expect("purge_plane_records_before"),
+            .purge_plane_records("task", BASE_TS + 100, busbar_contract::records::Retention::TerminalOnly)
+            .expect("purge_plane_records"),
         1,
         "only the TERMINAL row older than the cutoff goes; an active task is never swept no matter \
          how old"
@@ -1091,8 +1106,13 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         .view(),
     )
     .expect("clean up this run's task");
-    RecordStore::purge_plane_records_before(&direct, "task", i64::MAX as u64)
-        .expect("clean up this run's rows");
+    RecordStore::purge_plane_records(
+        &direct,
+        "task",
+        i64::MAX as u64,
+        busbar_contract::records::Retention::TerminalOnly,
+    )
+    .expect("clean up this run's rows");
 }
 
 /// THE DURABILITY PROOF FOR THE TRUST STATE — the `demotion` kind and the single-use `ask` token

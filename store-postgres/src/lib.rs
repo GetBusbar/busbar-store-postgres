@@ -60,8 +60,8 @@ mod pgwire;
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
     PlaneDisposition, PlaneRecord, PlaneRecordRef, PlaneSelector, RecordStoreError,
-    RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
-    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
+    RecordStoreResult, Retention, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey,
+    UNIT_CACHE_READ, UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use pgwire::{Client, Row, Transaction};
 use postgres_types::ToSql;
@@ -289,13 +289,6 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 /// `money_slices` (`window_caps`, `reserve`, `slice_release`). Nothing existing changes.
 const SCHEMA_VERSION: i64 = 11;
 
-/// The plane-record kinds whose retention is TERMINAL-ONLY: `purge_plane_records_before` drops a row
-/// of one of these kinds only once its `disposition` sidecar says `Terminal`. An interrupted task
-/// waiting on a human is exactly the row that sits still longest, and sweeping it is losing the
-/// work. Every other kind drops any row older than the cutoff — the same split busbar's reference
-/// backends (`store-memory`, `store-example-plugin`) draw.
-const TERMINAL_ONLY_RETENTION_KINDS: [&str; 1] = ["task"];
-
 /// `(parent kind, child kind)`: purging a parent record takes the child CHAIN hanging off it in the
 /// same transaction. A task's event chain has no retention path of its own, so leaving it behind
 /// would let it grow forever under tasks that no longer exist — the cascade busbar's
@@ -464,7 +457,7 @@ CREATE TABLE IF NOT EXISTS plane_records (
     body        BYTEA NOT NULL,
     PRIMARY KEY (kind, id)
 );
--- The retention sweep's access path: purge_plane_records_before filters on (kind, ts).
+-- The retention sweep's access path: purge_plane_records filters on (kind, ts).
 CREATE INDEX IF NOT EXISTS plane_records_kind_ts_idx ON plane_records (kind, ts);
 CREATE INDEX IF NOT EXISTS plane_records_kind_parent_idx ON plane_records (kind, parent);
 
@@ -1820,16 +1813,19 @@ impl Session {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    pub(crate) async fn purge_plane_records_before(
+    pub(crate) async fn purge_plane_records(
         &mut self,
         kind: &str,
         before: u64,
+        retention: Retention,
     ) -> RecordStoreResult<u64> {
         // STRICTLY older than the cutoff: a row exactly at `before` is kept. WHICH rows go is the
-        // kind's own contract, read off the typed `disposition` column and never out of the body —
-        // see TERMINAL_ONLY_RETENTION_KINDS.
+        // rule the host passes, read off the typed `disposition` column and never out of the body:
+        // `TerminalOnly` (the `task` kind's) drops a row only once its `disposition` sidecar says
+        // `Terminal` (an interrupted task waiting on a human is exactly the row that sits still
+        // longest, and sweeping it is losing the work); `Age` drops any row older than the cutoff.
         let cutoff = clamp(before);
-        let terminal_only = TERMINAL_ONLY_RETENTION_KINDS.contains(&kind);
+        let terminal_only = retention == Retention::TerminalOnly;
         let client = self.lock();
         let mut tx = client.transaction().await.store()?;
         let purged: Vec<String> = tx

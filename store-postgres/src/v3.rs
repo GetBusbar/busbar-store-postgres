@@ -43,13 +43,14 @@ use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::sdk::store::wire::{drive_kept, Body};
 use busbar_contract::abi::sdk::store::{
     Cap, CapsRefused, Cell, CellKey, Dimension, Grant, Op, OpRefused, OpResult, ReserveRefused,
-    Scanned, Step, StoreSlots, Tail,
+    Scanned, Step, StoreSlots, Tail, DURABLE_CLAIMED,
 };
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
 use busbar_contract::kinds::{Head, RecordBytes};
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, PlaneRecordRef,
-    PlaneSelector, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
+    PlaneSelector, RecordStoreError, RecordStoreResult, Retention, UsageDelta, UsageLedger,
+    VirtualKey,
 };
 
 use crate::pgwire::Transaction;
@@ -876,7 +877,7 @@ fn dimension_kind(d: &Dimension<'_>) -> Dimension<'static> {
 
 impl StoreSlots for PostgresStore {
     const TAIL: Tail = Tail {
-        ephemeral: false,
+        durable: DURABLE_CLAIMED,
         durable_plane: true,
         fork_refusal: true,
     };
@@ -1367,15 +1368,16 @@ impl StoreSlots for PostgresStore {
             .await)
     }
 
-    fn purge_plane_records_before(
+    fn purge_plane_records(
         &self,
         cx: &mut Op<'_>,
         kind: &str,
         before: u64,
+        retention: Retention,
     ) -> Step<RecordStoreResult<u64>> {
         let kind = kind.to_owned();
         on_conn!(self, cx, RecordStoreError, |s| s
-            .purge_plane_records_before(&kind, before)
+            .purge_plane_records(&kind, before, retention)
             .await)
     }
 
