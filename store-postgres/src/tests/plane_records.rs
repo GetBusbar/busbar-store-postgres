@@ -1100,18 +1100,31 @@ fn redeeming_evicts_entries_whose_token_can_no_longer_be_presented() {
 
 /// REFUSED RATHER THAN CLAMPED: a `now` clamped to `i64::MAX` would sweep the kind's entire ledger
 /// and then report the insert as a first redemption — every spent token reopened at once.
+/// `expires_at` alone saturates: `u64::MAX` is busbar's "never expires" for a minting claim (the
+/// boot's node identity, BUSBAR-9007), compared only by the sweep and never read back, so it is
+/// stored as `i64::MAX` and SPENT by its first redemption.
 #[test]
 fn the_ledger_refuses_values_it_cannot_store_faithfully() {
     let url = require_live_url();
     let nonce = trust_ns("nonce-range");
+    let forever = trust_ns("nonce-forever");
     let srv = trust_ns("srv-range");
     let store = connect_store_with_retry(&url).expect("connect");
-    reset_tokens(&store, "ask", &[&nonce]);
+    reset_tokens(&store, "ask", &[&nonce, &forever]);
     reset(&store, "demotion", &[&srv]);
 
-    store
-        .redeem_plane_token("ask", &nonce, u64::MAX, TRUST_NOW)
-        .expect_err("an unstorable expires_at must be an error, never a silent first redemption");
+    assert!(
+        store
+            .redeem_plane_token("ask", &forever, u64::MAX, TRUST_NOW)
+            .unwrap(),
+        "a never-expiring grant is redeemed once"
+    );
+    assert!(
+        !store
+            .redeem_plane_token("ask", &forever, u64::MAX, TRUST_NOW + 1)
+            .unwrap(),
+        "a never-expiring grant is spent by its first redemption"
+    );
     store
         .redeem_plane_token("ask", &nonce, TRUST_NOW + 900, u64::MAX)
         .expect_err("an unstorable now must be an error");
@@ -1122,7 +1135,7 @@ fn the_ledger_refuses_values_it_cannot_store_faithfully() {
     assert!(store
         .redeem_plane_token("ask", &nonce, i64::MAX as u64, TRUST_NOW)
         .unwrap());
-    reset_tokens(&store, "ask", &[&nonce]);
+    reset_tokens(&store, "ask", &[&nonce, &forever]);
     reset(&store, "demotion", &[&srv]);
 }
 
