@@ -1906,7 +1906,13 @@ impl Session {
         // crate: a `now` clamped to i64::MAX would sweep the kind's ENTIRE ledger below and then
         // report the insert as a first redemption — one out-of-range argument silently reopening
         // every spent token. An error is refused by the engine, so it is the direction to fail in.
-        let expires = as_storable_i64("redeem_plane_token", "expires_at", expires_at)?;
+        // `expires_at` is the ONE argument that saturates: busbar's minting claims (a node's
+        // identity, a keyset period) pass `u64::MAX` for "never expires", and the column is only
+        // ever compared against `now` by the sweep below, never read back, so `i64::MAX` is the
+        // same answer (no `now` this store accepts reaches it) and nothing stored differs from what
+        // was written in any way an observer can see. Refusing it refused the boot's identity claim
+        // (BUSBAR-9007), as it did in store-sqlite (5e6b6b0).
+        let expires = i64::try_from(expires_at).unwrap_or(i64::MAX);
         let cutoff = as_storable_i64("redeem_plane_token", "now", now)?;
         let client = self.lock();
         let mut tx = client.transaction().await.store()?;
