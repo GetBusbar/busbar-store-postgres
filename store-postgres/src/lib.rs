@@ -2492,7 +2492,7 @@ const _: fn() = || {
 // ── THE PLUGIN DOOR ─────────────────────────────────────────────────────────────────────────────
 // One door, both ways in (THE DESIGN §11, DECISIONS #2 rule (1)): `v3` invokes `store_door!` over
 // this store, which expands to `door`. A busbar build that links this crate registers `door` as a
-// compiled-in row (`LinkedRow::of(door)`); the sibling `busbar-store-postgres-plugin` cdylib exports
+// compiled-in row (`LinkedRow::of_loaded(LoadedDoor::from_raw(door))`); the sibling `busbar-store-postgres-plugin` cdylib exports
 // the same `door` as `busbar_plugin_door` for the loader to `dlopen`.
 
 mod v3;
