@@ -455,6 +455,47 @@ fn the_attribution_fields_round_trip_through_every_key_write() {
     hard_reset(&store, b);
 }
 
+/// THE MINTING PROVIDER (Q128 u31, busbar `VirtualKey::idp_provider`): kernel-only provenance
+/// persisted with the row through both write paths. RED before the column existed: the write
+/// dropped it and the key read back `None`. The GREEN twin is the unset key, which reads `None`.
+#[test]
+fn the_minting_provider_persists_through_both_key_writes() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let (a, b, c) = ("vk_prov_put", "vk_prov_mint", "vk_prov_none");
+    for id in [a, b, c] {
+        hard_reset(&store, id);
+    }
+
+    let mut k = sample_key(a);
+    k.idp_provider = Some("okta-prod".into());
+    store.put_key(&k).unwrap();
+    assert_eq!(
+        store.get_key(a).unwrap().unwrap().idp_provider.as_deref(),
+        Some("okta-prod")
+    );
+
+    let mut m = sample_key(b);
+    m.idp_provider = Some("okta-prod".into());
+    store
+        .put_key_with_credential(&m, &sample_cred(b, 0, "AKIA_PROV_MINT"))
+        .unwrap();
+    assert_eq!(
+        store.get_key(b).unwrap().unwrap().idp_provider.as_deref(),
+        Some("okta-prod")
+    );
+
+    store.put_key(&sample_key(c)).unwrap();
+    assert_eq!(store.get_key(c).unwrap().unwrap().idp_provider, None);
+
+    k.idp_provider = None;
+    store.put_key(&k).unwrap();
+    assert_eq!(store.get_key(a).unwrap().unwrap().idp_provider, None);
+    for id in [a, b, c] {
+        hard_reset(&store, id);
+    }
+}
+
 /// The usage ledger is name-keyed (1.6.0 M1b): the four reserved classes AND every open class
 /// round-trip through `put_usage`, accumulate through `add_usage`, and a NEGATIVE delta (a refund)
 /// actually lands — floored at 0, never below it.
