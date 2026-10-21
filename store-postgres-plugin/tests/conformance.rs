@@ -40,8 +40,15 @@ mod common;
 #[path = "support/conformance_host.rs"]
 mod conformance_host;
 
+/// This crate's own door, as the loader names a compiled-in one.
+#[allow(unused_unsafe)]
+fn loaded() -> busbar_plugin_loader::dispatch::LoadedDoor {
+    // SAFETY: `door` is this crate's own `store_door!` entry.
+    unsafe { busbar_plugin_loader::dispatch::LoadedDoor::from_raw(busbar_store_postgres::door) }
+}
+
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_store_postgres::MACRO_DOOR,
+    loaded: loaded(),
     cdylib: "busbar_store_postgres_plugin",
     inputs: include_str!("conformance.json"),
     host: host,
@@ -312,5 +319,16 @@ fn the_postgres_store_library_loaded_as_another_kind_is_refused() {
     assert!(
         load_dropped::<Secret>(&lib, &common::stated(), bind).is_err(),
         "a store library loaded as kind secret"
+    );
+}
+
+#[test]
+fn the_statement_carries_the_declares_document() {
+    let row = busbar_plugin_loader::dispatch::LinkedRow::of_loaded(loaded())
+        .expect("the door states itself");
+    let read = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
+    assert_eq!(
+        busbar_contract::abi::mechanism::extensions::declares(&read.extensions.bytes),
+        Some(&include_bytes!("../../store-postgres/declares.json")[..]),
     );
 }

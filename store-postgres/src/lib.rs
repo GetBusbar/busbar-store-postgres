@@ -555,12 +555,12 @@ ALTER TABLE usage_metering ADD COLUMN IF NOT EXISTS priced_from_ms BIGINT NOT NU
 /// 1.5.x held one), reached over the host's connector, so no socket of the store's own exists and
 /// no op blocks a thread (busbar THE DESIGN, the connections section and the plugin ABI). The
 /// schema is ensured once, by `open`'s connect step.
-pub struct PostgresStore {
+struct PostgresStore {
     shared: std::sync::Arc<Shared>,
 }
 
 /// How many connections an instance keeps: the 1.5.5 store held exactly one.
-pub const KEPT_CONNECTIONS: usize = 1;
+const KEPT_CONNECTIONS: usize = 1;
 
 /// What every op of one instance shares.
 pub(crate) struct Shared {
@@ -2496,10 +2496,10 @@ const _: fn() = || {
 // the same `door` as `busbar_plugin_door` for the loader to `dlopen`.
 
 mod v3;
-pub use v3::{door, MACRO_DOOR};
+pub use v3::door;
 
 /// The package name the door's Statement states for this store.
-pub const NAME: &str = "busbar-store-postgres";
+const NAME: &str = "busbar-store-postgres";
 
 #[cfg(test)]
 mod tests;

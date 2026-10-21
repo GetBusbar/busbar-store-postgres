@@ -14,11 +14,18 @@ use std::sync::Arc;
 
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
-    load_dropped, load_linked, rendering_of_macro, Bind, ConnTable, DispatchConfig, Dispatcher,
-    LinkedRow, NoSink,
+    load_dropped, load_linked, rendering_of_loaded, Bind, ConnTable, DispatchConfig, Dispatcher,
+    LinkedRow, LoadedDoor, NoSink,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
 use busbar_plugin_loader::tcp_conns::TcpConns;
+
+/// This crate's own door, as the loader names a compiled-in one.
+#[allow(unused_unsafe)]
+pub fn loaded() -> LoadedDoor {
+    // SAFETY: `door` is this crate's own `store_door!` entry.
+    unsafe { LoadedDoor::from_raw(busbar_store_postgres::door) }
+}
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
 /// failure, never a skip: the dropped-in door is what these tests prove.
@@ -40,7 +47,7 @@ pub fn cdylib() -> PathBuf {
 /// The Statement rendering the signed manifest states: the linked door's own (the cdylib is the
 /// same crate).
 pub fn stated() -> Vec<u8> {
-    rendering_of_macro(busbar_store_postgres::MACRO_DOOR).expect("the store renders its Statement")
+    rendering_of_loaded(loaded()).expect("the store renders its Statement")
 }
 
 /// A fresh `op_id` for every bridge write: a node half no other open (in this run or an earlier
@@ -78,7 +85,7 @@ fn bind(d: &Dispatcher) -> Bind {
 /// The store through its COMPILED-IN door, opened on `settings`.
 pub fn linked(settings: &str) -> Result<LoadedStore, String> {
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
-    let row = LinkedRow::of_macro(busbar_store_postgres::MACRO_DOOR).map_err(|e| e.to_string())?;
+    let row = LinkedRow::of_loaded(loaded()).map_err(|e| e.to_string())?;
     let p = load_linked::<Store>(&row, bind(&d)).map_err(|e| e.to_string())?;
     LoadedStore::open(p, d, settings.as_bytes(), mint)
 }

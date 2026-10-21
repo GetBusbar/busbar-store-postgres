@@ -76,7 +76,7 @@ pub(crate) fn open_loaded_over(
 ) -> Result<LoadedStore, String> {
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let conns = conns(&d);
-    let row = LinkedRow::of_macro(crate::MACRO_DOOR).map_err(|e| e.to_string())?;
+    let row = LinkedRow::of_macro(crate::v3::MACRO_DOOR).map_err(|e| e.to_string())?;
     let p = load_linked::<Store>(
         &row,
         Bind {
