@@ -209,6 +209,76 @@ fn caps_reserve_and_release_follow_the_1_5_5_rules() {
     ));
 }
 
+/// A RELEASE ON WINDOW 0 IS FINAL (`abi::store::money` slice life (e)): the release takes back
+/// the unspent it names, the slice closes (another release answers 0), and the spent rest stays
+/// counted against the cap. A rolling window keeps the partial-release rule.
+#[test]
+fn a_release_on_window_zero_is_final() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let zero = CellKey {
+        bucket: &ns,
+        pool: None,
+        dimension: Dimension::NanoUnits,
+        window_start: 0,
+    };
+    s.window_caps(
+        op(),
+        &[Cap {
+            key: zero,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("cap pushed");
+    let draw = |amount| [Cell { key: zero, amount }];
+    let g = reserve(&s, op(), &draw(6)).expect("6 of 10");
+    let id = g[0].slice_id;
+    assert_eq!(release(&s, op(), &[(id, 2)]), Ok(vec![2]));
+    assert_eq!(
+        release(&s, op(), &[(id, 4)]),
+        Ok(vec![0]),
+        "a window-0 slice stayed open after its release"
+    );
+    reserve(&s, op(), &draw(6)).expect("the returned 2 are drawable");
+    assert_eq!(
+        reserve(&s, op(), &draw(1)),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "the spent 4 stay counted"
+    );
+
+    // The control: on a rolling window a partial release leaves the rest open.
+    let rolling = requests(&ns);
+    s.window_caps(
+        op(),
+        &[Cap {
+            key: rolling,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("cap pushed");
+    let g = reserve(
+        &s,
+        op(),
+        &[Cell {
+            key: rolling,
+            amount: 6,
+        }],
+    )
+    .expect("draw");
+    assert_eq!(release(&s, op(), &[(g[0].slice_id, 2)]), Ok(vec![2]));
+    assert_eq!(release(&s, op(), &[(g[0].slice_id, 4)]), Ok(vec![4]));
+    // A slice never granted still fails the release.
+    assert!(matches!(
+        release(&s, op(), &[(u64::MAX, 1)]),
+        Err(OpRefused::Failed(_))
+    ));
+}
+
 /// The journal, sessions and kernel-held records.
 #[test]
 fn journal_sessions_and_records_round_trip() {
@@ -270,5 +340,55 @@ fn journal_sessions_and_records_round_trip() {
     assert!(
         s.record_scan(&ns, b"", 0).unwrap().is_empty(),
         "limit 0 is nothing"
+    );
+}
+
+/// AN EMPTY PUT REMOVES THE ROW (slot 40's rule, ARCHITECT 2026-10-21): the host writes every
+/// strike as an empty `record_put` and reads empty as absent, so the row LEAVES the table:
+/// `record_get` answers `None`, `record_scan` never returns it, and the table shrinks. Removing a
+/// row that is not there is `Ok`.
+#[test]
+fn an_empty_put_removes_the_row() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let held = || -> i64 {
+        s.lock()
+            .query_one(
+                "SELECT COUNT(*) FROM store_records WHERE schema_id = $1",
+                &[&ns],
+            )
+            .expect("count")
+            .get(0)
+    };
+    s.record_put(&ns, b"a/1", b"one").unwrap();
+    s.record_put(&ns, b"a/2", b"two").unwrap();
+    assert_eq!(held(), 2);
+
+    s.record_put(&ns, b"a/1", b"").unwrap();
+    assert_eq!(held(), 1, "the struck row left the table");
+    assert!(s.record_get(&ns, b"a/1").unwrap().is_none());
+    let scan: Vec<(Vec<u8>, Vec<u8>)> = s
+        .record_scan(&ns, b"a/", 10)
+        .unwrap()
+        .into_iter()
+        .map(|(k, v)| (k, v.as_slice().to_vec()))
+        .collect();
+    assert_eq!(
+        scan,
+        vec![(b"a/2".to_vec(), b"two".to_vec())],
+        "a scan never returns a struck row"
+    );
+
+    s.record_put(&ns, b"a/9", b"").unwrap();
+    assert_eq!(held(), 1, "a strike of nothing is Ok and changes nothing");
+    s.record_put(&ns, b"a/1", b"again").unwrap();
+    assert_eq!(
+        s.record_get(&ns, b"a/1")
+            .unwrap()
+            .map(|r| r.as_slice().to_vec()),
+        Some(b"again".to_vec())
     );
 }
