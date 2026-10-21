@@ -209,6 +209,68 @@ fn caps_reserve_and_release_follow_the_1_5_5_rules() {
     ));
 }
 
+/// A RELEASE ON WINDOW 0 IS FINAL (`abi::store::money` slice life (e)): the release takes back
+/// the unspent it names, the slice closes (another release answers 0), and the spent rest stays
+/// counted against the cap. A rolling window keeps the partial-release rule.
+#[test]
+fn a_release_on_window_zero_is_final() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let zero = CellKey {
+        bucket: &ns,
+        pool: None,
+        dimension: Dimension::NanoUnits,
+        window_start: 0,
+    };
+    s.window_caps(
+        op(),
+        &[Cap {
+            key: zero,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("cap pushed");
+    let draw = |amount| [Cell { key: zero, amount }];
+    let g = reserve(&s, op(), &draw(6)).expect("6 of 10");
+    let id = g[0].slice_id;
+    assert_eq!(release(&s, op(), &[(id, 2)]), Ok(vec![2]));
+    assert_eq!(
+        release(&s, op(), &[(id, 4)]),
+        Ok(vec![0]),
+        "a window-0 slice stayed open after its release"
+    );
+    reserve(&s, op(), &draw(6)).expect("the returned 2 are drawable");
+    assert_eq!(
+        reserve(&s, op(), &draw(1)),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "the spent 4 stay counted"
+    );
+
+    // The control: on a rolling window a partial release leaves the rest open.
+    let rolling = requests(&ns);
+    s.window_caps(
+        op(),
+        &[Cap {
+            key: rolling,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("cap pushed");
+    let g = reserve(&s, op(), &[Cell { key: rolling, amount: 6 }]).expect("draw");
+    assert_eq!(release(&s, op(), &[(g[0].slice_id, 2)]), Ok(vec![2]));
+    assert_eq!(release(&s, op(), &[(g[0].slice_id, 4)]), Ok(vec![4]));
+    // A slice never granted still fails the release.
+    assert!(matches!(
+        release(&s, op(), &[(u64::MAX, 1)]),
+        Err(OpRefused::Failed(_))
+    ));
+}
+
 /// The journal, sessions and kernel-held records.
 #[test]
 fn journal_sessions_and_records_round_trip() {

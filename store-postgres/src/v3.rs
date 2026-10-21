@@ -673,9 +673,21 @@ impl Session {
                     .await
                     .map_err(|e| OpRefused::Failed(pg(e)))?;
                     let Some(row) = row else {
-                        // An item naming a slice an EARLIER item of this call closed answers 0; any
-                        // other unknown slice fails the whole release.
-                        if seen.contains(&id) {
+                        // An item naming a slice already CLOSED answers 0: one an earlier item of
+                        // this call closed, or one this store issued (its id is within the slice
+                        // sequence) and a release closed before. A slice is deleted when it
+                        // closes, so the sequence is what tells a closed slice from one never
+                        // granted. Any other unknown slice fails the whole release.
+                        let issued = tx
+                            .query_opt(
+                                "SELECT 1 FROM money_slices_slice_id_seq \
+                                 WHERE is_called AND $1 BETWEEN 1 AND last_value",
+                                &[&bits(id)],
+                            )
+                            .await
+                            .map_err(|e| OpRefused::Failed(pg(e)))?
+                            .is_some();
+                        if seen.contains(&id) || issued {
                             back_all.push(0);
                             continue;
                         }
@@ -687,7 +699,15 @@ impl Session {
                     let s: String = row.get(0);
                     let left = unbits(row.get(1));
                     let back = unspent.min(left);
-                    let closed = if left == back {
+                    // A RELEASE ON WINDOW 0 IS FINAL (`abi::store::money` slice life (e)): window 0
+                    // never rolls, so the slice CLOSES now. Its spent rest stays counted against
+                    // the cap, and another release of it answers 0 (above). On a rolling window a
+                    // partial release leaves the rest open.
+                    let window_zero = s
+                        .rsplit_once('|')
+                        .and_then(|(_, w)| w.parse::<u64>().ok())
+                        == Some(0);
+                    let closed = if left == back || window_zero {
                         tx.execute("DELETE FROM money_slices WHERE slice_id = $1", &[&bits(id)])
                             .await
                     } else {
