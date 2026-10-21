@@ -498,12 +498,26 @@ impl Session {
         Ok(sessions)
     }
 
+    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row
+    /// (ARCHITECT 2026-10-21): it is the host's strike, so `record_get` then answers `None` and
+    /// `record_scan` never returns it. Removing a row that is not there is `Ok`.
     async fn v3_record_put(
         &mut self,
         schema: &str,
         key: &[u8],
         value: &[u8],
     ) -> Result<(), String> {
+        if value.is_empty() {
+            return self
+                .lock_client()
+                .execute(
+                    "DELETE FROM store_records WHERE schema_id = $1 AND key = $2",
+                    &[&schema, &key],
+                )
+                .await
+                .map(drop)
+                .map_err(pg);
+        }
         self.lock_client()
             .execute(
                 "INSERT INTO store_records (schema_id, key, value) VALUES ($1, $2, $3)
