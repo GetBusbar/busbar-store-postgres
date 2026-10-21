@@ -846,6 +846,25 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         vec![2, 3],
         "a raw read must find the two call records the purge kept"
     );
+    // One stored body, byte level: the BYTEA column holds exactly the bytes this test wrote, which
+    // decode back to the record the seam carried.
+    let raw_body: Vec<u8> = raw
+        .query_one(
+            "SELECT body FROM plane_chain WHERE kind = 'call' AND parent = $1 AND seq = 3",
+            &[&p_main],
+        )
+        .expect("raw read of one stored body")
+        .get(0);
+    let raw_record = plane_decode(&raw_body);
+    assert_eq!(raw_record["seq"], 3);
+    assert_eq!(raw_record["hash"], "h3");
+    assert_eq!(raw_record["content"]["tool_digest"], "sha256:tool3");
+    assert_eq!(raw_record["content"]["request_id"], "req-3");
+    assert_eq!(
+        raw_body,
+        plane_body(raw_record),
+        "the stored bytes are the serialized body, with nothing added or reordered"
+    );
     let other_rows: i64 = raw
         .query_one(
             "SELECT COUNT(*) FROM plane_chain WHERE kind = 'call' AND parent = $1",
