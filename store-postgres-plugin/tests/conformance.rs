@@ -41,7 +41,7 @@ mod common;
 mod conformance_host;
 
 busbar_plugin_loader::conformance_suite! {
-    door: busbar_store_postgres::door,
+    door: busbar_store_postgres::MACRO_DOOR,
     cdylib: "busbar_store_postgres_plugin",
     inputs: include_str!("conformance.json"),
     host: host,

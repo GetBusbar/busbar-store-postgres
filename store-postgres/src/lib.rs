@@ -2496,7 +2496,7 @@ const _: fn() = || {
 // the same `door` as `busbar_plugin_door` for the loader to `dlopen`.
 
 mod v3;
-pub use v3::door;
+pub use v3::{door, MACRO_DOOR};
 
 /// The package name the door's Statement states for this store.
 pub const NAME: &str = "busbar-store-postgres";
