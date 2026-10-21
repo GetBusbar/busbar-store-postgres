@@ -31,8 +31,10 @@
 //!      existence, so the same poll would break true on its first iteration even if `busbar` had
 //!      failed to load the plugin and exited immediately. Then the schema VERSION the boot wrote is
 //!      read back, and the child is confirmed still running rather than having died after migrating.
-//!   2. Only AFTER those proofs, a second, independent open of the LINKED door (bypassing the
-//!      plugin/ABI/loader entirely) confirms the store type itself can talk to the same schema.
+//!   2. Only AFTER those proofs, a second open of the LINKED door (bypassing the plugin/ABI/loader)
+//!      confirms the store type itself can talk to the same schema. The linked door is the SAME
+//!      code as the plugin under test, so it is not an independent check of it: the raw
+//!      `postgres::Client` reads in leg 1 above, and in the durability tests' final leg, are.
 //!
 //! The two ABI-contract error-path tests below (`bad_config_fails_over_abi`, `refuses_non_plugin`)
 //! are DELIBERATELY left loading the dropped-in door directly (`common::dropped_at`) — they test the loader's own error-surface
@@ -574,9 +576,9 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
         guard.output()
     );
 
-    // Only AFTER those proofs: a second, independent open of the LINKED door (bypassing the
-    // plugin/ABI/loader entirely) confirms the store type itself can talk to the same schema the
-    // real boot process just created.
+    // Only AFTER those proofs: a second open of the LINKED door (bypassing the plugin/ABI/loader;
+    // the same code as the plugin, so not an independent check of it) confirms the store type itself
+    // can talk to the same schema the real boot process just created.
     let _direct = common::linked(&cfg(&url)).expect(
         "connect directly, bypassing the plugin entirely, to confirm the schema the real boot \
          created is usable",
@@ -654,9 +656,10 @@ fn plane_decode(b: &[u8]) -> serde_json::Value {
 /// cdylib, the real store v3 table, the real `LoadedStore`. It writes AT ARITY > 1 (three chained
 /// records for one principal and one for a second), DROPS the handle — which closes the instance, so
 /// nothing this process still holds can answer the reads — then `dlopen`s AGAIN over the same file
-/// and reads everything back. A third leg reads the same rows through the linked door,
-/// never touching the cdylib, the door or the loader — so a plugin that answered from its own
-/// in-process cache still fails here.
+/// and reads everything back. A third leg reads the same rows through the linked door (the same
+/// code as the plugin, so it shows the rows are in Postgres, not that the code is right), and a
+/// fourth reads them with a RAW `postgres::Client`, independent of all of it — so a plugin that
+/// answered from its own in-process cache still fails here.
 #[test]
 fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
@@ -813,7 +816,8 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     drop(store);
 
     // LEG 3 — read the surviving rows through the LINKED door (`common::linked`), a code path
-    // that never touches the cdylib or its dlopen.
+    // that never touches the cdylib or its dlopen. It is the same code as the plugin, so leg 4 is
+    // the read independent of it.
     let direct_calls = chain(&direct, &p_main);
     assert_eq!(
         direct_calls
@@ -824,6 +828,36 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "the records must be physically present in Postgres, not just cached in-process by the plugin"
     );
     assert_eq!(direct_calls[1]["hash"], "h3");
+
+    // LEG 4 — a RAW `postgres::Client`: plain SQL on the table, no store code, no plugin, no ABI.
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls)
+        .expect("a raw connection for the independent read-back");
+    let raw_seqs: Vec<i64> = raw
+        .query(
+            "SELECT seq FROM plane_chain WHERE kind = 'call' AND parent = $1 ORDER BY seq",
+            &[&p_main],
+        )
+        .expect("raw read of the call chain")
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        raw_seqs,
+        vec![2, 3],
+        "a raw read must find the two call records the purge kept"
+    );
+    let other_rows: i64 = raw
+        .query_one(
+            "SELECT COUNT(*) FROM plane_chain WHERE kind = 'call' AND parent = $1",
+            &[&p_other],
+        )
+        .expect("raw count of the swept principal's rows")
+        .get(0);
+    assert_eq!(
+        other_rows, 0,
+        "the sweep emptied the other principal's chain"
+    );
+    drop(raw);
 
     RecordStore::purge_plane_records_before(&direct, "call", i64::MAX as u64)
         .expect("clean up this run's records");
