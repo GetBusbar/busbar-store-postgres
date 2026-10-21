@@ -703,10 +703,8 @@ impl Session {
                     // never rolls, so the slice CLOSES now. Its spent rest stays counted against
                     // the cap, and another release of it answers 0 (above). On a rolling window a
                     // partial release leaves the rest open.
-                    let window_zero = s
-                        .rsplit_once('|')
-                        .and_then(|(_, w)| w.parse::<u64>().ok())
-                        == Some(0);
+                    let window_zero =
+                        s.rsplit_once('|').and_then(|(_, w)| w.parse::<u64>().ok()) == Some(0);
                     let closed = if left == back || window_zero {
                         tx.execute("DELETE FROM money_slices WHERE slice_id = $1", &[&bits(id)])
                             .await

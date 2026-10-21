@@ -261,7 +261,15 @@ fn a_release_on_window_zero_is_final() {
         }],
     )
     .expect("cap pushed");
-    let g = reserve(&s, op(), &[Cell { key: rolling, amount: 6 }]).expect("draw");
+    let g = reserve(
+        &s,
+        op(),
+        &[Cell {
+            key: rolling,
+            amount: 6,
+        }],
+    )
+    .expect("draw");
     assert_eq!(release(&s, op(), &[(g[0].slice_id, 2)]), Ok(vec![2]));
     assert_eq!(release(&s, op(), &[(g[0].slice_id, 4)]), Ok(vec![4]));
     // A slice never granted still fails the release.
