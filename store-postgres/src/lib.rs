@@ -268,7 +268,7 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 ///
 /// v10 (busbar 1.6.0 store interface), an IN-PLACE, ADDITIVE upgrade of a v6 (released 1.5.x)
 /// database — no table is dropped and no existing row changes meaning:
-///   * `keys` gains `idp_subject`/`binding_mode`/`minted_by` (NULL for every pre-existing key, which
+///   * `keys` gains `idp_subject`/`binding_mode`/`minted_by`/`idp_provider` (NULL for every pre-existing key, which
 ///     is exactly what `VirtualKey` reads for a key minted before those fields existed) and
 ///     `allowed_scopes_by_kind`, the non-`pool` scope grants (`mcp_server`, `agent`, …) keyed by
 ///     kind. `allowed_pools` keeps holding the pool grants byte-for-byte as before, so a pool-only
@@ -333,6 +333,7 @@ CREATE TABLE IF NOT EXISTS keys (
     idp_subject     TEXT,
     binding_mode    TEXT,
     minted_by       TEXT,
+    idp_provider    TEXT,
     -- v10: the NON-pool scope grants, a JSON object {kind: [value, ...]}. NULL = none. Pool grants
     -- stay in allowed_pools; NULL in BOTH columns is the omitted-grant wildcard.
     allowed_scopes_by_kind TEXT,
@@ -546,6 +547,7 @@ const MIGRATE_V10_COLUMNS: &str = "
 ALTER TABLE keys ADD COLUMN IF NOT EXISTS idp_subject TEXT;
 ALTER TABLE keys ADD COLUMN IF NOT EXISTS binding_mode TEXT;
 ALTER TABLE keys ADD COLUMN IF NOT EXISTS minted_by TEXT;
+ALTER TABLE keys ADD COLUMN IF NOT EXISTS idp_provider TEXT;
 ALTER TABLE keys ADD COLUMN IF NOT EXISTS allowed_scopes_by_kind TEXT;
 ALTER TABLE usage_metering ADD COLUMN IF NOT EXISTS priced_from_ms BIGINT NOT NULL DEFAULT 0;
 ";
@@ -555,12 +557,12 @@ ALTER TABLE usage_metering ADD COLUMN IF NOT EXISTS priced_from_ms BIGINT NOT NU
 /// 1.5.x held one), reached over the host's connector, so no socket of the store's own exists and
 /// no op blocks a thread (busbar THE DESIGN, the connections section and the plugin ABI). The
 /// schema is ensured once, by `open`'s connect step.
-pub struct PostgresStore {
+struct PostgresStore {
     shared: std::sync::Arc<Shared>,
 }
 
 /// How many connections an instance keeps: the 1.5.5 store held exactly one.
-pub const KEPT_CONNECTIONS: usize = 1;
+const KEPT_CONNECTIONS: usize = 1;
 
 /// What every op of one instance shares.
 pub(crate) struct Shared {
@@ -931,10 +933,11 @@ fn row_to_key(r: &Row) -> VirtualKey {
         idp_subject: r.get(11),
         binding_mode: r.get(12),
         minted_by: r.get(13),
+        idp_provider: r.get(15),
     }
 }
 
-const KEY_COLUMNS: &str = "id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,idp_subject,binding_mode,minted_by,allowed_scopes_by_kind";
+const KEY_COLUMNS: &str = "id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,idp_subject,binding_mode,minted_by,allowed_scopes_by_kind,idp_provider";
 
 fn secret_form_to_storage(f: SecretForm) -> &'static str {
     match f {
@@ -1001,8 +1004,8 @@ impl Session {
         let changed = tx.execute(
             "INSERT INTO keys
                 (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,
-                 idp_subject,binding_mode,minted_by,allowed_scopes_by_kind)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                 idp_subject,binding_mode,minted_by,allowed_scopes_by_kind,idp_provider)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
              ON CONFLICT (id) DO UPDATE SET
                 generation_hash=EXCLUDED.generation_hash, name=EXCLUDED.name,
                 allowed_pools=EXCLUDED.allowed_pools, enabled=EXCLUDED.enabled,
@@ -1010,12 +1013,13 @@ impl Session {
                 expires_at=EXCLUDED.expires_at, deleted_at=EXCLUDED.deleted_at,
                 revision=EXCLUDED.revision, idp_subject=EXCLUDED.idp_subject,
                 binding_mode=EXCLUDED.binding_mode, minted_by=EXCLUDED.minted_by,
-                allowed_scopes_by_kind=EXCLUDED.allowed_scopes_by_kind
+                allowed_scopes_by_kind=EXCLUDED.allowed_scopes_by_kind,
+                idp_provider=EXCLUDED.idp_provider
              WHERE EXCLUDED.deleted_at IS NOT NULL OR keys.deleted_at IS NULL",
             &[
                 &key.id, &key.generation_hash, &key.name, &pools, &key.enabled, &created,
                 &key.group, &labels, &expires, &deleted, &rev, &key.idp_subject,
-                &key.binding_mode, &key.minted_by, &by_kind,
+                &key.binding_mode, &key.minted_by, &by_kind, &key.idp_provider,
             ],
         ).await
         .store()?;
@@ -1492,20 +1496,21 @@ impl Session {
         let changed = tx.execute(
             "INSERT INTO keys
                 (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,
-                 idp_subject,binding_mode,minted_by,allowed_scopes_by_kind)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10,$11,$12,$13,$14)
+                 idp_subject,binding_mode,minted_by,allowed_scopes_by_kind,idp_provider)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10,$11,$12,$13,$14,$15)
              ON CONFLICT (id) DO UPDATE SET
                 generation_hash=EXCLUDED.generation_hash, name=EXCLUDED.name,
                 allowed_pools=EXCLUDED.allowed_pools, enabled=EXCLUDED.enabled,
                 key_group=EXCLUDED.key_group, labels=EXCLUDED.labels,
                 expires_at=EXCLUDED.expires_at, revision=EXCLUDED.revision,
                 idp_subject=EXCLUDED.idp_subject, binding_mode=EXCLUDED.binding_mode,
-                minted_by=EXCLUDED.minted_by, allowed_scopes_by_kind=EXCLUDED.allowed_scopes_by_kind
+                minted_by=EXCLUDED.minted_by, allowed_scopes_by_kind=EXCLUDED.allowed_scopes_by_kind,
+                idp_provider=EXCLUDED.idp_provider
              WHERE keys.deleted_at IS NULL",
             &[
                 &key.id, &key.generation_hash, &key.name, &pools, &key.enabled, &created,
                 &key.group, &labels, &expires, &rev, &key.idp_subject, &key.binding_mode,
-                &key.minted_by, &by_kind,
+                &key.minted_by, &by_kind, &key.idp_provider,
             ],
         ).await
         .store()?;
@@ -2492,14 +2497,14 @@ const _: fn() = || {
 // ── THE PLUGIN DOOR ─────────────────────────────────────────────────────────────────────────────
 // One door, both ways in (THE DESIGN §11, DECISIONS #2 rule (1)): `v3` invokes `store_door!` over
 // this store, which expands to `door`. A busbar build that links this crate registers `door` as a
-// compiled-in row (`LinkedRow::of(door)`); the sibling `busbar-store-postgres-plugin` cdylib exports
+// compiled-in row (`LinkedRow::of_loaded(LoadedDoor::from_raw(door))`); the sibling `busbar-store-postgres-plugin` cdylib exports
 // the same `door` as `busbar_plugin_door` for the loader to `dlopen`.
 
 mod v3;
 pub use v3::door;
 
 /// The package name the door's Statement states for this store.
-pub const NAME: &str = "busbar-store-postgres";
+const NAME: &str = "busbar-store-postgres";
 
 #[cfg(test)]
 mod tests;

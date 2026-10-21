@@ -37,7 +37,7 @@ use std::sync::atomic::Ordering;
 use busbar_contract::abi::host::conn::connector::{
     Need, DIRECTION_OUTBOUND, EGRESS_OPERATOR_INFRASTRUCTURE, KEEP_NAMED,
 };
-use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_OCTETS};
+use busbar_contract::abi::mechanism::call::{Blob, BLOB_OCTETS};
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::sdk::store::wire::{drive_kept, Body};
@@ -55,42 +55,35 @@ use busbar_contract::records::{
 use crate::pgwire::Transaction;
 use crate::{now_secs, render_pg_error, PostgresStore, Session, NAME};
 
-const NO_TEXT: AbiStr = AbiStr {
-    ptr: std::ptr::null(),
-    len: 0,
-};
-
 /// THE STORE'S ONE NEED: the server, dialled over `tcp` at the DSN's `host:port` (the store names
 /// the target per connection), in the `operator-infrastructure` egress class (private, loopback and
 /// plaintext allowed; pinned; cloud metadata hosts refused).
-pub const NEEDS: &[Need] = &[Need {
-    direction: DIRECTION_OUTBOUND,
-    egress_class: EGRESS_OPERATOR_INFRASTRUCTURE,
-    transport: abi_str("tcp"),
-    auth: NO_TEXT,
-    target_from: NO_TEXT,
-    trust_from: NO_TEXT,
-    details: Blob {
-        ptr: std::ptr::null(),
-        len: 0,
-        fmt: BLOB_OCTETS,
-        flags: 0,
-    },
-    keep_response_headers: std::ptr::null(),
-    keep_response_headers_len: 0,
-    timeout_ms: 0,
-    keep_mode: KEEP_NAMED,
-    _reserved: 0,
-    deny_response_headers: std::ptr::null(),
-    deny_response_headers_len: 0,
+pub const NEEDS: &[Need] = &[{
+    let mut n = Need::EMPTY;
+    n.direction = DIRECTION_OUTBOUND;
+    n.egress_class = EGRESS_OPERATOR_INFRASTRUCTURE;
+    n.transport = abi_str("tcp");
+    n.details = Blob::ABSENT.with_fmt(BLOB_OCTETS);
+    n.timeout_ms = 0;
+    n.keep_mode = KEEP_NAMED;
+    n
 }];
+
+busbar_contract::statement_extensions!(
+    /// The Statement's extensions: this plugin's whole `declares` document (BUSBAR-1.6.0.md l.246).
+    EXTENSIONS: [(
+        busbar_contract::abi::mechanism::extensions::EXT_DECLARES,
+        include_bytes!("../declares.json")
+    )]
+);
 
 busbar_contract::store_door!(
     PostgresStore,
     NAME,
     env!("CARGO_PKG_VERSION"),
     64,
-    needs: NEEDS
+    needs: NEEDS,
+    extensions: EXTENSIONS
 );
 
 /// RUN ONE OP on the instance's kept connection (a fresh one when none is kept): open the session
