@@ -37,7 +37,7 @@ use std::sync::atomic::Ordering;
 use busbar_contract::abi::host::conn::connector::{
     Need, DIRECTION_OUTBOUND, EGRESS_OPERATOR_INFRASTRUCTURE, KEEP_NAMED,
 };
-use busbar_contract::abi::mechanism::call::BLOB_OCTETS;
+use busbar_contract::abi::mechanism::call::{Blob, BLOB_OCTETS};
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::sdk::store::wire::{drive_kept, Body};
