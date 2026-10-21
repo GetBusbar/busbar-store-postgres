@@ -681,7 +681,7 @@ impl Session {
                         let issued = tx
                             .query_opt(
                                 "SELECT 1 FROM money_slices_slice_id_seq \
-                                 WHERE is_called AND $1 BETWEEN 1 AND last_value",
+                                 WHERE is_called AND $1::int8 BETWEEN 1 AND last_value",
                                 &[&bits(id)],
                             )
                             .await
