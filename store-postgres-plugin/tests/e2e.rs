@@ -862,8 +862,8 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     assert_eq!(raw_record["content"]["request_id"], "req-3");
     assert_eq!(
         raw_body,
-        plane_body(raw_record),
-        "the stored bytes are the serialized body, with nothing added or reordered"
+        call(&p_main, 3, "h2", "h3").body,
+        "the stored bytes are exactly the body this test built for that record"
     );
     let other_rows: i64 = raw
         .query_one(
