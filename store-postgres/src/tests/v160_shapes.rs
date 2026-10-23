@@ -455,6 +455,21 @@ fn the_attribution_fields_round_trip_through_every_key_write() {
     hard_reset(&store, b);
 }
 
+/// `idp_provider` is persisted with the row and read back.
+#[test]
+fn idp_provider_round_trips() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let id = "vk_idp_provider";
+    hard_reset(&store, id);
+    let mut k = sample_key(id);
+    k.idp_provider = Some("github".into());
+    store.put_key(&k).unwrap();
+    let back = store.get_key(id).unwrap().unwrap();
+    assert_eq!(back.idp_provider.as_deref(), Some("github"));
+    hard_reset(&store, id);
+}
+
 /// The usage ledger is name-keyed (1.6.0 M1b): the four reserved classes AND every open class
 /// round-trip through `put_usage`, accumulate through `add_usage`, and a NEGATIVE delta (a refund)
 /// actually lands — floored at 0, never below it.
