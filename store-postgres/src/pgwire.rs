@@ -46,6 +46,9 @@ pub enum SslMode {
 pub struct Config {
     pub host: String,
     pub port: u16,
+    /// The endpoints after the first, in order (libpq's multi-host list): a connect the first
+    /// refuses tries each in turn.
+    pub more: Vec<(String, u16)>,
     pub user: String,
     pub password: Option<String>,
     pub dbname: Option<String>,
@@ -104,25 +107,29 @@ impl Config {
                 }
             }
             if !hostport.is_empty() {
-                if hostport.contains(',') {
-                    return Err(config_err("multiple hosts are not supported"));
+                // libpq's multi-host list, `host1:port1,host2:port2`, kept as its keyword form's
+                // comma lists (`host=a,b port=1,2`) for the option loop below.
+                let (mut hosts, mut ports) = (Vec::new(), Vec::new());
+                for one in hostport.split(',') {
+                    let (host, port) = if let Some(v6) = one.strip_prefix('[') {
+                        match v6.split_once(']') {
+                            Some((h, rest)) => (h.to_string(), rest.strip_prefix(':')),
+                            None => return Err(config_err("unterminated IPv6 host")),
+                        }
+                    } else {
+                        match one.rsplit_once(':') {
+                            Some((h, p)) => (h.to_string(), Some(p)),
+                            None => (one.to_string(), None),
+                        }
+                    };
+                    hosts.push(decode(&host)?);
+                    ports.push(port.unwrap_or("").to_string());
                 }
-                let (host, port) = if let Some(v6) = hostport.strip_prefix('[') {
-                    match v6.split_once(']') {
-                        Some((h, rest)) => (h.to_string(), rest.strip_prefix(':')),
-                        None => return Err(config_err("unterminated IPv6 host")),
-                    }
-                } else {
-                    match hostport.rsplit_once(':') {
-                        Some((h, p)) => (h.to_string(), Some(p)),
-                        None => (hostport.to_string(), None),
-                    }
-                };
-                if !host.is_empty() {
-                    pairs.push(("host".into(), decode(&host)?));
+                if hosts.iter().any(|h| !h.is_empty()) {
+                    pairs.push(("host".into(), hosts.join(",")));
                 }
-                if let Some(p) = port.filter(|p| !p.is_empty()) {
-                    pairs.push(("port".into(), p.to_string()));
+                if ports.iter().any(|p| !p.is_empty()) {
+                    pairs.push(("port".into(), ports.join(",")));
                 }
             }
             if let Some(db) = path.filter(|p| !p.is_empty()) {
@@ -142,6 +149,7 @@ impl Config {
         let mut c = Config {
             host: String::new(),
             port: 5432,
+            more: Vec::new(),
             user: String::new(),
             password: None,
             dbname: None,
@@ -149,14 +157,11 @@ impl Config {
             options: None,
             ssl: SslMode::Plain,
         };
+        let (mut hosts, mut ports) = (String::new(), String::new());
         for (k, v) in pairs {
             match k.as_str() {
-                "host" | "hostaddr" => c.host = v,
-                "port" => {
-                    c.port = v
-                        .parse()
-                        .map_err(|_| config_err("invalid value for option `port`"))?;
-                }
+                "host" | "hostaddr" => hosts = v,
+                "port" => ports = v,
                 "user" => c.user = v,
                 "password" => c.password = Some(v),
                 "dbname" => c.dbname = Some(v),
@@ -187,10 +192,15 @@ impl Config {
                 _ => return Err(config_err(format!("unknown option `{k}`"))),
             }
         }
-        if c.host.is_empty() {
-            c.host = "localhost".into();
-        }
-        if c.host.starts_with('/') {
+        let mut endpoints = endpoints(&hosts, &ports)?.into_iter();
+        (c.host, c.port) = endpoints
+            .next()
+            .unwrap_or_else(|| ("localhost".into(), 5432));
+        c.more = endpoints.collect();
+        if std::iter::once(&c.host)
+            .chain(c.more.iter().map(|(h, _)| h))
+            .any(|h| h.starts_with('/'))
+        {
             return Err(config_err(
                 "a Unix-socket host is not supported: the store reaches its server over TCP",
             ));
@@ -201,15 +211,57 @@ impl Config {
         Ok(c)
     }
 
-    /// The `host:port` the store's need dials.
+    /// Every endpoint, in the order a connect tries them: `(host, host:port)`.
     #[must_use]
-    pub fn target(&self) -> String {
-        if self.host.contains(':') {
-            format!("[{}]:{}", self.host, self.port)
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
+    pub fn targets(&self) -> Vec<(&str, String)> {
+        std::iter::once((self.host.as_str(), self.port))
+            .chain(self.more.iter().map(|(h, p)| (h.as_str(), *p)))
+            .map(|(h, p)| (h, target(h, p)))
+            .collect()
     }
+}
+
+fn target(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// libpq's host and port lists, paired: one port for every host, or one port (or none, 5432) for
+/// them all. An empty host is `localhost`, an empty port 5432.
+fn endpoints(hosts: &str, ports: &str) -> Result<Vec<(String, u16)>, Error> {
+    let hosts: Vec<&str> = hosts.split(',').collect();
+    let ports = ports
+        .split(',')
+        .map(|p| {
+            if p.is_empty() {
+                Ok(5432)
+            } else {
+                p.parse()
+                    .map_err(|_| config_err("invalid value for option `port`"))
+            }
+        })
+        .collect::<Result<Vec<u16>, Error>>()?;
+    if ports.len() != 1 && ports.len() != hosts.len() {
+        return Err(config_err(format!(
+            "could not match {} port numbers to {} hosts",
+            ports.len(),
+            hosts.len()
+        )));
+    }
+    Ok(hosts
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let host = if h.is_empty() { "localhost" } else { h };
+            (
+                host.to_string(),
+                ports[if ports.len() == 1 { 0 } else { i }],
+            )
+        })
+        .collect())
 }
 
 fn decode(s: &str) -> Result<String, Error> {
@@ -577,9 +629,25 @@ impl Client {
     /// # Errors
     /// The connector's failure (as a connect error), a TLS refusal, or the server's refusal.
     pub async fn connect(wire: Wire, cfg: &Config) -> Result<Client, Error> {
-        wire.connect(0, Some(&cfg.target()))
-            .await
-            .map_err(Error::connect)?;
+        // libpq's endpoint list: open; on a refusal close and try the next, in order.
+        let mut host = cfg.host.as_str();
+        let mut failed = None;
+        for (h, target) in cfg.targets() {
+            match wire.connect(0, Some(&target)).await {
+                Ok(()) => {
+                    host = h;
+                    failed = None;
+                    break;
+                }
+                Err(e) => {
+                    wire.close().await;
+                    failed = Some(e);
+                }
+            }
+        }
+        if let Some(e) = failed {
+            return Err(Error::connect(e));
+        }
         let reused = wire.reused();
         let mut c = Client {
             wire,
@@ -605,7 +673,7 @@ impl Client {
                 )));
             }
             c.wire
-                .upgrade_secure(Some(&cfg.host))
+                .upgrade_secure(Some(host))
                 .await
                 .map_err(|e| Error::new(Kind_::Tls(e.to_string())))?;
         }
@@ -1129,12 +1197,12 @@ mod tests {
         .unwrap();
         assert_eq!(c.user, "u@x");
         assert_eq!(c.password.as_deref(), Some("p:ss"));
-        assert_eq!(c.target(), "db.internal:6543");
+        assert_eq!(c.targets()[0].1, "db.internal:6543");
         assert_eq!(c.dbname.as_deref(), Some("busbar"));
         assert_eq!(c.ssl, SslMode::Require);
         assert_eq!(c.application_name.as_deref(), Some("bb"));
         let c = Config::parse("postgresql://u@[::1]/d").unwrap();
-        assert_eq!(c.target(), "[::1]:5432");
+        assert_eq!(c.targets()[0].1, "[::1]:5432");
         assert_eq!(c.password, None);
     }
 
@@ -1143,7 +1211,7 @@ mod tests {
         let c =
             Config::parse("host = db port=5433 user=u password='se cret' dbname=x sslmode=prefer")
                 .unwrap();
-        assert_eq!(c.target(), "db:5433");
+        assert_eq!(c.targets()[0].1, "db:5433");
         assert_eq!(c.password.as_deref(), Some("se cret"));
         assert_eq!(c.ssl, SslMode::Plain);
     }
@@ -1154,7 +1222,22 @@ mod tests {
         assert!(Config::parse("host=db").is_err(), "no user");
         assert!(Config::parse("host=db user=u bogus=1").is_err());
         assert!(Config::parse("host=db user=u sslmode=sometimes").is_err());
-        assert!(Config::parse("postgres://u@a,b/d").is_err());
+        assert!(Config::parse("host=a,b port=1,2,3 user=u").is_err());
+    }
+
+    /// libpq's MULTI-HOST list (busbar oracle store.boot|postgres|multi-host): every endpoint, in
+    /// order, each with its own port or the one shared; a connect the first refuses tries the next.
+    /// RED before: "multiple hosts are not supported".
+    #[test]
+    fn a_multi_host_list_names_every_endpoint_in_order() {
+        let c = Config::parse("postgres://u:p@127.0.0.1:1,db:5433,[::1]/d").unwrap();
+        let t: Vec<String> = c.targets().into_iter().map(|(_, t)| t).collect();
+        assert_eq!(t, ["127.0.0.1:1", "db:5433", "[::1]:5432"]);
+        let c = Config::parse("host=a,b port=6000 user=u").unwrap();
+        let t: Vec<String> = c.targets().into_iter().map(|(_, t)| t).collect();
+        assert_eq!(t, ["a:6000", "b:6000"]);
+        let c = Config::parse("host=a,b port=1,2 user=u").unwrap();
+        assert_eq!(c.targets()[1], ("b", "b:2".to_string()));
     }
 
     #[test]
