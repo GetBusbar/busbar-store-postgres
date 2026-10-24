@@ -209,6 +209,74 @@ fn caps_reserve_and_release_follow_the_1_5_5_rules() {
     ));
 }
 
+/// RED before slice life (e): a release on window 0 is final. The holder of a 6-unit window-0 slice
+/// spent 4 and hands back 2; the slice closes, so a second release returns 0, the 4 spent stay
+/// counted (6 more fill the cap of 10) and nothing past the cap is granted. A slice on a rolling
+/// window keeps the partial-release rule: what it still holds can be handed back later.
+#[test]
+fn a_release_on_window_0_is_final() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let zero = CellKey {
+        bucket: &ns,
+        pool: None,
+        dimension: Dimension::NanoUnits,
+        window_start: 0,
+    };
+    s.window_caps(
+        op(),
+        &[Cap {
+            key: zero,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("the window-0 cap is pushed");
+    let draw = |amount: u64| reserve(&s, op(), &[Cell { key: zero, amount }]);
+    let g = draw(6).expect("a window-0 draw within its cap")[0];
+    assert_eq!(release(&s, op(), &[(g.slice_id, 2)]), Ok(vec![2]));
+    assert_eq!(
+        release(&s, op(), &[(g.slice_id, 4)]),
+        Ok(vec![0]),
+        "a window-0 slice stayed open after its release"
+    );
+    assert_eq!(draw(6).expect("the returned 2 are drawable")[0].granted, 6);
+    assert_eq!(
+        draw(1),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "the spent part of a released window-0 slice was not counted"
+    );
+
+    let rolling = requests(&ns);
+    s.window_caps(
+        op(),
+        &[Cap {
+            key: rolling,
+            cap: 10,
+            config_gen: 1,
+        }],
+    )
+    .expect("the rolling cap is pushed");
+    let g = reserve(
+        &s,
+        op(),
+        &[Cell {
+            key: rolling,
+            amount: 6,
+        }],
+    )
+    .expect("a rolling draw")[0];
+    assert_eq!(release(&s, op(), &[(g.slice_id, 2)]), Ok(vec![2]));
+    assert_eq!(
+        release(&s, op(), &[(g.slice_id, 4)]),
+        Ok(vec![4]),
+        "a rolling-window slice keeps what it still holds for a later release"
+    );
+}
+
 /// The journal, sessions and kernel-held records.
 #[test]
 fn journal_sessions_and_records_round_trip() {
