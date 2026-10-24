@@ -673,7 +673,20 @@ impl Session {
                     let s: String = row.get(0);
                     let left = unbits(row.get(1));
                     let back = unspent.min(left);
-                    let closed = if left == back {
+                    // A slice on window 0 closes at its first release whatever it still holds
+                    // (`abi::store` slice life (e), a release on window 0 is final): window 0 never
+                    // rolls, so left open the slice would outlive its holder. The slot key ends in
+                    // `|<window_start>`; digits hold no `|`, so the last field is unambiguous. The
+                    // closed slice stays as a row with nothing left (no migration, no closed-set
+                    // table), so another release of it answers 0 rather than "not held".
+                    let on_window_0 = s.rsplit('|').next() == Some("0");
+                    let closed = if on_window_0 {
+                        tx.execute(
+                            "UPDATE money_slices SET remaining = 0 WHERE slice_id = $1",
+                            &[&bits(id)],
+                        )
+                        .await
+                    } else if left == back {
                         tx.execute("DELETE FROM money_slices WHERE slice_id = $1", &[&bits(id)])
                             .await
                     } else {
