@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "busbar-store-postgres"
-version = "1.0.0"
+version = "1.6.0"
 dependencies = [
  "busbar-contract",
  "busbar-plugin-loader",
@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "busbar-store-postgres-plugin"
-version = "1.0.0"
+version = "1.6.0"
 dependencies = [
  "base64 0.22.1",
  "busbar-contract",
