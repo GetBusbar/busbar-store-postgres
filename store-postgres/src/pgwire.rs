@@ -201,7 +201,16 @@ impl Config {
                 "options" => c.options = Some(v),
                 "sslmode" => {
                     c.ssl = match v.as_str() {
-                        "disable" | "allow" | "prefer" => SslMode::Plain,
+                        "disable" => SslMode::Plain,
+                        // Refused rather than downgraded: these would try TLS or fall back to
+                        // plaintext silently, and the operator asked for neither outcome by name.
+                        m @ ("allow" | "prefer") => {
+                            return Err(config_err(format!(
+                                "sslmode={m} is not supported: this store never falls back \
+                                 silently; use require/verify-ca/verify-full for TLS or disable \
+                                 for plaintext"
+                            )));
+                        }
                         "require" | "verify-ca" | "verify-full" => SslMode::Require,
                         _ => {
                             return Err(config_err("invalid value for option `sslmode`"));
@@ -213,7 +222,12 @@ impl Config {
                 "connect_timeout" => {
                     let secs: i64 = v
                         .parse()
-                        .map_err(|_| config_err("invalid value for option `connect_timeout`"))?;
+                        .map_err(|_| {
+                        config_err(
+                            "invalid value for option `connect_timeout` (a whole number of \
+                             seconds; 0 or less means no bound)",
+                        )
+                    })?;
                     c.connect_timeout_ms = (secs > 0)
                         .then(|| u32::try_from(secs.saturating_mul(1000)).unwrap_or(u32::MAX));
                 }
@@ -252,15 +266,21 @@ impl Config {
                          busbar's trust anchors, not a per-store root certificate",
                     ));
                 }
-                // Accepted and served by the host instead: its connector keeps the connection and
-                // its sockets.
+                // Refused rather than ignored: the host's connector keeps the connection and its
+                // sockets, so a per-store socket or balancing option could never apply.
                 "keepalives"
                 | "keepalives_idle"
+                | "keepalives_interval"
+                | "keepalives_count"
+                | "keepalives_retries"
                 | "load_balance_hosts"
                 | "tcp_user_timeout"
-                | "keepalives_interval"
-                | "keepalives_retries"
-                | "sslnegotiation" => {}
+                | "sslnegotiation" => {
+                    return Err(config_err(format!(
+                        "{k} is not supported by this store: the host's connector owns the \
+                         connection and its sockets, so this option could never apply"
+                    )));
+                }
                 _ if has_password => {
                     return Err(config_err(
                         "unknown option (its name is withheld: the connection string carries a \
@@ -1397,11 +1417,11 @@ mod tests {
     #[test]
     fn the_keyword_form_parses_with_spaces_and_quotes() {
         let c =
-            Config::parse("host = db port=5433 user=u password='se cret' dbname=x sslmode=prefer")
+            Config::parse("host = db port=5433 user=u password='se cret' dbname=x sslmode=require")
                 .unwrap();
         assert_eq!(c.targets()[0].1, "db:5433");
         assert_eq!(c.password.as_deref(), Some("se cret"));
-        assert_eq!(c.ssl, SslMode::Plain);
+        assert_eq!(c.ssl, SslMode::Require);
     }
 
     #[test]
@@ -1486,6 +1506,68 @@ mod tests {
         assert!(e.to_string().contains("sslrootcert"), "{e}");
     }
 
+    /// A downgrade nobody asked for is refused: `prefer` and `allow` would fall back to plaintext
+    /// silently, so they are errors that say what to use; `disable` is plaintext on request, and
+    /// an ABSENT `sslmode` is plaintext too (documented in the README), not a refused request.
+    /// The message never echoes the password.
+    #[test]
+    fn sslmode_prefer_and_allow_are_refused_not_downgraded() {
+        for mode in ["prefer", "allow"] {
+            for dsn in [
+                format!("host=db user=u password=zq9pw sslmode={mode}"),
+                format!("postgres://u:zq9pw@db/d?sslmode={mode}"),
+            ] {
+                let e = Config::parse(&dsn).unwrap_err().to_string();
+                assert!(
+                    e.contains(&format!("sslmode={mode} is not supported"))
+                        && e.contains("never falls back silently")
+                        && e.contains("verify-full")
+                        && !e.contains("zq9pw"),
+                    "{dsn}: {e}"
+                );
+            }
+        }
+        assert_eq!(
+            Config::parse("host=db user=u sslmode=disable").unwrap().ssl,
+            SslMode::Plain
+        );
+        assert_eq!(Config::parse("host=db user=u").unwrap().ssl, SslMode::Plain);
+        for mode in ["require", "verify-ca", "verify-full"] {
+            let c = Config::parse(&format!("host=db user=u sslmode={mode}")).unwrap();
+            assert_eq!(c.ssl, SslMode::Require, "{mode}");
+        }
+    }
+
+    /// Connect options this store neither applies nor can apply (the host's connector owns the
+    /// sockets) are refused with an explanation, not accepted and ignored; the message never
+    /// echoes the password.
+    #[test]
+    fn connect_options_the_store_cannot_apply_are_refused_not_ignored() {
+        for opt in [
+            "keepalives=1",
+            "keepalives_idle=30",
+            "keepalives_interval=10",
+            "keepalives_count=3",
+            "keepalives_retries=3",
+            "load_balance_hosts=random",
+            "tcp_user_timeout=5000",
+            "sslnegotiation=direct",
+        ] {
+            let name = opt.split('=').next().unwrap();
+            for dsn in [
+                format!("host=db user=u password=zq9pw {opt}"),
+                format!("postgres://u:zq9pw@db/d?{opt}"),
+            ] {
+                let e = Config::parse(&dsn).unwrap_err().to_string();
+                assert!(
+                    e.contains(&format!("{name} is not supported by this store"))
+                        && !e.contains("zq9pw"),
+                    "{dsn}: {e}"
+                );
+            }
+        }
+    }
+
     /// D37 (RED before: accepted and ignored): `connect_timeout` is whole seconds as the driver
     /// reads it, a number that is not one is refused.
     #[test]
@@ -1496,6 +1578,15 @@ mod tests {
         let e = Config::parse("host=db user=u connect_timeout=soon").unwrap_err();
         assert!(e.to_string().contains("connect_timeout"), "{e}");
         assert!(Config::parse("postgres://u@db/d?connect_timeout=2.5").is_err());
+        // Zero or less is no bound (libpq's reading); more than zero is whole seconds.
+        let ms = |v: &str| {
+            Config::parse(&format!("host=db user=u connect_timeout={v}"))
+                .unwrap()
+                .connect_timeout_ms
+        };
+        assert_eq!((ms("5"), ms("0"), ms("-1")), (Some(5000), None, None));
+        let e = Config::parse("host=db user=u connect_timeout=soon").unwrap_err();
+        assert!(e.to_string().contains("whole number of seconds"), "{e}");
     }
 
     /// D26 (RED before: the unparsed fragment was echoed): a configuration error never repeats a
