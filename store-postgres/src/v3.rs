@@ -21,9 +21,11 @@
 //! (one clock for the fleet, not each node's), a concurrency gauge's slice included. A `reserve`
 //! returns the unreturned part of the slices of its slots that have expired to their windows'
 //! headroom before it tests them, so a node that crashed holding a slice strands nothing past one
-//! TTL. A `slice_release` always applies, whatever the epoch. During a rolling upgrade, nodes still
-//! on schema v11 (no epoch, a slice that never expires) keep that behaviour on a v12 database until
-//! they are upgraded.
+//! TTL. A `slice_release` always applies, whatever the epoch. Do not run schema-v11 nodes against a
+//! v12 database (v11 never shipped in a release): a v11 node's slice insert takes the column
+//! default `0`, which is already expired, so the next v12 `reserve` returns that slice to the
+//! window at once (the window can be over-granted for up to one TTL) and the v11 node's later
+//! release of it fails as not held.
 //!
 //! MONEY: a slot `(bucket, pool, dimension, class_key, window_start)` is one `money_slots` row
 //! keyed by its rendering; `reserve` locks every slot it draws from (in key order, so two draws
@@ -41,7 +43,8 @@
 //!
 //! Every `u64` the ABI hands this module's own money, journal and record columns is stored
 //! BIT-FOR-BIT in a BIGINT (`as i64` / `as u64`) and compared here, never in SQL, so none of them is
-//! clamped or wrapped on the way back (the one SQL comparison is the epoch's raise, done unsigned). The
+//! clamped or wrapped on the way back (the SQL comparisons are the epoch's raise, done unsigned, and the expiry reclaim: that one
+//! compares two DB-clock millisecond values far below 2^63 and tests `remaining` only for `<> 0`). The
 //! ops this module delegates to the 1.5.5 code (`add_usage_in`, `add_metering_in` and the audit and
 //! plane-record appends) keep that code's own rules: usage and metering totals clamp, and appends
 //! refuse a value outside their column.
@@ -641,7 +644,7 @@ impl Session {
                 let expired = tx
                     .query(
                         "DELETE FROM money_slices
-                         WHERE slot = ANY($1) AND remaining > 0 AND valid_until_ms <= $2
+                         WHERE slot = ANY($1) AND remaining <> 0 AND valid_until_ms <= $2
                          RETURNING slot, remaining",
                         &[&slots, &bits(now)],
                     )

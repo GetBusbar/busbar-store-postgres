@@ -566,7 +566,7 @@ CREATE TABLE IF NOT EXISTS money_epoch (
 INSERT INTO money_epoch (one, epoch) VALUES (TRUE, 0) ON CONFLICT DO NOTHING;
 ALTER TABLE money_slices ADD COLUMN IF NOT EXISTS valid_until_ms BIGINT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS money_slices_open_idx ON money_slices (slot, valid_until_ms)
-    WHERE remaining > 0;
+    WHERE remaining <> 0;
 ";
 
 /// The v10 column additions on tables a 1.5.x database already has. `IF NOT EXISTS`, so a re-run
@@ -853,7 +853,7 @@ impl Session {
             tx.execute(
                 "UPDATE money_slices SET valid_until_ms =
                      (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint + $1
-                 WHERE valid_until_ms = 0 AND remaining > 0",
+                 WHERE valid_until_ms = 0 AND remaining <> 0",
                 &[&ttl],
             )
             .await

@@ -554,8 +554,8 @@ fn a_grant_is_bounded_and_an_expired_slice_returns_to_the_window() {
     let g = iso.draw("ttl", 5, 2).expect("draws the whole window");
     let after = iso.now_ms();
     assert!(
-        g.valid_until_ms >= before && g.valid_until_ms <= after + TTL,
-        "valid_until_ms {} is not within [{before}, {after} + SLICE_TTL_MS]",
+        g.valid_until_ms >= before + TTL && g.valid_until_ms <= after + TTL,
+        "valid_until_ms {} is not within [{before} + SLICE_TTL_MS, {after} + SLICE_TTL_MS]",
         g.valid_until_ms
     );
     assert_eq!(
@@ -714,6 +714,20 @@ fn a_concurrent_first_cap_push_keeps_the_higher_generation() {
     }
 }
 
+/// A slice of 2^63 or more is stored as negative bits; it must still expire and come back.
+#[test]
+fn a_huge_expired_slice_returns_to_the_window() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let iso = Iso::new(&url);
+    iso.cap("huge", u64::MAX);
+    iso.draw("huge", u64::MAX - 1, 0).expect("a huge draw");
+    iso.advance_ms(TTL + 1);
+    iso.draw("huge", u64::MAX - 1, 0)
+        .expect("the expired huge slice came back");
+}
+
 /// The v11 -> v12 step: slices a v11 build left open (granted `u64::MAX`, never expiring) are
 /// stamped to expire one SLICE_TTL_MS after the upgrade, the epoch row exists at 0, and the step
 /// runs once.
@@ -732,7 +746,8 @@ fn the_v12_upgrade_stamps_open_slices_and_creates_the_epoch() {
             "DROP TABLE {0}.money_epoch;
              ALTER TABLE {0}.money_slices DROP COLUMN valid_until_ms;
              ALTER TABLE {0}.money_slices ADD COLUMN valid_until_ms BIGINT NOT NULL DEFAULT 0;
-             DELETE FROM {0}.busbar_schema WHERE version >= 12;",
+             DELETE FROM {0}.busbar_schema WHERE version >= 12;
+             INSERT INTO {0}.busbar_schema (version) VALUES (11);",
             iso.schema
         ))
         .unwrap();
