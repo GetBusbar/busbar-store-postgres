@@ -57,9 +57,12 @@ meaning:
   other than the four reserved token classes), and `plane_records`,
   `plane_chain`, `plane_tokens` (busbar's durable A2A tasks, MCP call log,
   upstream demotions, push-callback capabilities and single-use approvals),
-  plus the store v3 tables `store_ops`, `store_journal`, `store_sessions`,
-  `store_records`, `money_slots` and `money_slices` (op-id dedupe, the
-  journal, sessions, records and the money reservation slots and slices).
+  plus the store v3 tables `store_ops` and `store_records` (op-id dedupe and
+  the kernel's records). The store keeps ledger counts, not money: busbar
+  derives money from the counts and its rate card.
+- Schema v13 drops the tables a pre-release v11/v12 build created for the
+  deleted store slots (`money_slots`, `money_slices`, `money_epoch`,
+  `store_journal`, `store_sessions`) and their op-id dedupe rows.
 
 A database a pre-release dev build took to schema v7–v9 keeps its
 `mcp_calls`/`tasks`/`task_events`/`mcp_demotions`/`spent_ask_states` tables

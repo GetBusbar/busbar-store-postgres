@@ -2,8 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store v3 slots this backend answers beyond the 1.5.5 op set ([`StoreSlots`]): the
-//! `op_id`-carrying writes, the ledger ops, the money slots and `window_caps`, and the door
-//! (`store_door!`) over all of it.
+//! `op_id`-carrying writes (the usage and metering batches and the plane-record append), the
+//! kernel-held records, and the door (`store_door!`) over all of it. The store keeps ledger counts
+//! and records only: no money state (busbar 1.6.0: money is a view on ledger x rate card).
 //!
 //! DEDUPE (`abi::store` S1-S4), DURABLE: every `op_id` this store APPLIED is a row of `store_ops`
 //! holding the op's value fields and its answer. The row is inserted FIRST in the op's own
@@ -13,26 +14,6 @@
 //! A failed op rolls its row back with its effect, so only an op that applied is remembered. Rows
 //! are kept [`OP_ID_RETENTION_SECS`] and swept at most once a minute per instance.
 //!
-//! EPOCH AND SLICE LIFE (`abi::store::money`, rules (a)-(c); this store is shared by a fleet): the
-//! fleet's ONE epoch is the `money_epoch` row. A `reserve` presenting a higher epoch raises it in
-//! its own transaction, atomically with its draw; one presenting a lower epoch is `StaleEpoch`,
-//! applies nothing and records nothing under its `op_id`; nothing lowers it, and it survives a
-//! restart. Every slice is granted `valid_until_ms = now + SLICE_TTL_MS` on the DATABASE's clock
-//! (one clock for the fleet, not each node's), a concurrency gauge's slice included. A `reserve`
-//! returns the unreturned part of the slices of its slots that have expired to their windows'
-//! headroom before it tests them, so a node that crashed holding a slice strands nothing past one
-//! TTL. A `slice_release` always applies, whatever the epoch. Do not run schema-v11 nodes against a
-//! v12 database (v11 never shipped in a release): a v11 node's slice insert takes the column
-//! default `0`, which is already expired, so the next v12 `reserve` returns that slice to the
-//! window at once (the window can be over-granted for up to one TTL) and the v11 node's later
-//! release of it fails as not held.
-//!
-//! MONEY: a slot `(bucket, pool, dimension, class_key, window_start)` is one `money_slots` row
-//! keyed by its rendering; `reserve` locks every slot it draws from (in key order, so two draws
-//! never deadlock), tests each cell with 1.5.5's per-dimension rule (`abi::store::ReserveIn`) and
-//! applies all or nothing. Locks are always taken slot first (sorted), then slice (sorted), so no two
-//! ops can deadlock on them.
-//!
 //! CONNECTIONS: every slot runs on the instance's ONE kept connection over the host's connector
 //! (1.5.5's one mutex-guarded connection; STORE-KEEP), as straight-line async code by the store
 //! SDK's `wire::drive_kept` (busbar THE DESIGN: every call Ready or Pending(wake), no
@@ -41,13 +22,10 @@
 //! settings, and its connect step reaches the server and ensures the schema, so an unreachable or
 //! refusing server still fails the load at open, in the driver's words.
 //!
-//! Every `u64` the ABI hands this module's own money, journal and record columns is stored
-//! BIT-FOR-BIT in a BIGINT (`as i64` / `as u64`) and compared here, never in SQL, so none of them is
-//! clamped or wrapped on the way back (the SQL comparisons are the epoch's raise, done unsigned, and the expiry reclaim: that one
-//! compares two DB-clock millisecond values far below 2^63 and tests `remaining` only for `<> 0`). The
-//! ops this module delegates to the 1.5.5 code (`add_usage_in`, `add_metering_in` and the audit and
-//! plane-record appends) keep that code's own rules: usage and metering totals clamp, and appends
-//! refuse a value outside their column.
+//! Every `u64` the ABI hands this module's own record and dedupe columns is stored BIT-FOR-BIT in a
+//! BIGINT (`as i64`), so none of them is clamped or wrapped. The ops this module delegates to the
+//! 1.5.5 code (`add_usage_in`, `add_metering_in` and the plane-record append) keep that code's own
+//! rules: usage and metering totals clamp, and appends refuse a value outside their column.
 
 use std::sync::atomic::Ordering;
 
@@ -58,12 +36,9 @@ use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_OCTETS};
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::sdk::store::wire::{drive_kept, Body};
-use busbar_contract::abi::sdk::store::{
-    Cap, CapsRefused, Cell, CellKey, Dimension, Grant, Op, OpRefused, OpResult, ReserveRefused,
-    Scanned, Step, StoreSlots, Tail,
-};
-use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS, SLICE_TTL_MS};
-use busbar_contract::kinds::{Head, RecordBytes};
+use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
+use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
+use busbar_contract::kinds::RecordBytes;
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, PlaneRecordRef,
     PlaneSelector, RecordStoreError, RecordStoreResult, UsageDelta, UsageLedger, VirtualKey,
@@ -167,19 +142,6 @@ fn bits(v: u64) -> i64 {
     v as i64
 }
 
-/// A BIGINT back into the `u64` it was written from.
-fn unbits(v: i64) -> u64 {
-    v as u64
-}
-
-/// `ReserveRefused::Unavailable` carries no payload on the ABI, so the reason would be lost with the
-/// refusal: log it first. `reason` is already rendered by [`pg`] (SQLSTATE and message, no row
-/// values) or scrubbed of the password by the session open; the DSN is never logged.
-pub(crate) fn reserve_unavailable(reason: String) -> ReserveRefused {
-    tracing::warn!(%reason, "postgres store: reserve refused as unavailable");
-    ReserveRefused::Unavailable
-}
-
 fn pg(e: crate::pgwire::Error) -> String {
     render_pg_error(&e)
 }
@@ -199,37 +161,6 @@ fn encode(answer: &[u64]) -> String {
 
 fn decode(answer: &str) -> Option<Vec<u64>> {
     answer.split_whitespace().map(|n| n.parse().ok()).collect()
-}
-
-/// A slot's key: the cell key's fields, each rendered unambiguously (`Debug` quotes and escapes
-/// the strings), so two different slots never share a row.
-fn slot(k: &CellKey<'_>) -> String {
-    let (dimension, class_key) = match k.dimension {
-        Dimension::NanoUnits => (0, ""),
-        Dimension::Requests => (1, ""),
-        Dimension::Concurrency => (2, ""),
-        Dimension::Class(c) => (3, c),
-    };
-    format!(
-        "{:?}|{:?}|{dimension}|{class_key:?}|{}",
-        k.bucket, k.pool, k.window_start
-    )
-}
-
-/// The 1.5.5 admission test for one cell (`abi::store::ReserveIn`, GRANT SIZE): whether drawing
-/// `amount` onto `used` under `cap` is refused. `used + amount` is checked: an overflow refuses.
-fn exhausted(dimension: &Dimension<'_>, used: u64, amount: u64, cap: u64) -> bool {
-    let Some(after) = used.checked_add(amount) else {
-        return true;
-    };
-    match dimension {
-        // DIM_CLASS: `tokens >= cap` — the draw that crosses the cap is granted whole.
-        Dimension::Class(_) => used >= cap,
-        // DIM_NANO_UNITS: `derived >= cap || derived + fee > cap`.
-        Dimension::NanoUnits => used >= cap || after > cap,
-        // DIM_REQUESTS / DIM_CONCURRENCY: `used + amount > cap`.
-        Dimension::Requests | Dimension::Concurrency => after > cap,
-    }
 }
 
 /// Whether an `op_id` is new, a replay (with its recorded answer), or a conflict.
@@ -317,65 +248,6 @@ impl Session {
         Ok((tx, seen))
     }
 
-    async fn v3_add_usage(
-        &mut self,
-        op: OpId,
-        bucket: &str,
-        window_start: u64,
-        delta: &UsageDelta,
-    ) -> OpResult<()> {
-        let body = format!("add_usage:{bucket:?}:{window_start}:{delta:?}");
-        deduped!(
-            self,
-            op,
-            &body,
-            OpRefused::Conflict,
-            OpRefused::Failed,
-            OpRefused,
-            |tx| {
-                Session::add_usage_in(tx, bucket, window_start, delta)
-                    .await
-                    .map_err(failed)?;
-                Ok(Vec::new())
-            }
-        );
-        Ok(())
-    }
-
-    async fn v3_add_metering(&mut self, op: OpId, delta: &MeteringDelta) -> OpResult<()> {
-        let body = format!("add_metering:{delta:?}");
-        deduped!(
-            self,
-            op,
-            &body,
-            OpRefused::Conflict,
-            OpRefused::Failed,
-            OpRefused,
-            |tx| {
-                Session::add_metering_in(tx, delta).await.map_err(failed)?;
-                Ok(Vec::new())
-            }
-        );
-        Ok(())
-    }
-
-    async fn v3_append_audit(&mut self, op: OpId, entry: &AuditRecord) -> OpResult<()> {
-        let body = format!("append_audit:{entry:?}");
-        deduped!(
-            self,
-            op,
-            &body,
-            OpRefused::Conflict,
-            OpRefused::Failed,
-            OpRefused,
-            |tx| {
-                audit_in(tx, entry).await?;
-                Ok(Vec::new())
-            }
-        );
-        Ok(())
-    }
-
     async fn v3_append_plane_record(
         &mut self,
         op: OpId,
@@ -404,123 +276,6 @@ impl Session {
             }
         );
         Ok(())
-    }
-
-    async fn v3_append_batch(
-        &mut self,
-        op: OpId,
-        stream: &str,
-        records: &[RecordBytes],
-    ) -> OpResult<Head> {
-        let body = format!("append_batch:{stream:?}:{records:?}");
-        let answer = deduped!(
-            self,
-            op,
-            &body,
-            OpRefused::Conflict,
-            OpRefused::Failed,
-            OpRefused,
-            |tx| {
-                // One appender per stream at a time, fleet-wide: the head is read and extended under
-                // the stream's transaction-scoped advisory lock.
-                tx.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                    &[&stream],
-                )
-                .await
-                .map_err(|e| OpRefused::Failed(pg(e)))?;
-                let head: i64 = tx
-                    .query_one(
-                        "SELECT COALESCE(MAX(seq), 0) FROM store_journal WHERE stream = $1",
-                        &[&stream],
-                    )
-                    .await
-                    .map_err(|e| OpRefused::Failed(pg(e)))?
-                    .get(0);
-                let mut seq = head;
-                for r in records {
-                    seq += 1;
-                    tx.execute(
-                        "INSERT INTO store_journal (stream, seq, record) VALUES ($1, $2, $3)",
-                        &[&stream, &seq, &r.as_slice()],
-                    )
-                    .await
-                    .map_err(|e| OpRefused::Failed(pg(e)))?;
-                }
-                Ok(vec![unbits(seq), 0])
-            }
-        );
-        match answer[..] {
-            [seq, epoch] => Ok(Head { seq, epoch }),
-            _ => Err(OpRefused::Conflict),
-        }
-    }
-
-    async fn v3_heads(&mut self) -> Result<Vec<(String, Head)>, String> {
-        let rows = self
-            .lock()
-            .query(
-                "SELECT stream, MAX(seq) FROM store_journal GROUP BY stream ORDER BY stream",
-                &[],
-            )
-            .await
-            .map_err(pg)?;
-        Ok(rows
-            .iter()
-            .map(|r| {
-                (
-                    r.get(0),
-                    Head {
-                        seq: unbits(r.get(1)),
-                        epoch: 0,
-                    },
-                )
-            })
-            .collect())
-    }
-
-    async fn v3_session_put(
-        &mut self,
-        session: u64,
-        node: &str,
-        principal: &str,
-    ) -> Result<(), String> {
-        self.lock()
-            .execute(
-                "INSERT INTO store_sessions (session, node, principal) VALUES ($1, $2, $3)
-                 ON CONFLICT (session) DO UPDATE SET node = EXCLUDED.node,
-                     principal = EXCLUDED.principal",
-                &[&bits(session), &node, &principal],
-            )
-            .await
-            .map(drop)
-            .map_err(pg)
-    }
-
-    async fn v3_session_remove(&mut self, session: u64) -> Result<(), String> {
-        self.lock()
-            .execute(
-                "DELETE FROM store_sessions WHERE session = $1",
-                &[&bits(session)],
-            )
-            .await
-            .map(drop)
-            .map_err(pg)
-    }
-
-    async fn v3_sessions_for(&mut self, principal: &str) -> Result<Vec<(u64, String)>, String> {
-        let rows = self
-            .lock()
-            .query(
-                "SELECT session, node FROM store_sessions WHERE principal = $1",
-                &[&principal],
-            )
-            .await
-            .map_err(pg)?;
-        let mut sessions: Vec<(u64, String)> =
-            rows.iter().map(|r| (unbits(r.get(0)), r.get(1))).collect();
-        sessions.sort_unstable();
-        Ok(sessions)
     }
 
     async fn v3_record_put(
@@ -582,307 +337,6 @@ impl Session {
             .collect()
     }
 
-    /// `reserve` over the cells' slots (each cell's slot key, its dimension and its amount), under
-    /// the fleet `epoch` the caller presents.
-    async fn v3_reserve(
-        &mut self,
-        op: OpId,
-        body: &str,
-        epoch: u64,
-        cells: &[(String, Dimension<'static>, u64)],
-    ) -> Result<Vec<Grant>, ReserveRefused> {
-        let unavailable = reserve_unavailable;
-        let answer = deduped!(
-            self,
-            op,
-            body,
-            ReserveRefused::Conflict,
-            unavailable,
-            ReserveRefused,
-            |tx| {
-                let down = |e: crate::pgwire::Error| reserve_unavailable(pg(e));
-                // THE EPOCH FENCE. Raise first, in ONE statement and compared UNSIGNED (the epoch
-                // is a u64 kept in a BIGINT; XOR with the sign bit makes BIGINT order equal u64
-                // order), so a raise is never a share-lock upgrade and two raisers cannot deadlock.
-                // The row is write-locked only when the epoch actually rises. Then read it FOR
-                // SHARE, held to the commit: a concurrent raiser waits for every in-flight draw of
-                // the old epoch to finish, and a draw of an old epoch that starts after the raise
-                // reads the new one and is refused. Never FOR KEY SHARE: a non-key UPDATE does not
-                // conflict with it. The cost is a shared lock on one hot row in every reserve,
-                // which never blocks another reserve (shares coexist) and only waits behind a raise.
-                tx.execute(
-                    "UPDATE money_epoch SET epoch = $1::bigint
-                     WHERE (epoch # (-9223372036854775808)::bigint)
-                         < ($1::bigint # (-9223372036854775808)::bigint)",
-                    &[&bits(epoch)],
-                )
-                .await
-                .map_err(down)?;
-                let row = tx
-                    .query_one(
-                        "SELECT epoch, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint
-                         FROM money_epoch FOR SHARE",
-                        &[],
-                    )
-                    .await
-                    .map_err(down)?;
-                if unbits(row.get(0)) > epoch {
-                    // Dropping the transaction rolls it back: nothing applied, nothing recorded.
-                    return Err(ReserveRefused::StaleEpoch);
-                }
-                let now: u64 = row.get::<_, i64>(1) as u64;
-                let valid_until = now.saturating_add(SLICE_TTL_MS);
-
-                let slots: Vec<String> = cells.iter().map(|c| c.0.clone()).collect();
-                let rows = tx
-                    .query(
-                        "SELECT slot, cap, used FROM money_slots WHERE slot = ANY($1)
-                     ORDER BY slot FOR UPDATE",
-                        &[&slots],
-                    )
-                    .await
-                    .map_err(down)?;
-                let mut held: std::collections::HashMap<String, (u64, u64)> = rows
-                    .iter()
-                    .map(|r| (r.get(0), (unbits(r.get(1)), unbits(r.get(2)))))
-                    .collect();
-                // Slice life (c): an expired slice's unreturned part goes back to its window's
-                // headroom before the cells are tested. The slots are locked, so no release of these
-                // slices runs beside this; the rows go, so each unit is returned once.
-                let expired = tx
-                    .query(
-                        "DELETE FROM money_slices
-                         WHERE slot = ANY($1) AND remaining <> 0 AND valid_until_ms <= $2
-                         RETURNING slot, remaining",
-                        &[&slots, &bits(now)],
-                    )
-                    .await
-                    .map_err(down)?;
-                for r in &expired {
-                    if let Some((_, used)) = held.get_mut(r.get::<_, &str>(0)) {
-                        *used = used.saturating_sub(unbits(r.get(1)));
-                    }
-                }
-                // The chain draw is all or nothing: each cell is tested against what the cells before
-                // it in THIS draw add, and nothing is written until every cell passes.
-                for (i, (s, dimension, amount)) in cells.iter().enumerate() {
-                    let Some((cap, used)) = held.get_mut(s) else {
-                        return Err(ReserveRefused::NoCap { cell: i as u32 });
-                    };
-                    if exhausted(dimension, *used, *amount, *cap) {
-                        return Err(ReserveRefused::Exhausted { cell: i as u32 });
-                    }
-                    *used = used.saturating_add(*amount);
-                }
-                let mut answer = Vec::with_capacity(cells.len() * 3);
-                for (s, _, amount) in cells {
-                    tx.execute(
-                        "UPDATE money_slots SET used = $2 WHERE slot = $1",
-                        &[s, &bits(held[s].1)],
-                    )
-                    .await
-                    .map_err(down)?;
-                    let id: i64 = tx
-                        .query_one(
-                            "INSERT INTO money_slices (slot, remaining, valid_until_ms)
-                             VALUES ($1, $2, $3) RETURNING slice_id",
-                            &[s, &bits(*amount), &bits(valid_until)],
-                        )
-                        .await
-                        .map_err(down)?
-                        .get(0);
-                    answer.extend([unbits(id), *amount, valid_until]);
-                }
-                Ok(answer)
-            }
-        );
-        if answer.len() != cells.len() * 3 {
-            return Err(ReserveRefused::Conflict);
-        }
-        Ok(answer
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|g| Grant {
-                slice_id: g[0],
-                granted: g[1],
-                valid_until_ms: g[2],
-            })
-            .collect())
-    }
-
-    async fn v3_slice_release(
-        &mut self,
-        op: OpId,
-        body: &str,
-        items: &[(u64, u64)],
-    ) -> OpResult<Vec<u64>> {
-        let answer = deduped!(
-            self,
-            op,
-            body,
-            OpRefused::Conflict,
-            OpRefused::Failed,
-            OpRefused,
-            |tx| {
-                let fail = |e: crate::pgwire::Error| OpRefused::Failed(pg(e));
-                // LOCK ORDER, the same as `reserve`'s: slots (sorted), then slices (sorted). A
-                // slice's slot never changes, so the slots are read unlocked first; a slice that
-                // closed meanwhile is simply absent when it is locked below.
-                let ids: Vec<i64> = items.iter().map(|&(id, _)| bits(id)).collect();
-                let slots: Vec<String> = tx
-                    .query(
-                        "SELECT DISTINCT slot FROM money_slices WHERE slice_id = ANY($1)",
-                        &[&ids],
-                    )
-                    .await
-                    .map_err(fail)?
-                    .iter()
-                    .map(|r| r.get(0))
-                    .collect();
-                tx.query(
-                    "SELECT slot FROM money_slots WHERE slot = ANY($1) ORDER BY slot FOR UPDATE",
-                    &[&slots],
-                )
-                .await
-                .map_err(fail)?;
-                // Slice life (c): past `valid_until_ms` a slice IS expired and its unreturned part
-                // went back to headroom at expiry, so reclaim the expired slices of these slots
-                // (the same reclaim `reserve` does, on the database clock) before the release looks
-                // for them. A reclaimed slice is closed: it answers 0 below, and its units return once.
-                let now: i64 = tx
-                    .query_one(
-                        "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
-                        &[],
-                    )
-                    .await
-                    .map_err(fail)?
-                    .get(0);
-                let expired = tx
-                    .query(
-                        "DELETE FROM money_slices
-                         WHERE slot = ANY($1) AND remaining <> 0 AND valid_until_ms <= $2
-                         RETURNING slot, remaining",
-                        &[&slots, &now],
-                    )
-                    .await
-                    .map_err(fail)?;
-                for r in &expired {
-                    let s: String = r.get(0);
-                    let used = tx
-                        .query_opt("SELECT used FROM money_slots WHERE slot = $1", &[&s])
-                        .await
-                        .map_err(fail)?;
-                    if let Some(used) = used {
-                        let back = unbits(r.get(1));
-                        tx.execute(
-                            "UPDATE money_slots SET used = $2 WHERE slot = $1",
-                            &[&s, &bits(unbits(used.get(0)).saturating_sub(back))],
-                        )
-                        .await
-                        .map_err(fail)?;
-                    }
-                }
-                let mut open: std::collections::HashMap<u64, (String, u64)> = tx
-                    .query(
-                        "SELECT slice_id, slot, remaining FROM money_slices
-                         WHERE slice_id = ANY($1) ORDER BY slice_id FOR UPDATE",
-                        &[&ids],
-                    )
-                    .await
-                    .map_err(fail)?
-                    .iter()
-                    .map(|r| (unbits(r.get(0)), (r.get(1), unbits(r.get(2)))))
-                    .collect();
-                // The highest slice id ever granted (`None` before the first): an id up to it that
-                // is no longer a row was granted and has since closed (released whole, or expired
-                // and returned); an id above it was never granted.
-                let mut granted_up_to: Option<Option<u64>> = None;
-                let mut back_all = Vec::with_capacity(items.len());
-                for &(id, unspent) in items {
-                    let Some((s, left)) = open.get(&id).cloned() else {
-                        // A closed slice answers 0 (the contract's "a later release of it returns
-                        // 0"); only a slice never granted fails the whole release.
-                        let top = match granted_up_to {
-                            Some(top) => top,
-                            None => {
-                                let top: Option<i64> = tx
-                                    .query_one(
-                                        "SELECT pg_sequence_last_value(
-                                             pg_get_serial_sequence('money_slices', 'slice_id')
-                                                 ::regclass)",
-                                        &[],
-                                    )
-                                    .await
-                                    .map_err(fail)?
-                                    .get(0);
-                                *granted_up_to.insert(top.map(unbits))
-                            }
-                        };
-                        if id >= 1 && top.is_some_and(|top| id <= top) {
-                            back_all.push(0);
-                            continue;
-                        }
-                        return Err(OpRefused::Failed(format!(
-                            "slice_release: slice {id} is not held"
-                        )));
-                    };
-                    let back = unspent.min(left);
-                    // A slice on window 0 closes at its first release whatever it still holds
-                    // (`abi::store` slice life (e), a release on window 0 is final): window 0 never
-                    // rolls, so left open the slice would outlive its holder. The slot key ends in
-                    // `|<window_start>`; digits hold no `|`, so the last field is unambiguous. The
-                    // closed slice stays as a row with nothing left (no migration, no closed-set
-                    // table), so another release of it answers 0 rather than "not held". A rolling
-                    // window's slice is deleted when fully returned: a row per request would grow
-                    // without bound, and the sequence above is what says it was granted.
-                    let on_window_0 = s.rsplit('|').next() == Some("0");
-                    let closed = if on_window_0 {
-                        open.insert(id, (s.clone(), 0));
-                        tx.execute(
-                            "UPDATE money_slices SET remaining = 0 WHERE slice_id = $1",
-                            &[&bits(id)],
-                        )
-                        .await
-                    } else if left == back {
-                        open.remove(&id);
-                        tx.execute("DELETE FROM money_slices WHERE slice_id = $1", &[&bits(id)])
-                            .await
-                    } else {
-                        open.insert(id, (s.clone(), left - back));
-                        tx.execute(
-                            "UPDATE money_slices SET remaining = $2 WHERE slice_id = $1",
-                            &[&bits(id), &bits(left - back)],
-                        )
-                        .await
-                    };
-                    closed.map_err(fail)?;
-                    let used = tx
-                        .query_opt(
-                            "SELECT used FROM money_slots WHERE slot = $1 FOR UPDATE",
-                            &[&s],
-                        )
-                        .await
-                        .map_err(fail)?;
-                    if let Some(used) = used {
-                        tx.execute(
-                            "UPDATE money_slots SET used = $2 WHERE slot = $1",
-                            &[&s, &bits(unbits(used.get(0)).saturating_sub(back))],
-                        )
-                        .await
-                        .map_err(fail)?;
-                    }
-                    back_all.push(back);
-                }
-                Ok(back_all)
-            }
-        );
-        if answer.len() != items.len() {
-            return Err(OpRefused::Conflict);
-        }
-        Ok(answer)
-    }
-
     async fn v3_add_usage_batch(
         &mut self,
         op: OpId,
@@ -926,108 +380,6 @@ impl Session {
         );
         Ok(())
     }
-
-    async fn v3_append_audit_batch(&mut self, op: OpId, entries: &[AuditRecord]) -> OpResult<()> {
-        let body = format!("append_audit_batch:{entries:?}");
-        // One transaction: a fork anywhere (against a stored seq or an earlier entry of this batch)
-        // rolls the whole batch back.
-        deduped!(
-            self,
-            op,
-            &body,
-            OpRefused::Conflict,
-            OpRefused::Failed,
-            OpRefused,
-            |tx| {
-                for e in entries {
-                    audit_in(tx, e).await?;
-                }
-                Ok(Vec::new())
-            }
-        );
-        Ok(())
-    }
-
-    /// `window_caps` over the caps' slots (each cap's slot key, cap and config generation).
-    async fn v3_window_caps(
-        &mut self,
-        op: OpId,
-        body: &str,
-        caps: &[(String, u64, u64)],
-    ) -> Result<(), CapsRefused> {
-        deduped!(
-            self,
-            op,
-            body,
-            CapsRefused::Conflict,
-            CapsRefused::Failed,
-            CapsRefused,
-            |tx| {
-                let fail = |e: crate::pgwire::Error| CapsRefused::Failed(pg(e));
-                // Atomic per push: every cap is checked (against the stored cap and the ones before it
-                // in this push) before the push's transaction commits, and a conflict rolls it all
-                // back. Caps are taken in SLOT order, like `reserve` locks, so two pushes (or a push
-                // and a draw) never wait on each other in a cycle; the conflict reported is the
-                // smallest caller index among the conflicting caps.
-                let mut order: Vec<usize> = (0..caps.len()).collect();
-                order.sort_by(|&a, &b| caps[a].0.cmp(&caps[b].0));
-                let mut conflict: Option<usize> = None;
-                for index in order {
-                    let (s, cap_value, config_gen) = &caps[index];
-                    // Claim the row first: `SELECT .. FOR UPDATE` locks nothing when the row is absent,
-                    // so two first pushes both saw nothing and the later INSERT overwrote the
-                    // higher generation. Inserting is the lock; a loser waits on the winner's commit.
-                    let inserted = tx
-                        .execute(
-                            "INSERT INTO money_slots (slot, cap, config_gen, used)
-                             VALUES ($1, $2, $3, 0) ON CONFLICT (slot) DO NOTHING",
-                            &[s, &bits(*cap_value), &bits(*config_gen)],
-                        )
-                        .await
-                        .map_err(fail)?;
-                    if inserted == 1 {
-                        continue;
-                    }
-                    let (cap, gen) = tx
-                        .query_one(
-                            "SELECT cap, config_gen FROM money_slots WHERE slot = $1 FOR UPDATE",
-                            &[s],
-                        )
-                        .await
-                        .map(|r| (unbits(r.get(0)), unbits(r.get(1))))
-                        .map_err(fail)?;
-                    if gen == *config_gen && cap != *cap_value {
-                        conflict = Some(conflict.map_or(index, |c| c.min(index)));
-                    } else if gen < *config_gen {
-                        tx.execute(
-                            "UPDATE money_slots SET cap = $2, config_gen = $3 WHERE slot = $1",
-                            &[s, &bits(*cap_value), &bits(*config_gen)],
-                        )
-                        .await
-                        .map_err(fail)?;
-                    }
-                }
-                if let Some(index) = conflict {
-                    return Err(CapsRefused::CapConflict { index });
-                }
-                Ok(Vec::new())
-            }
-        );
-        Ok(())
-    }
-}
-
-/// An audit append inside an op's transaction: a vanished conflicting row is a failure here (the
-/// transaction cannot be retried from inside), never a success.
-async fn audit_in(tx: &mut Transaction<'_>, entry: &AuditRecord) -> OpResult<()> {
-    match Session::append_audit_in(tx, entry).await.map_err(failed)? {
-        true => Ok(()),
-        false => Err(OpRefused::Failed(format!(
-            "append_audit: seq {} was freed between the insert and the read-back; the record was \
-             NOT stored",
-            entry.seq
-        ))),
-    }
 }
 
 /// A stored record's bytes as the table's bounded record.
@@ -1066,16 +418,6 @@ fn settings_url(settings: &[u8]) -> Result<String, String> {
         })
 }
 
-/// A dimension, owned for an op that runs across entries (only its variant is read).
-fn dimension_kind(d: &Dimension<'_>) -> Dimension<'static> {
-    match d {
-        Dimension::NanoUnits => Dimension::NanoUnits,
-        Dimension::Requests => Dimension::Requests,
-        Dimension::Concurrency => Dimension::Concurrency,
-        Dimension::Class(_) => Dimension::Class(""),
-    }
-}
-
 impl StoreSlots for PostgresStore {
     const TAIL: Tail = Tail {
         ephemeral: false,
@@ -1105,44 +447,6 @@ impl StoreSlots for PostgresStore {
         on_conn!(self, cx, |e| e, |s| s.migrate().await.map_err(|e| e.0))
     }
 
-    fn add_usage_op(
-        &self,
-        cx: &mut Op<'_>,
-        op: OpId,
-        bucket: &str,
-        window_start: u64,
-        delta: &UsageDelta,
-    ) -> Step<OpResult<()>> {
-        let (bucket, delta) = (bucket.to_owned(), delta.clone());
-        on_conn!(self, cx, OpRefused::Failed, |s| s
-            .v3_add_usage(op, &bucket, window_start, &delta)
-            .await)
-    }
-
-    fn add_metering_op(
-        &self,
-        cx: &mut Op<'_>,
-        op: OpId,
-        delta: &MeteringDelta,
-    ) -> Step<OpResult<()>> {
-        let delta = delta.clone();
-        on_conn!(self, cx, OpRefused::Failed, |s| s
-            .v3_add_metering(op, &delta)
-            .await)
-    }
-
-    fn append_audit_op(
-        &self,
-        cx: &mut Op<'_>,
-        op: OpId,
-        entry: &AuditRecord,
-    ) -> Step<OpResult<()>> {
-        let entry = entry.clone();
-        on_conn!(self, cx, OpRefused::Failed, |s| s
-            .v3_append_audit(op, &entry)
-            .await)
-    }
-
     fn append_plane_record_op(
         &self,
         cx: &mut Op<'_>,
@@ -1153,49 +457,6 @@ impl StoreSlots for PostgresStore {
         on_conn!(self, cx, OpRefused::Failed, |s| s
             .v3_append_plane_record(op, &record)
             .await)
-    }
-
-    fn append_batch(
-        &self,
-        cx: &mut Op<'_>,
-        op: OpId,
-        stream: &str,
-        records: &[RecordBytes],
-    ) -> Step<OpResult<Head>> {
-        let (stream, records) = (stream.to_owned(), records.to_vec());
-        on_conn!(self, cx, OpRefused::Failed, |s| s
-            .v3_append_batch(op, &stream, &records)
-            .await)
-    }
-
-    fn heads(&self, cx: &mut Op<'_>) -> Step<Result<Vec<(String, Head)>, String>> {
-        on_conn!(self, cx, |e| e, |s| s.v3_heads().await)
-    }
-
-    fn session_put(
-        &self,
-        cx: &mut Op<'_>,
-        session: u64,
-        node: &str,
-        principal: &str,
-    ) -> Step<Result<(), String>> {
-        let (node, principal) = (node.to_owned(), principal.to_owned());
-        on_conn!(self, cx, |e| e, |s| s
-            .v3_session_put(session, &node, &principal)
-            .await)
-    }
-
-    fn session_remove(&self, cx: &mut Op<'_>, session: u64) -> Step<Result<(), String>> {
-        on_conn!(self, cx, |e| e, |s| s.v3_session_remove(session).await)
-    }
-
-    fn sessions_for(
-        &self,
-        cx: &mut Op<'_>,
-        principal: &str,
-    ) -> Step<Result<Vec<(u64, String)>, String>> {
-        let principal = principal.to_owned();
-        on_conn!(self, cx, |e| e, |s| s.v3_sessions_for(&principal).await)
     }
 
     fn record_put(
@@ -1234,56 +495,6 @@ impl StoreSlots for PostgresStore {
             .await)
     }
 
-    fn reserve<'c>(
-        &self,
-        cx: &mut Op<'_>,
-        op: OpId,
-        epoch: u64,
-        cells: impl Iterator<Item = Cell<'c>> + Clone,
-        grants: &mut impl Extend<Grant>,
-    ) -> Step<Result<(), ReserveRefused>> {
-        let cells: Vec<Cell<'_>> = cells.collect();
-        let body = format!("reserve:{epoch}:{cells:?}");
-        let owned: Vec<(String, Dimension<'static>, u64)> = cells
-            .iter()
-            .map(|c| (slot(&c.key), dimension_kind(&c.key.dimension), c.amount))
-            .collect();
-        let step = on_conn!(self, cx, reserve_unavailable, |s| s
-            .v3_reserve(op, &body, epoch, &owned)
-            .await);
-        match step {
-            Step::Ready(Ok(g)) => {
-                grants.extend(g);
-                Step::Ready(Ok(()))
-            }
-            Step::Ready(Err(e)) => Step::Ready(Err(e)),
-            Step::Pending { wake_at_ns } => Step::Pending { wake_at_ns },
-        }
-    }
-
-    fn slice_release(
-        &self,
-        cx: &mut Op<'_>,
-        op: OpId,
-        epoch: u64,
-        items: impl Iterator<Item = (u64, u64)> + Clone,
-        released: &mut impl Extend<u64>,
-    ) -> Step<OpResult<()>> {
-        let items: Vec<(u64, u64)> = items.collect();
-        let body = format!("slice_release:{epoch}:{items:?}");
-        let step = on_conn!(self, cx, OpRefused::Failed, |s| s
-            .v3_slice_release(op, &body, &items)
-            .await);
-        match step {
-            Step::Ready(Ok(back)) => {
-                released.extend(back);
-                Step::Ready(Ok(()))
-            }
-            Step::Ready(Err(e)) => Step::Ready(Err(e)),
-            Step::Pending { wake_at_ns } => Step::Pending { wake_at_ns },
-        }
-    }
-
     fn add_usage_batch(
         &self,
         cx: &mut Op<'_>,
@@ -1312,34 +523,6 @@ impl StoreSlots for PostgresStore {
             .await)
     }
 
-    fn append_audit_batch(
-        &self,
-        cx: &mut Op<'_>,
-        op: OpId,
-        entries: &[AuditRecord],
-    ) -> Step<OpResult<()>> {
-        let entries = entries.to_vec();
-        on_conn!(self, cx, OpRefused::Failed, |s| s
-            .v3_append_audit_batch(op, &entries)
-            .await)
-    }
-
-    fn window_caps(
-        &self,
-        cx: &mut Op<'_>,
-        op: OpId,
-        caps: &[Cap<'_>],
-    ) -> Step<Result<(), CapsRefused>> {
-        let body = format!("window_caps:{caps:?}");
-        let caps: Vec<(String, u64, u64)> = caps
-            .iter()
-            .map(|c| (slot(&c.key), c.cap, c.config_gen))
-            .collect();
-        on_conn!(self, cx, CapsRefused::Failed, |s| s
-            .v3_window_caps(op, &body, &caps)
-            .await)
-    }
-
     // ── the 1.5.5 op set (slots 0-32): each the 1.5.5 body, on the op's connection ──────────
 
     fn put_key(&self, cx: &mut Op<'_>, key: &VirtualKey) -> Step<RecordStoreResult<()>> {
@@ -1359,11 +542,6 @@ impl StoreSlots for PostgresStore {
     fn delete_key(&self, cx: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<()>> {
         let id = id.to_owned();
         on_conn!(self, cx, RecordStoreError, |s| s.delete_key(&id).await)
-    }
-
-    fn scrub_key(&self, cx: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<()>> {
-        let id = id.to_owned();
-        on_conn!(self, cx, RecordStoreError, |s| s.scrub_key(&id).await)
     }
 
     fn list_keys_since(
@@ -1411,19 +589,6 @@ impl StoreSlots for PostgresStore {
             .await)
     }
 
-    fn purge_windows_before(&self, cx: &mut Op<'_>, before: u64) -> Step<RecordStoreResult<u64>> {
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .purge_windows_before(before)
-            .await)
-    }
-
-    fn purge_metering_before(&self, cx: &mut Op<'_>, bucket: &str) -> Step<RecordStoreResult<u64>> {
-        let bucket = bucket.to_owned();
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .purge_metering_before(&bucket)
-            .await)
-    }
-
     fn put_credential(
         &self,
         cx: &mut Op<'_>,
@@ -1455,18 +620,6 @@ impl StoreSlots for PostgresStore {
         let key_id = key_id.to_owned();
         on_conn!(self, cx, RecordStoreError, |s| s
             .list_credentials(&key_id)
-            .await)
-    }
-
-    fn lookup_credential_secret(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-        public_id: &str,
-    ) -> Step<RecordStoreResult<Option<CredentialSecret>>> {
-        let (kind, public_id) = (kind.to_owned(), public_id.to_owned());
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .lookup_credential_secret(&kind, &public_id)
             .await)
     }
 
