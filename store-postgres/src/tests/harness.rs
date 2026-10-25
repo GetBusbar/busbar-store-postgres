@@ -18,6 +18,10 @@ use busbar_contract::abi::sdk::store::{
 use busbar_contract::abi::store::OpId;
 use busbar_contract::kinds::{Head, RecordBytes};
 use busbar_contract::records::{AuditRecord, UsageDelta};
+use busbar_contract::services::{
+    Caller, DiskDest, HookAsk, HostServices, Later, NestAsk, Ran, Reading, RecordsList, Snapshot,
+    Stored, UNSERVED,
+};
 use busbar_contract::store_calls::{StoreCalls, StoreFailure};
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
@@ -64,6 +68,92 @@ fn mint() -> OpId {
     )
 }
 
+/// The host services a store op can reach in a test: the CLOCK alone, on the dispatcher's own
+/// timebase, every other service refusing as a host that does not serve it. `Wire::bound` reads the
+/// host's clock (no clock: no bound), so a test of the connect timeout needs one; the shared
+/// double the fleet uses (`busbar_contract::services::double`) is behind a dev-only feature of the
+/// contract this crate does not enable, so the refusing bodies are spelled out here.
+struct ClockOnly;
+
+fn refused() -> Ran {
+    Ran::Now(Stored::refused(UNSERVED))
+}
+
+impl HostServices for ClockOnly {
+    fn now(&self) -> Reading {
+        Reading {
+            wall_ns: 0,
+            mono_ns: busbar_plugin_loader::dispatch::now_ns(),
+        }
+    }
+    fn dest_judge(&self, _: &str, _: u32, _: u32, _: Option<Later>) -> Ran {
+        refused()
+    }
+    fn records_get(&self, _: &Caller, _: &str, _: &[u8], _: Later) -> Ran {
+        refused()
+    }
+    fn records_list(&self, _: &Caller, _: RecordsList, _: Later) -> Ran {
+        refused()
+    }
+    fn records_claim(&self, _: &Caller, _: &str, _: &[u8], _: u64, _: Later) -> Ran {
+        refused()
+    }
+    fn sign(&self, _: &Caller, _: &[u8]) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+    fn trust_sight(&self, _: &Caller, _: &str, _: &str, _: Later) -> Ran {
+        refused()
+    }
+    fn trust_due(&self, _: &Caller) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+    fn trust_verify(&self, _: &Caller, _: &str, _: &[u8], _: &[u8]) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+    fn entitlement_check(&self, _: &Caller, _: Option<u64>, _: &str) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+    fn random_fill(&self, _: u64) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+    fn records_secret(&self, _: &str, _: &str, _: Later) -> Ran {
+        refused()
+    }
+    fn unit_nest(&self, _: &Caller, _: Option<u64>, _: NestAsk, _: Later) -> Ran {
+        refused()
+    }
+    fn work_open(&self, _: &Caller, _: Option<u64>, _: &str, _: &[u8], _: Later) -> Ran {
+        refused()
+    }
+    fn work_find(&self, _: &Caller, _: Option<u64>, _: &[u8], _: Later) -> Ran {
+        refused()
+    }
+    fn work_settle(&self, _: &Caller, _: Option<u64>, _: u64, _: &[u8], _: Later) -> Ran {
+        refused()
+    }
+    fn work_resume(&self, _: &Caller, _: Option<u64>, _: u64, _: Later) -> Ran {
+        refused()
+    }
+    fn disk_append(&self, _: &DiskDest, _: Vec<u8>, _: Later) -> Ran {
+        refused()
+    }
+    fn verify_lookup(&self, _: &Caller, _: &[u8], _: Later) -> Ran {
+        refused()
+    }
+    fn verify_store(&self, _: &Caller, _: &[u8], _: &[u8], _: u64) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+    fn content_scan(&self, _: &Caller, _: Option<u64>, _: &[u8], _: Later) -> Ran {
+        refused()
+    }
+    fn hook_call(&self, _: &Caller, _: Option<u64>, _: HookAsk, _: Later) -> Ran {
+        refused()
+    }
+    fn snapshot_read(&self, _: &Caller, _: u32) -> Snapshot {
+        Snapshot::Refused(UNSERVED)
+    }
+}
+
 /// The store's linked door opened on `settings` over the loader, its needs on a [`TcpConns`].
 pub(crate) fn open_loaded(settings: &str) -> Result<LoadedStore, String> {
     open_loaded_over(settings, |d| Arc::new(TcpConns::new(d.conn_waker())))
@@ -74,7 +164,10 @@ pub(crate) fn open_loaded_over(
     settings: &str,
     conns: impl FnOnce(&Dispatcher) -> Arc<dyn busbar_contract::conn::DeclaredConns>,
 ) -> Result<LoadedStore, String> {
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let d = Arc::new(Dispatcher::with_services(
+        DispatchConfig::default(),
+        Arc::new(ClockOnly),
+    ));
     let conns = conns(&d);
     let row = LinkedRow::of(crate::door).map_err(|e| e.to_string())?;
     let p = load_linked::<Store>(
