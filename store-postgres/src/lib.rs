@@ -284,17 +284,16 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 ///     token ledger, keyed `(kind, token)`).
 ///
 /// v11 (busbar 1.6.0 store v3 table), ADDITIVE: the tables the store v3 slots beyond the 1.5.5 op
-/// set keep (`v3`): `store_ops` (the durable `op_id` dedupe log), `store_journal` (`append_batch`'s
-/// streams), `store_sessions`, `store_records` (`record_put`/`get`/`scan`), and `money_slots` /
-/// `money_slices` (`window_caps`, `reserve`, `slice_release`). Nothing existing changes.
+/// set keep (`v3`): `store_ops` (the durable `op_id` dedupe log) and `store_records`
+/// (`record_put`/`get`/`scan`). Nothing existing changes.
 ///
-/// v12 (store kind epoch and slice life), ADDITIVE: `money_epoch` (the ONE fleet epoch `reserve`
-/// fences with, `0` before any reserve) and `money_slices.valid_until_ms` (the instant a slice
-/// expires and its unreturned part goes back to its window's headroom). Slices a v11 build left
-/// open are stamped to expire one `SLICE_TTL_MS` after the upgrade, so money a crashed node
-/// stranded under the old never-expires grant is returned rather than held forever (v11 never
-/// shipped in a release).
-const SCHEMA_VERSION: i64 = 12;
+/// v13 (money is a view on ledger x rate card), SUBTRACTIVE: the store keeps only ledger counts
+/// (`usage_windows`, `usage_metering` and their unit tables) and the records the kernel puts. The
+/// tables of the deleted slots go: `money_slots`, `money_slices`, `money_epoch` (caps, slices and
+/// the fence epoch v11/v12 kept; neither shipped in a release), `store_journal` (`append_batch`)
+/// and `store_sessions`. The dedupe rows of the deleted slots go with them; a row of a kept slot is
+/// untouched, so a retry across the upgrade still answers its original.
+const SCHEMA_VERSION: i64 = 13;
 
 /// The plane-record kinds whose retention is TERMINAL-ONLY: `purge_plane_records_before` drops a row
 /// of one of these kinds only once its `disposition` sidecar says `Terminal`. An interrupted task
@@ -513,19 +512,6 @@ CREATE TABLE IF NOT EXISTS store_ops (
     recorded_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS store_ops_recorded_at_idx ON store_ops (recorded_at);
--- append_batch's streams; a stream's head is its highest seq.
-CREATE TABLE IF NOT EXISTS store_journal (
-    stream TEXT COLLATE \"C\" NOT NULL,
-    seq    BIGINT NOT NULL,
-    record BYTEA NOT NULL,
-    PRIMARY KEY (stream, seq)
-);
-CREATE TABLE IF NOT EXISTS store_sessions (
-    session   BIGINT PRIMARY KEY,
-    node      TEXT NOT NULL,
-    principal TEXT COLLATE \"C\" NOT NULL
-);
-CREATE INDEX IF NOT EXISTS store_sessions_principal_idx ON store_sessions (principal);
 -- A plane's kernel-held durable records, keyed (schema, key); scanned in key (byte) order.
 CREATE TABLE IF NOT EXISTS store_records (
     schema_id TEXT COLLATE \"C\" NOT NULL,
@@ -533,40 +519,6 @@ CREATE TABLE IF NOT EXISTS store_records (
     value     BYTEA NOT NULL,
     PRIMARY KEY (schema_id, key)
 );
--- One money slot (bucket, pool, dimension, class_key, window_start), keyed by its rendering: the
--- cap window_caps pushed, its config generation, and what outstanding slices have drawn.
-CREATE TABLE IF NOT EXISTS money_slots (
-    slot       TEXT COLLATE \"C\" PRIMARY KEY,
-    cap        BIGINT NOT NULL,
-    config_gen BIGINT NOT NULL,
-    used       BIGINT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS money_slices (
-    slice_id  BIGSERIAL PRIMARY KEY,
-    slot      TEXT COLLATE \"C\" NOT NULL,
-    remaining BIGINT NOT NULL,
-    valid_until_ms BIGINT NOT NULL DEFAULT 0
-);
--- The fleet's ONE epoch (a u64 stored bit for bit); the single row is the CHECK-pinned `one`.
-CREATE TABLE IF NOT EXISTS money_epoch (
-    one   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (one),
-    epoch BIGINT NOT NULL
-);
-INSERT INTO money_epoch (one, epoch) VALUES (TRUE, 0) ON CONFLICT DO NOTHING;
-";
-
-/// The v12 additions on tables an older database already has (`SCHEMA`'s `CREATE TABLE IF NOT
-/// EXISTS` never alters an existing table). `IF NOT EXISTS` throughout, so a re-run is harmless;
-/// `migrate_locked` runs it only when crossing into v12. The index follows the column it covers.
-const MIGRATE_V12: &str = "
-CREATE TABLE IF NOT EXISTS money_epoch (
-    one   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (one),
-    epoch BIGINT NOT NULL
-);
-INSERT INTO money_epoch (one, epoch) VALUES (TRUE, 0) ON CONFLICT DO NOTHING;
-ALTER TABLE money_slices ADD COLUMN IF NOT EXISTS valid_until_ms BIGINT NOT NULL DEFAULT 0;
-CREATE INDEX IF NOT EXISTS money_slices_open_idx ON money_slices (slot, valid_until_ms)
-    WHERE remaining <> 0;
 ";
 
 /// The v10 column additions on tables a 1.5.x database already has. `IF NOT EXISTS`, so a re-run
@@ -856,17 +808,17 @@ impl Session {
             .await
             .store()?;
         }
-        // v12 — see SCHEMA_VERSION. Gated like v10: `ALTER TABLE` locks `money_slices` even as a
-        // no-op. Every slice still open was granted by a build that never expired one, so each is
-        // stamped to expire one `SLICE_TTL_MS` from the database's clock (the store's one clock).
-        if version < 12 {
-            tx.batch_execute(MIGRATE_V12).await.store()?;
-            let ttl = busbar_contract::abi::store::SLICE_TTL_MS as i64;
-            tx.execute(
-                "UPDATE money_slices SET valid_until_ms =
-                     (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint + $1
-                 WHERE valid_until_ms = 0 AND remaining <> 0",
-                &[&ttl],
+        // v13 — see SCHEMA_VERSION. The deleted slots' tables and dedupe rows go in the same
+        // transaction as the version stamp, so a crash part-way re-runs it whole.
+        if version < 13 {
+            tx.batch_execute(
+                "DROP TABLE IF EXISTS money_slices;
+                 DROP TABLE IF EXISTS money_slots;
+                 DROP TABLE IF EXISTS money_epoch;
+                 DROP TABLE IF EXISTS store_journal;
+                 DROP TABLE IF EXISTS store_sessions;
+                 DELETE FROM store_ops WHERE split_part(body, ':', 1) NOT IN
+                     ('append_plane_record', 'add_usage_batch', 'add_metering_batch');",
             )
             .await
             .store()?;
@@ -1185,55 +1137,6 @@ impl Session {
         Ok(())
     }
 
-    pub(crate) async fn scrub_key(&mut self, id: &str) -> RecordStoreResult<()> {
-        // PII-erasure only: null name/labels on an ALREADY-tombstoned key. Errors if unknown or
-        // still live -- scrubbing a live key would be silent, un-auditable data loss on an active
-        // principal (the trait doc's own guard: go through delete_key first).
-        let client = self.lock();
-        let mut tx = client.transaction().await.store()?;
-        let deleted: Option<bool> = tx
-            .query_opt(
-                "SELECT deleted_at IS NOT NULL FROM keys WHERE id=$1",
-                &[&id],
-            )
-            .await
-            .store()?
-            .map(|r| r.get(0));
-        match deleted {
-            None => return Err(RecordStoreError(format!("scrub_key: unknown key {id}"))),
-            Some(false) => {
-                return Err(RecordStoreError(format!(
-                    "scrub_key: key {id} is not tombstoned -- call delete_key first"
-                )))
-            }
-            Some(true) => {}
-        }
-        let rev = Self::next_revision(&mut tx).await?;
-        // `AND deleted_at IS NOT NULL` re-states the "must already be tombstoned" guard IN the
-        // UPDATE's own WHERE clause, closing the same TOCTOU class as delete_key above: the SELECT
-        // this function just ran is not atomic with this write, so without the re-check here a
-        // concurrent put_key/put_key_with_credential resurrecting the key between the SELECT and
-        // this UPDATE would let scrub_key silently erase name/labels on what is, by the time this
-        // statement lands, a LIVE key -- exactly the un-auditable-data-loss-on-an-active-principal
-        // this method's own doc comment says it must never do.
-        let changed = tx
-            .execute(
-                "UPDATE keys SET name='', labels='{}', revision=$2 \
-                 WHERE id=$1 AND deleted_at IS NOT NULL",
-                &[&id, &rev],
-            )
-            .await
-            .store()?;
-        if changed == 0 {
-            return Err(RecordStoreError(format!(
-                "scrub_key: key {id} was resurrected (deleted_at cleared) concurrently with this \
-                 call -- refusing to scrub a key that is live by the time the write landed"
-            )));
-        }
-        tx.commit().await.store()?;
-        Ok(())
-    }
-
     pub(crate) async fn get_usage(
         &mut self,
         bucket_id: &str,
@@ -1473,49 +1376,6 @@ impl Session {
             .collect())
     }
 
-    pub(crate) async fn purge_windows_before(&mut self, before: u64) -> RecordStoreResult<u64> {
-        let b = clamp(before);
-        let client = self.lock();
-        let mut tx = client.transaction().await.store()?;
-        let n1 = tx
-            .execute("DELETE FROM usage_windows WHERE window_start < $1", &[&b])
-            .await
-            .store()?;
-        tx.execute("DELETE FROM usage_ledger WHERE window_start < $1", &[&b])
-            .await
-            .store()?;
-        tx.execute(
-            "DELETE FROM usage_ledger_units WHERE window_start < $1",
-            &[&b],
-        )
-        .await
-        .store()?;
-        tx.commit().await.store()?;
-        Ok(n1)
-    }
-
-    pub(crate) async fn purge_metering_before(&mut self, bucket: &str) -> RecordStoreResult<u64> {
-        // The trait's purge_metering_before takes `bucket: &str` while list_metering/add_metering
-        // use `bucket: u64` -- an inconsistency in the core trait itself, not introduced here.
-        // usage_metering.bucket is genuinely BIGINT, so this parses the string form.
-        let b: i64 = bucket.parse().map_err(|_| {
-            RecordStoreError(format!(
-                "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
-            ))
-        })?;
-        let client = self.lock();
-        let mut tx = client.transaction().await.store()?;
-        let n = tx
-            .execute("DELETE FROM usage_metering WHERE bucket=$1", &[&b])
-            .await
-            .store()?;
-        tx.execute("DELETE FROM usage_metering_units WHERE bucket=$1", &[&b])
-            .await
-            .store()?;
-        tx.commit().await.store()?;
-        Ok(n)
-    }
-
     pub(crate) async fn put_credential(
         &mut self,
         secret: &CredentialSecret,
@@ -1589,27 +1449,6 @@ impl Session {
         let sql = format!("SELECT {CRED_META_COLUMNS} FROM credentials WHERE key_id=$1");
         let rows = self.lock().query(&sql, &[&key_id]).await.store()?;
         Ok(rows.iter().map(row_to_cred_meta).collect())
-    }
-
-    pub(crate) async fn lookup_credential_secret(
-        &mut self,
-        kind: &str,
-        public_id: &str,
-    ) -> RecordStoreResult<Option<CredentialSecret>> {
-        let sql = format!(
-            "SELECT {CRED_META_COLUMNS},secret FROM credentials WHERE kind=$1 AND public_id=$2"
-        );
-        let row = self
-            .lock()
-            .query_opt(&sql, &[&kind, &public_id])
-            .await
-            .store()?;
-        Ok(row.map(|r| CredentialSecret {
-            meta: row_to_cred_meta(&r),
-            secret: r
-                .get::<_, Option<String>>(CRED_SECRET_COLUMN_INDEX)
-                .unwrap_or_default(),
-        }))
     }
 
     pub(crate) async fn revoke_credential(
@@ -2396,92 +2235,6 @@ impl Session {
             tx.execute(&sql, &params).await.store()?;
         }
         Ok(())
-    }
-
-    /// `append_audit` inside the caller's transaction: `Ok(true)` once the record is stored (or an
-    /// identical one already was), `Ok(false)` when the conflicting row vanished before the share
-    /// lock held it (the seq is free again: retry in a fresh transaction), `Err` on a fork.
-    pub(crate) async fn append_audit_in(
-        tx: &mut Transaction<'_>,
-        entry: &AuditRecord,
-    ) -> RecordStoreResult<bool> {
-        // A `seq`/`ts` past `i64::MAX` cannot be stored faithfully: `clamp` pins it, so the record
-        // read back is NOT the record written. Two consequences, both bad, and neither acceptable
-        // silently — an identical retry compares unequal and is reported as "the audit chain has
-        // forked" (naming the same action on both sides, the worst possible page to hand an
-        // operator), and two genuinely distinct seqs collapse onto one row. Rejected outright
-        // instead. Comparing the CLAMPED form would fix the false alarm by causing the silent loss,
-        // which is the wrong half to give up.
-        if entry.seq > i64::MAX as u64 || entry.ts > i64::MAX as u64 {
-            return Err(RecordStoreError(format!(
-                "append_audit: seq {} / ts {} exceeds the storable range (i64::MAX); refusing to \
-                 store a record that would not read back as itself",
-                entry.seq, entry.ts
-            )));
-        }
-        let (seq, ts) = (clamp(entry.seq), clamp(entry.ts));
-        // ON CONFLICT DO NOTHING, not DO UPDATE: the trait's own contract is "append-only... a store
-        // never rewrites or recomputes the digest" (busbar_contract::records::RecordStore::append_audit doc). `seq` is a
-        // per-process counter (see the engine's own known caveat about clustered nodes), so a
-        // collision here means either a real caller bug or two nodes racing on the same seq -- in
-        // BOTH cases silently overwriting a prior entry's hash/prev_hash would corrupt the hash chain
-        // without any trace. Failing loudly on a collision is strictly safer than the alternative:
-        // the caller (or an operator) finds out immediately, instead of the audit log quietly losing
-        // integrity guarantees it claims to hold.
-        // A collision has TWO causes and they are not the same event. Erroring on both (which this
-        // used to do) makes the engine's own write-through look like a corrupt chain the first time
-        // a commit ACK is lost to a timeout or a reconnect and it retries. Compare the records and
-        // let the difference decide, per the trait contract:
-        //   identical -> the retry. Benign, and the common one. Ok.
-        //   different -> two records claiming one chain position: forked or tampered. Error.
-        //
-        // The INSERT and the read-back run in ONE transaction, and the read takes `FOR SHARE`, so
-        // the row that caused the conflict cannot be deleted out from under the comparison. Without
-        // that (an autocommit INSERT then a separate autocommit SELECT), an out-of-band deleter —
-        // operator SQL, an external retention job — could remove the conflicting row in between,
-        // leaving the seq empty and this method with nothing to compare. The obvious-looking answer
-        // there, "nothing occupies the seq, so no fork: return Ok", REPORTS SUCCESS FOR A RECORD IT
-        // NEVER STORED. That is the same silent-loss shape the whole comparison exists to prevent,
-        // just inverted, and an audit entry is the last thing that should vanish quietly.
-
-        let inserted = tx
-            .execute(
-                "INSERT INTO audit_log
-                    (seq, ts, action, resource, outcome, principal, prev_hash, hash)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                 ON CONFLICT (seq) DO NOTHING",
-                &[
-                    &seq,
-                    &ts,
-                    &entry.action,
-                    &entry.resource,
-                    &entry.outcome,
-                    &entry.principal,
-                    &entry.prev_hash,
-                    &entry.hash,
-                ],
-            )
-            .await
-            .store()?;
-        if inserted == 1 {
-            return Ok(true);
-        }
-        let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log WHERE seq=$1 FOR SHARE");
-        let stored = tx
-            .query_opt(&sql, &[&seq])
-            .await
-            .store()?
-            .map(|r| row_to_audit(&r));
-        match stored {
-            Some(stored) if &stored == entry => Ok(true),
-            Some(stored) => Err(RecordStoreError(format!(
-                "append_audit: seq {} already holds a DIFFERENT record; the audit chain \
-                     has forked (stored action '{}', incoming '{}')",
-                entry.seq, stored.action, entry.action
-            ))),
-            // Gone before the share lock could hold it.
-            None => Ok(false),
-        }
     }
 
     /// `append_plane_record` inside the caller's transaction: `Ok(true)` once the record is stored
