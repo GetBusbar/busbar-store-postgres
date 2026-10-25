@@ -604,6 +604,9 @@ pub(crate) struct Shared {
     /// the 1.5.5 store's one mutex-guarded connection (it had no pool setting). An op waits for it
     /// while another holds it, as 1.5.5's ops waited on the mutex.
     pub(crate) pool: std::sync::Arc<busbar_contract::abi::sdk::store::wire::Pool>,
+    /// The endpoint (an index into the DSN's list) that last connected: the next connect tries it
+    /// first, so a failover DSN keeps asking for the kept connection's own endpoint.
+    pub(crate) endpoint: std::sync::atomic::AtomicUsize,
 }
 
 /// ONE OP'S CONNECTION: the 1.5.5 bodies run on it, as they ran on the mutex-guarded client.
@@ -668,6 +671,7 @@ impl PostgresStore {
                 secret,
                 ops_swept_at: AtomicU64::new(0),
                 pool: busbar_contract::abi::sdk::store::wire::Pool::new(KEPT_CONNECTIONS),
+                endpoint: std::sync::atomic::AtomicUsize::new(0),
             }),
         })
     }
@@ -685,7 +689,7 @@ impl Session {
         wire: busbar_contract::abi::sdk::store::wire::Wire,
         shared: std::sync::Arc<Shared>,
     ) -> Result<Self, String> {
-        match Client::connect(wire, &shared.config).await {
+        match Client::connect(wire, &shared.config, &shared.endpoint).await {
             Ok(client) => Ok(Self { client, shared }),
             Err(e) => Err(scrub(render_pg_error(&e), shared.secret.as_deref())),
         }
@@ -694,7 +698,7 @@ impl Session {
     /// The op is done: its connection is kept for the next op if the session is idle, else
     /// discarded ([`Client::release`]).
     pub(crate) async fn close(mut self) {
-        self.client.release();
+        self.client.release().await;
     }
 
     fn lock(&mut self) -> &mut Client {

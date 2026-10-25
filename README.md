@@ -122,7 +122,7 @@ thin `cdylib` adapter around it.
 
 | Setting | Required | Default | Notes |
 |---|---|---|---|
-| `url` | yes | — | A libpq connection string, URL (`postgres://user:pass@host:5432/busbar?sslmode=require`) or keyword form (`host=... user=... password=... dbname=...`). Connections go through busbar's connector, whose deadlines bound every connect (`connect_timeout` is accepted and ignored). `sslmode=require`/`verify-*` secures the connection through busbar; the other modes are plaintext. |
+| `url` | yes | — | A libpq connection string, URL (`postgres://user:pass@host:5432/busbar?sslmode=require`) or keyword form (`host=... user=... password=... dbname=...`). Connections go through busbar's connector; `connect_timeout` (whole seconds) bounds a new connection's dial and handshake, and `channel_binding=require` and `sslrootcert` are refused (no SCRAM-PLUS; trust is busbar's). `sslmode=require`/`verify-*` secures the connection through busbar; the other modes are plaintext. |
 
 ## Build
 
