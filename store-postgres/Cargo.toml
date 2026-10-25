@@ -5,7 +5,7 @@ version = "1.6.0"
 publish = false            # internal workspace crate; never goes to crates.io
 edition = "2021"
 rust-version = "1.97"
-description = "The Postgres backend for busbar's durable governance store — the shared, multi-node db plugin. Implements busbar_contract::records::RecordStore over a mutex-guarded sync postgres client."
+description = "The Postgres backend for busbar's durable governance store — the shared, multi-node db plugin. Serves the store v3 table (StoreSlots) over the host's connector with its own async Postgres wire client (pgwire)."
 license = "Apache-2.0"
 
 [dependencies]

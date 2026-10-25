@@ -42,7 +42,7 @@ explicitly in production; do not assume they move together.
 ### Upgrading from a 1.5.x deployment
 
 The first connect of this build upgrades an existing database **in place**
-(schema v6 → v10, inside one transaction, under the same advisory lock every
+(schema v6 → this build's current schema, inside one transaction, under the same advisory lock every
 node's migration takes). Nothing is dropped and no existing row changes
 meaning:
 
@@ -56,13 +56,16 @@ meaning:
 - New tables: `usage_ledger_units` and `usage_metering_units` (unit classes
   other than the four reserved token classes), and `plane_records`,
   `plane_chain`, `plane_tokens` (busbar's durable A2A tasks, MCP call log,
-  upstream demotions, push-callback capabilities and single-use approvals).
+  upstream demotions, push-callback capabilities and single-use approvals),
+  plus the store v3 tables `store_ops`, `store_journal`, `store_sessions`,
+  `store_records`, `money_slots` and `money_slices` (op-id dedupe, the
+  journal, sessions, records and the money reservation slots and slices).
 
 A database a pre-release dev build took to schema v7–v9 keeps its
 `mcp_calls`/`tasks`/`task_events`/`mcp_demotions`/`spent_ask_states` tables
 untouched; busbar 1.6.0 no longer reads them.
 
-It is a `cdylib` that implements busbar's `RecordStore` trait (via the plugin SDK in
+It is a `cdylib` that serves busbar's store v3 table (`StoreSlots`, via the plugin SDK in
 [`busbar-contract`](https://github.com/GetBusbar/busbar/tree/main/crates/busbar-contract))
 and is loaded in-process by busbar over the signed hybrid plugin ABI —
 `dlopen`'d, not spawned as a separate process.
@@ -71,9 +74,8 @@ This repo is a same-repo, 2-crate Cargo workspace: it brings 100% of
 what it needs. All the SQL and schema logic lives in the
 `busbar-store-postgres` crate (`store-postgres/`, a same-repo sibling
 this plugin wraps — a custom build can also link it statically instead
-of loading this cdylib); `store-postgres-plugin/src/lib.rs` only adapts
-the engine's JSON config (`{"url": "postgres://..."}`) into a
-`PostgresStore`.
+of loading this cdylib); `store-postgres-plugin/src/lib.rs` only re-exports
+that crate and exports its `door` through `export_door!`.
 
 
 - **A shared, multi-node governance store.** `store: sqlite` is
@@ -142,9 +144,7 @@ This is a same-repo, 2-crate Cargo workspace (`store-postgres/`, the
 real logic crate — which also carries the store's one door, `door`,
 from `store_door!` over its `StoreSlots` implementation (`src/v3.rs`) —
 and `store-postgres-plugin/`, the thin `cdylib` that exports that door as
-`busbar_plugin_door` through `export_door!`, and also registers the store on
-the cold store lane (`export_store_plugin!`) that the busbar kernel at the pin
-boots a configured `store:` through; see [members](Cargo.toml)).
+`busbar_plugin_door` through `export_door!`; see [members](Cargo.toml)).
 
 Its one busbar dependency is `busbar-contract` (plus
 `busbar-plugin-loader`, dev-only, for the conformance and end-to-end
