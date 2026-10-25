@@ -1813,6 +1813,34 @@ fn migrate_already_at_current_version_skips_the_legacy_check() {
     drop(check);
 }
 
+/// A database stamped ABOVE this build is refused at open, with the reason: an older binary would
+/// ignore newer rules (the epoch fence among them). An equal version still opens.
+#[test]
+fn migrate_refuses_a_database_stamped_newer_than_this_build() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_newer");
+    let iso_url = tmp.url();
+    {
+        let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+        c.batch_execute(&format!(
+            "CREATE TABLE busbar_schema (version BIGINT PRIMARY KEY);
+             INSERT INTO busbar_schema (version) VALUES ({});",
+            SCHEMA_VERSION + 1
+        ))
+        .unwrap();
+    }
+    let err = TestStore::open(&iso_url).err().expect("a newer schema is refused");
+    // The loader prefixes the plugin's name; the store's own words are the tail.
+    assert!(
+        err.ends_with(&format!(
+            "postgres store: database schema v{} is newer than this build (v{SCHEMA_VERSION}); \
+             refusing to open",
+            SCHEMA_VERSION + 1
+        )),
+        "{err}"
+    );
+}
+
 /// The v6 one-time backfill: a database sitting at v5 with a `usage_windows` row shaped
 /// `billable_requests=0, requests>0` (indistinguishable, by counter value alone, from a
 /// legitimately fully-refunded window OR a genuine pre-split legacy row) gets `billable_requests`
