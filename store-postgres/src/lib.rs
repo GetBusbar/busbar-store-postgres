@@ -777,7 +777,15 @@ impl Session {
         // no-op DDL on a current database deadlocked a live key delete against a node merely
         // connecting (observed: `40P01` on `UPDATE keys ... deleted_at`). A database at (or past)
         // this build's version has every table and index this build creates.
-        if version >= SCHEMA_VERSION {
+        if version > SCHEMA_VERSION {
+            // A newer build owns this database: this one would ignore its newer rules (the epoch
+            // fence among them), so it must not serve it.
+            return Err(RecordStoreError(format!(
+                "postgres store: database schema v{version} is newer than this build \
+                 (v{SCHEMA_VERSION}); refusing to open"
+            )));
+        }
+        if version == SCHEMA_VERSION {
             return Ok(());
         }
         let mut tx = client.transaction().await.store()?;
