@@ -220,9 +220,7 @@ impl Config {
                 // Whole seconds, as the 1.5.5 driver read them: more than zero bounds the dial and
                 // the handshake of a new connection, zero or less is no bound.
                 "connect_timeout" => {
-                    let secs: i64 = v
-                        .parse()
-                        .map_err(|_| {
+                    let secs: i64 = v.parse().map_err(|_| {
                         config_err(
                             "invalid value for option `connect_timeout` (a whole number of \
                              seconds; 0 or less means no bound)",
