@@ -1339,8 +1339,10 @@ impl Session {
                     params.push(*unit);
                     params.push(count);
                 }
-                // Two ModelTokens entries for one model would name the same unit twice; summed,
-                // the same way `UsageLedger::apply_delta` folds them, rather than a key violation.
+                // This ON CONFLICT only guards the open-unit rows against a concurrent writer. Two
+                // ModelTokens entries for one model are refused (23505) by the reserved-column
+                // INSERT above, which has no ON CONFLICT, before this statement runs; 1.5.5
+                // refused them too.
                 sql.push_str(
                     " ON CONFLICT (bucket_id, window_start, model, unit) DO UPDATE SET \
                      count = usage_ledger_units.count + EXCLUDED.count",
@@ -2448,9 +2450,10 @@ impl Session {
         // worth reporting, and this store never restates a digest it was handed).
         //
         // The INSERT and the read-back share ONE transaction and the read takes `FOR SHARE`, so the
-        // conflicting row cannot be purged out from under the comparison; the bounded loop covers
-        // the row vanishing before the share lock lands (the position is then free, so insert). No
-        // path returns Ok without the record being stored.
+        // conflicting row cannot be purged out from under the comparison. There is no retry loop: if
+        // the row vanishes before the share lock lands (the position is then free) this returns
+        // `Ok(false)`, NOT success, and the v3 caller turns that into a failure the kernel retries.
+        // No path returns `Ok(true)` without the record being stored.
         let inserted = tx
             .execute(
                 "INSERT INTO plane_chain (kind, parent, seq, id, ts, disposition, body)
