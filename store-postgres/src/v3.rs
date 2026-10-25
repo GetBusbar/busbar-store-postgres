@@ -172,6 +172,14 @@ fn unbits(v: i64) -> u64 {
     v as u64
 }
 
+/// `ReserveRefused::Unavailable` carries no payload on the ABI, so the reason would be lost with the
+/// refusal: log it first. `reason` is already rendered by [`pg`] (SQLSTATE and message, no row
+/// values) or scrubbed of the password by the session open; the DSN is never logged.
+pub(crate) fn reserve_unavailable(reason: String) -> ReserveRefused {
+    tracing::warn!(%reason, "postgres store: reserve refused as unavailable");
+    ReserveRefused::Unavailable
+}
+
 fn pg(e: crate::pgwire::Error) -> String {
     render_pg_error(&e)
 }
@@ -583,7 +591,7 @@ impl Session {
         epoch: u64,
         cells: &[(String, Dimension<'static>, u64)],
     ) -> Result<Vec<Grant>, ReserveRefused> {
-        let unavailable = |_: String| ReserveRefused::Unavailable;
+        let unavailable = reserve_unavailable;
         let answer = deduped!(
             self,
             op,
@@ -592,7 +600,7 @@ impl Session {
             unavailable,
             ReserveRefused,
             |tx| {
-                let down = |_: crate::pgwire::Error| ReserveRefused::Unavailable;
+                let down = |e: crate::pgwire::Error| reserve_unavailable(pg(e));
                 // THE EPOCH FENCE. Raise first, in ONE statement and compared UNSIGNED (the epoch
                 // is a u64 kept in a BIGINT; XOR with the sign bit makes BIGINT order equal u64
                 // order), so a raise is never a share-lock upgrade and two raisers cannot deadlock.
@@ -1240,7 +1248,7 @@ impl StoreSlots for PostgresStore {
             .iter()
             .map(|c| (slot(&c.key), dimension_kind(&c.key.dimension), c.amount))
             .collect();
-        let step = on_conn!(self, cx, |_: String| ReserveRefused::Unavailable, |s| s
+        let step = on_conn!(self, cx, reserve_unavailable, |s| s
             .v3_reserve(op, &body, epoch, &owned)
             .await);
         match step {

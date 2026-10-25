@@ -1053,3 +1053,68 @@ fn a_release_of_an_expired_slice_returns_zero_and_headroom_returns_once() {
         "headroom came back exactly once"
     );
 }
+
+/// A `MakeWriter` that keeps what the subscriber writes, for asserting on a log line.
+#[derive(Clone, Default)]
+struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+    type Writer = LogSink;
+    fn make_writer(&'a self) -> LogSink {
+        self.clone()
+    }
+}
+
+/// `ReserveRefused::Unavailable` has no payload on the ABI, so the reason it drops is logged first
+/// (inside a door call the plugin's `tracing` events are captured into its own log). Every site that
+/// answers Unavailable goes through `reserve_unavailable`; the line carries the reason it is given
+/// (SQLSTATE and message, already free of the DSN's password) and the answer stays Unavailable.
+///
+/// The door call itself cannot be observed from a logic-crate test: the door swaps in the contract's
+/// call capture as the thread's subscriber for the span of the call, so a subscriber installed here
+/// sees nothing from inside it. The helper is therefore driven directly, and the live path that
+/// reaches it is covered by the Unavailable answer below.
+#[test]
+fn an_unavailable_reserve_logs_the_reason_it_drops() {
+    let sink = LogSink::default();
+    let sub = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .finish();
+    let refused = tracing::subscriber::with_default(sub, || {
+        crate::v3::reserve_unavailable("42P01: relation \"money_epoch\" does not exist".into())
+    });
+    assert_eq!(refused, ReserveRefused::Unavailable);
+    let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains("WARN") && log.contains("reserve refused as unavailable"),
+        "{log}"
+    );
+    assert!(log.contains("42P01") && log.contains("money_epoch"), "{log}");
+    assert!(!log.contains("postgres://"), "never the DSN: {log}");
+
+    // And the live path: a reserve whose fence table is gone answers Unavailable.
+    let Some(url) = live_url() else {
+        return;
+    };
+    let iso = Iso::new(&url);
+    iso.cap("unavail", 5);
+    iso.admin
+        .borrow_mut()
+        .batch_execute(&format!("DROP TABLE {}.money_epoch", iso.schema))
+        .unwrap();
+    assert_eq!(
+        iso.draw("unavail", 1, 0).map(drop),
+        Err(ReserveRefused::Unavailable)
+    );
+}
