@@ -17,7 +17,7 @@ mod harness;
 /// deletes every usage window below it in the SHARED database, whoever wrote it. The two tests that
 /// purge (here and in `v160_shapes`) therefore write ONLY windows below 2_000 and hold
 /// [`lock_usage_purge`] so they cannot take each other's rows; every other test writes windows at or
-/// above `20_270_000`, far above any cutoff either purge uses.
+/// above `86_400`, far above any cutoff either purge uses.
 static USAGE_PURGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn lock_usage_purge() -> std::sync::MutexGuard<'static, ()> {
