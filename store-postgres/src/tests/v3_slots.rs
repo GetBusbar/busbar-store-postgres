@@ -767,3 +767,233 @@ fn the_v12_upgrade_stamps_open_slices_and_creates_the_epoch() {
     iso.draw("legacy", 5, 0)
         .expect("the stranded slice's money came back");
 }
+
+/// A chain draw is all or nothing across cells: cell 1 exhausted is reported as cell 1 and cell 0's
+/// slot is unchanged.
+#[test]
+fn a_multi_cell_reserve_is_all_or_nothing() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let (a, b) = (format!("{ns}-a"), format!("{ns}-b"));
+    for (bucket, cap) in [(&a, 5), (&b, 1)] {
+        s.window_caps(
+            op(),
+            &[Cap {
+                key: requests(bucket),
+                cap,
+                config_gen: 1,
+            }],
+        )
+        .unwrap();
+    }
+    let cells = |x: u64, y: u64| {
+        [
+            Cell {
+                key: requests(&a),
+                amount: x,
+            },
+            Cell {
+                key: requests(&b),
+                amount: y,
+            },
+        ]
+    };
+    assert_eq!(
+        reserve(&s, op(), &cells(5, 2)),
+        Err(ReserveRefused::Exhausted { cell: 1 })
+    );
+    let both = reserve(&s, op(), &cells(5, 1)).expect("cell 0 kept all its headroom");
+    assert_eq!(both.len(), 2);
+    assert_eq!(
+        reserve(&s, op(), &cells(1, 1)),
+        Err(ReserveRefused::Exhausted { cell: 0 })
+    );
+}
+
+/// The per-dimension admission rules and the checked sum.
+#[test]
+fn the_dimension_rules_and_the_overflow_refusal() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let key = |bucket: &'static str, dimension| CellKey {
+        bucket: Box::leak(format!("{ns}-{bucket}").into_boxed_str()),
+        pool: None,
+        dimension,
+        window_start: 1_790_000_000_000,
+    };
+    let cap = |k: CellKey<'_>, cap| {
+        s.window_caps(
+            op(),
+            &[Cap {
+                key: k,
+                cap,
+                config_gen: 1,
+            }],
+        )
+        .unwrap()
+    };
+    let draw = |k: CellKey<'_>, amount| reserve(&s, op(), &[Cell { key: k, amount }]);
+
+    // Class: best effort, the draw that crosses the cap is granted whole; at the cap it is refused.
+    let class = key("class", Dimension::Class("tok"));
+    cap(class, 10);
+    assert_eq!(draw(class, 9).unwrap()[0].granted, 9);
+    assert_eq!(
+        draw(class, 5).unwrap()[0].granted,
+        5,
+        "crossing, granted whole"
+    );
+    assert_eq!(draw(class, 1), Err(ReserveRefused::Exhausted { cell: 0 }));
+
+    // Concurrency: a gauge, `used + amount > cap` refuses, a release reopens it.
+    let gauge = key("gauge", Dimension::Concurrency);
+    cap(gauge, 2);
+    let g1 = draw(gauge, 1).unwrap()[0];
+    draw(gauge, 1).unwrap();
+    assert_eq!(draw(gauge, 1), Err(ReserveRefused::Exhausted { cell: 0 }));
+    assert_eq!(release(&s, op(), &[(g1.slice_id, 1)]), Ok(vec![1]));
+    draw(gauge, 1).expect("the released permit is drawable");
+
+    // NanoUnits: refused at the cap and when the draw would cross it.
+    let nano = key("nano", Dimension::NanoUnits);
+    cap(nano, 10);
+    assert_eq!(draw(nano, 11), Err(ReserveRefused::Exhausted { cell: 0 }));
+    draw(nano, 10).unwrap();
+
+    // A sum past u64::MAX is a refusal, never a wrap or a saturated grant.
+    let big = key("big", Dimension::Requests);
+    cap(big, u64::MAX);
+    draw(big, u64::MAX - 1).unwrap();
+    assert_eq!(draw(big, 5), Err(ReserveRefused::Exhausted { cell: 0 }));
+}
+
+/// A newer generation replaces the cap, an older one is ignored.
+#[test]
+fn window_caps_a_newer_generation_replaces_and_an_older_is_ignored() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let push = |cap, config_gen| {
+        s.window_caps(
+            op(),
+            &[Cap {
+                key: requests(&ns),
+                cap,
+                config_gen,
+            }],
+        )
+    };
+    let stored = || -> (i64, i64) {
+        let r = s
+            .lock()
+            .query_one(
+                "SELECT cap, config_gen FROM money_slots WHERE slot LIKE '%' || $1 || '%'",
+                &[&ns],
+            )
+            .unwrap();
+        (r.get(0), r.get(1))
+    };
+    push(5, 1).unwrap();
+    push(8, 2).unwrap();
+    assert_eq!(stored(), (8, 2), "the newer generation replaced the cap");
+    push(3, 1).unwrap();
+    assert_eq!(stored(), (8, 2), "an older generation was ignored");
+    push(8, 2).unwrap();
+    assert_eq!(push(9, 2), Err(CapsRefused::CapConflict { index: 0 }));
+}
+
+/// Two nodes appending to one stream at once both land, with distinct contiguous seqs.
+#[test]
+fn concurrent_append_batches_on_one_stream_both_land() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    const ROUNDS: usize = 60;
+    let ns = ns();
+    let barrier = std::sync::Barrier::new(2);
+    let run = || {
+        let node = store(&url);
+        let (ns, barrier) = (&ns, &barrier);
+        move || {
+            let rows: Vec<RecordBytes> = (0..3u8)
+                .map(|i| RecordBytes::new(vec![i]).unwrap())
+                .collect();
+            (0..ROUNDS)
+                .map(|i| {
+                    barrier.wait();
+                    node.append_batch(op(), &format!("{ns}-{i}"), &rows)
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    let (x, y) = std::thread::scope(|sc| {
+        let (x, y) = (sc.spawn(run()), sc.spawn(run()));
+        (x.join().unwrap(), y.join().unwrap())
+    });
+    for (i, (x, y)) in x.iter().zip(&y).enumerate() {
+        let mut seqs = [
+            x.as_ref().ok().map(|h| h.seq),
+            y.as_ref().ok().map(|h| h.seq),
+        ];
+        seqs.sort();
+        assert_eq!(seqs, [Some(3), Some(6)], "round {i}: {x:?} {y:?}");
+    }
+}
+
+/// Record keys are raw bytes: NUL, 0xFF and non-UTF-8 sequences are keys like any other, a scan runs
+/// in byte order, and a prefix equal to a whole key returns that key too.
+#[test]
+fn record_keys_are_raw_bytes_scanned_in_byte_order() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let keys: [&[u8]; 7] = [
+        &[0xFF, 0x00],
+        &[0x00],
+        &[0xFF],
+        &[0xC3, 0x28],
+        &[0x00, 0xFF],
+        &[0xFF, 0xFF],
+        &[0x7F],
+    ];
+    for (i, k) in keys.iter().enumerate() {
+        s.record_put(&ns, k, &[i as u8]).unwrap();
+    }
+    let scan = |prefix: &[u8]| -> Vec<Vec<u8>> {
+        s.record_scan(&ns, prefix, 100)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
+    };
+    assert_eq!(
+        scan(&[]),
+        vec![
+            vec![0x00],
+            vec![0x00, 0xFF],
+            vec![0x7F],
+            vec![0xC3, 0x28],
+            vec![0xFF],
+            vec![0xFF, 0x00],
+            vec![0xFF, 0xFF],
+        ]
+    );
+    assert_eq!(
+        scan(&[0xFF]),
+        vec![vec![0xFF], vec![0xFF, 0x00], vec![0xFF, 0xFF]],
+        "a prefix equal to a whole key includes that key"
+    );
+    assert_eq!(scan(&[0x00]), vec![vec![0x00], vec![0x00, 0xFF]]);
+    assert_eq!(scan(&[0xC3, 0x28]), vec![vec![0xC3, 0x28]]);
+    assert!(scan(&[0xC3, 0x29]).is_empty());
+}
