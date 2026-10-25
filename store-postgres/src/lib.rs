@@ -287,7 +287,14 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 /// set keep (`v3`): `store_ops` (the durable `op_id` dedupe log), `store_journal` (`append_batch`'s
 /// streams), `store_sessions`, `store_records` (`record_put`/`get`/`scan`), and `money_slots` /
 /// `money_slices` (`window_caps`, `reserve`, `slice_release`). Nothing existing changes.
-const SCHEMA_VERSION: i64 = 11;
+///
+/// v12 (store kind epoch and slice life), ADDITIVE: `money_epoch` (the ONE fleet epoch `reserve`
+/// fences with, `0` before any reserve) and `money_slices.valid_until_ms` (the instant a slice
+/// expires and its unreturned part goes back to its window's headroom). Slices a v11 build left
+/// open are stamped to expire one `SLICE_TTL_MS` after the upgrade, so money a crashed node
+/// stranded under the old never-expires grant is returned rather than held forever (v11 never
+/// shipped in a release).
+const SCHEMA_VERSION: i64 = 12;
 
 /// The plane-record kinds whose retention is TERMINAL-ONLY: `purge_plane_records_before` drops a row
 /// of one of these kinds only once its `disposition` sidecar says `Terminal`. An interrupted task
@@ -537,8 +544,29 @@ CREATE TABLE IF NOT EXISTS money_slots (
 CREATE TABLE IF NOT EXISTS money_slices (
     slice_id  BIGSERIAL PRIMARY KEY,
     slot      TEXT COLLATE \"C\" NOT NULL,
-    remaining BIGINT NOT NULL
+    remaining BIGINT NOT NULL,
+    valid_until_ms BIGINT NOT NULL DEFAULT 0
 );
+-- The fleet's ONE epoch (a u64 stored bit for bit); the single row is the CHECK-pinned `one`.
+CREATE TABLE IF NOT EXISTS money_epoch (
+    one   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (one),
+    epoch BIGINT NOT NULL
+);
+INSERT INTO money_epoch (one, epoch) VALUES (TRUE, 0) ON CONFLICT DO NOTHING;
+";
+
+/// The v12 additions on tables an older database already has (`SCHEMA`'s `CREATE TABLE IF NOT
+/// EXISTS` never alters an existing table). `IF NOT EXISTS` throughout, so a re-run is harmless;
+/// `migrate_locked` runs it only when crossing into v12. The index follows the column it covers.
+const MIGRATE_V12: &str = "
+CREATE TABLE IF NOT EXISTS money_epoch (
+    one   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (one),
+    epoch BIGINT NOT NULL
+);
+INSERT INTO money_epoch (one, epoch) VALUES (TRUE, 0) ON CONFLICT DO NOTHING;
+ALTER TABLE money_slices ADD COLUMN IF NOT EXISTS valid_until_ms BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS money_slices_open_idx ON money_slices (slot, valid_until_ms)
+    WHERE remaining > 0;
 ";
 
 /// The v10 column additions on tables a 1.5.x database already has. `IF NOT EXISTS`, so a re-run
@@ -812,6 +840,21 @@ impl Session {
                 "ALTER TABLE usage_metering DROP CONSTRAINT IF EXISTS usage_metering_pkey;
                  ALTER TABLE usage_metering ADD CONSTRAINT usage_metering_pkey
                      PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms);",
+            )
+            .await
+            .store()?;
+        }
+        // v12 — see SCHEMA_VERSION. Gated like v10: `ALTER TABLE` locks `money_slices` even as a
+        // no-op. Every slice still open was granted by a build that never expired one, so each is
+        // stamped to expire one `SLICE_TTL_MS` from the database's clock (the store's one clock).
+        if version < 12 {
+            tx.batch_execute(MIGRATE_V12).await.store()?;
+            let ttl = busbar_contract::abi::store::SLICE_TTL_MS as i64;
+            tx.execute(
+                "UPDATE money_slices SET valid_until_ms =
+                     (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint + $1
+                 WHERE valid_until_ms = 0 AND remaining > 0",
+                &[&ttl],
             )
             .await
             .store()?;
