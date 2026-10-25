@@ -1012,3 +1012,30 @@ fn record_keys_are_raw_bytes_scanned_in_byte_order() {
     assert_eq!(scan(&[0xC3, 0x28]), vec![vec![0xC3, 0x28]]);
     assert!(scan(&[0xC3, 0x29]).is_empty());
 }
+
+/// Rule (c): past `valid_until_ms` a slice IS expired and its unreturned part went back to headroom
+/// at expiry, so a release of it answers 0 even when no reserve has reclaimed it yet, and the
+/// headroom comes back exactly once.
+#[test]
+fn a_release_of_an_expired_slice_returns_zero_and_headroom_returns_once() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let iso = Iso::new(&url);
+    iso.cap("expired-release", 5);
+    let g = iso.draw("expired-release", 5, 0).expect("draws the whole cap");
+    // NO reserve between the expiry and the release: the slice is still a row.
+    iso.advance_ms(TTL + 1);
+    assert_eq!(
+        release(iso.s(), op(), &[(g.slice_id, 5)]),
+        Ok(vec![0]),
+        "an expired slice's remainder is already back in headroom"
+    );
+    iso.draw("expired-release", 5, 0)
+        .expect("the whole cap is drawable again");
+    assert_eq!(
+        iso.draw("expired-release", 1, 0).map(drop),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "headroom came back exactly once"
+    );
+}
