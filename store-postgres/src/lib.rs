@@ -287,7 +287,14 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 /// set keep (`v3`): `store_ops` (the durable `op_id` dedupe log), `store_journal` (`append_batch`'s
 /// streams), `store_sessions`, `store_records` (`record_put`/`get`/`scan`), and `money_slots` /
 /// `money_slices` (`window_caps`, `reserve`, `slice_release`). Nothing existing changes.
-const SCHEMA_VERSION: i64 = 11;
+///
+/// v12 (store kind epoch and slice life), ADDITIVE: `money_epoch` (the ONE fleet epoch `reserve`
+/// fences with, `0` before any reserve) and `money_slices.valid_until_ms` (the instant a slice
+/// expires and its unreturned part goes back to its window's headroom). Slices a v11 build left
+/// open are stamped to expire one `SLICE_TTL_MS` after the upgrade, so money a crashed node
+/// stranded under the old never-expires grant is returned rather than held forever (v11 never
+/// shipped in a release).
+const SCHEMA_VERSION: i64 = 12;
 
 /// The plane-record kinds whose retention is TERMINAL-ONLY: `purge_plane_records_before` drops a row
 /// of one of these kinds only once its `disposition` sidecar says `Terminal`. An interrupted task
@@ -537,8 +544,29 @@ CREATE TABLE IF NOT EXISTS money_slots (
 CREATE TABLE IF NOT EXISTS money_slices (
     slice_id  BIGSERIAL PRIMARY KEY,
     slot      TEXT COLLATE \"C\" NOT NULL,
-    remaining BIGINT NOT NULL
+    remaining BIGINT NOT NULL,
+    valid_until_ms BIGINT NOT NULL DEFAULT 0
 );
+-- The fleet's ONE epoch (a u64 stored bit for bit); the single row is the CHECK-pinned `one`.
+CREATE TABLE IF NOT EXISTS money_epoch (
+    one   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (one),
+    epoch BIGINT NOT NULL
+);
+INSERT INTO money_epoch (one, epoch) VALUES (TRUE, 0) ON CONFLICT DO NOTHING;
+";
+
+/// The v12 additions on tables an older database already has (`SCHEMA`'s `CREATE TABLE IF NOT
+/// EXISTS` never alters an existing table). `IF NOT EXISTS` throughout, so a re-run is harmless;
+/// `migrate_locked` runs it only when crossing into v12. The index follows the column it covers.
+const MIGRATE_V12: &str = "
+CREATE TABLE IF NOT EXISTS money_epoch (
+    one   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (one),
+    epoch BIGINT NOT NULL
+);
+INSERT INTO money_epoch (one, epoch) VALUES (TRUE, 0) ON CONFLICT DO NOTHING;
+ALTER TABLE money_slices ADD COLUMN IF NOT EXISTS valid_until_ms BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS money_slices_open_idx ON money_slices (slot, valid_until_ms)
+    WHERE remaining <> 0;
 ";
 
 /// The v10 column additions on tables a 1.5.x database already has. `IF NOT EXISTS`, so a re-run
@@ -576,6 +604,9 @@ pub(crate) struct Shared {
     /// the 1.5.5 store's one mutex-guarded connection (it had no pool setting). An op waits for it
     /// while another holds it, as 1.5.5's ops waited on the mutex.
     pub(crate) pool: std::sync::Arc<busbar_contract::abi::sdk::store::wire::Pool>,
+    /// The endpoint (an index into the DSN's list) that last connected: the next connect tries it
+    /// first, so a failover DSN keeps asking for the kept connection's own endpoint.
+    pub(crate) endpoint: std::sync::atomic::AtomicUsize,
 }
 
 /// ONE OP'S CONNECTION: the 1.5.5 bodies run on it, as they ran on the mutex-guarded client.
@@ -640,6 +671,7 @@ impl PostgresStore {
                 secret,
                 ops_swept_at: AtomicU64::new(0),
                 pool: busbar_contract::abi::sdk::store::wire::Pool::new(KEPT_CONNECTIONS),
+                endpoint: std::sync::atomic::AtomicUsize::new(0),
             }),
         })
     }
@@ -657,7 +689,7 @@ impl Session {
         wire: busbar_contract::abi::sdk::store::wire::Wire,
         shared: std::sync::Arc<Shared>,
     ) -> Result<Self, String> {
-        match Client::connect(wire, &shared.config).await {
+        match Client::connect(wire, &shared.config, &shared.endpoint).await {
             Ok(client) => Ok(Self { client, shared }),
             Err(e) => Err(scrub(render_pg_error(&e), shared.secret.as_deref())),
         }
@@ -666,7 +698,7 @@ impl Session {
     /// The op is done: its connection is kept for the next op if the session is idle, else
     /// discarded ([`Client::release`]).
     pub(crate) async fn close(mut self) {
-        self.client.release();
+        self.client.release().await;
     }
 
     fn lock(&mut self) -> &mut Client {
@@ -812,6 +844,21 @@ impl Session {
                 "ALTER TABLE usage_metering DROP CONSTRAINT IF EXISTS usage_metering_pkey;
                  ALTER TABLE usage_metering ADD CONSTRAINT usage_metering_pkey
                      PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms);",
+            )
+            .await
+            .store()?;
+        }
+        // v12 — see SCHEMA_VERSION. Gated like v10: `ALTER TABLE` locks `money_slices` even as a
+        // no-op. Every slice still open was granted by a build that never expired one, so each is
+        // stamped to expire one `SLICE_TTL_MS` from the database's clock (the store's one clock).
+        if version < 12 {
+            tx.batch_execute(MIGRATE_V12).await.store()?;
+            let ttl = busbar_contract::abi::store::SLICE_TTL_MS as i64;
+            tx.execute(
+                "UPDATE money_slices SET valid_until_ms =
+                     (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint + $1
+                 WHERE valid_until_ms = 0 AND remaining <> 0",
+                &[&ttl],
             )
             .await
             .store()?;
@@ -1339,8 +1386,9 @@ impl Session {
                     params.push(*unit);
                     params.push(count);
                 }
-                // Two ModelTokens entries for one model would name the same unit twice; summed,
-                // the same way `UsageLedger::apply_delta` folds them, rather than a key violation.
+                // Two ModelTokens entries for one model never reach this statement: the
+                // reserved-column INSERT above has no ON CONFLICT, so it refuses them (23505)
+                // first, as 1.5.5's put_usage did.
                 sql.push_str(
                     " ON CONFLICT (bucket_id, window_start, model, unit) DO UPDATE SET \
                      count = usage_ledger_units.count + EXCLUDED.count",
@@ -2136,7 +2184,24 @@ impl Session {
         )
         .await
         .store()?;
-        if !delta.models.is_empty() {
+        // `UsageDelta.models` is a plain Vec, so one model may be named twice; the contract's
+        // `UsageLedger::apply_delta` folds the entries sequentially, flooring each counter at 0
+        // after every entry. A single `UPDATE … FROM (VALUES …)` applies only ONE joined row per
+        // target row, so a second entry for the same model would be silently dropped. Apply the
+        // entries in ROUNDS instead: round k holds the k-th occurrence of each model, so no round
+        // names a model twice, and the rounds run in order to reproduce the sequential fold. A
+        // delta without duplicates is exactly one round, i.e. the statements it always issued.
+        let mut rounds: Vec<Vec<&busbar_contract::records::ModelTokensDelta>> = Vec::new();
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for m in &delta.models {
+            let n = seen.entry(m.model.as_str()).or_insert(0);
+            if rounds.len() <= *n {
+                rounds.push(Vec::new());
+            }
+            rounds[*n].push(m);
+            *n += 1;
+        }
+        for models in &rounds {
             // TWO statements, both batched over every model, and the split is what makes a
             // NEGATIVE delta (a refund) land. An `INSERT … ON CONFLICT DO UPDATE` can only add
             // `EXCLUDED.col` on conflict, and EXCLUDED is the row the INSERT would have written —
@@ -2144,8 +2209,7 @@ impl Session {
             // row added 0 and was silently lost. Instead: make sure every model's row exists (at
             // zero), then apply the SIGNED deltas to it in one UPDATE, floored at 0 there. A refund
             // against a fresh row floors to 0, exactly as `UsageLedger::apply_model_delta` does.
-            let deltas: Vec<[i64; 4]> = delta
-                .models
+            let deltas: Vec<[i64; 4]> = models
                 .iter()
                 .map(|m| RESERVED_COLUMNS.map(|u| m.usage_units.get(u).copied().unwrap_or(0)))
                 .collect();
@@ -2159,15 +2223,14 @@ impl Session {
                     tokens_cache_write = GREATEST(0, u.tokens_cache_write + v.dcw) \
                  FROM (VALUES ",
             );
-            let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
-                Vec::with_capacity(2 + delta.models.len());
+            let mut ensure_params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(2 + models.len());
             let mut update_params: Vec<&(dyn ToSql + Sync)> =
-                Vec::with_capacity(2 + delta.models.len() * 5);
+                Vec::with_capacity(2 + models.len() * 5);
             ensure_params.push(&bucket_id);
             ensure_params.push(&ws);
             update_params.push(&bucket_id);
             update_params.push(&ws);
-            for (i, (m, d)) in delta.models.iter().zip(deltas.iter()).enumerate() {
+            for (i, (m, d)) in models.iter().zip(deltas.iter()).enumerate() {
                 if i > 0 {
                     ensure.push(',');
                     update.push(',');
@@ -2197,8 +2260,7 @@ impl Session {
             tx.execute(&update, &update_params).await.store()?;
 
             // The OPEN unit classes, the same ensure-then-signed-update shape.
-            let opens: Vec<(&String, &String, i64)> = delta
-                .models
+            let opens: Vec<(&String, &String, i64)> = models
                 .iter()
                 .flat_map(|m| {
                     m.usage_units
@@ -2434,9 +2496,10 @@ impl Session {
         // worth reporting, and this store never restates a digest it was handed).
         //
         // The INSERT and the read-back share ONE transaction and the read takes `FOR SHARE`, so the
-        // conflicting row cannot be purged out from under the comparison; the bounded loop covers
-        // the row vanishing before the share lock lands (the position is then free, so insert). No
-        // path returns Ok without the record being stored.
+        // conflicting row cannot be purged out from under the comparison. There is no retry loop: if
+        // the row vanishes before the share lock lands (the position is then free) this returns
+        // `Ok(false)`, NOT success, and the v3 caller turns that into a failure the kernel retries.
+        // No path returns `Ok(true)` without the record being stored.
         let inserted = tx
             .execute(
                 "INSERT INTO plane_chain (kind, parent, seq, id, ts, disposition, body)

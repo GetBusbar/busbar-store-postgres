@@ -9,6 +9,8 @@
 //!   trusting a CA minted for the run, and the server is an in-test TLS proxy in front of the live
 //!   server (it answers the `SSLRequest`, accepts TLS, and forwards the plaintext). A write and a
 //!   read round-trip; without the CA the load fails in the driver's words.
+//! * The connect path against fake servers and the live one: a hostile or silent server, the connect
+//!   timeout, endpoint failover and `target_session_attrs`.
 //! * The instance keeps ONE connection across its ops (1.5.5's one mutex-guarded connection): every
 //!   op of a store runs on the same server backend.
 
@@ -212,7 +214,7 @@ fn tls_proxy(upstream: String, server: Arc<rustls::ServerConfig>) -> u16 {
 /// The live server's settings with the proxy in front: `postgres://...@localhost:<port>/...?sslmode=verify-full`.
 fn through_proxy(url: &str, port: u16) -> (String, String) {
     let c = Config::parse(url).expect("the live url parses");
-    let upstream = format!("{}:{}", c.host, c.port);
+    let upstream = c.targets()[0].1.clone();
     let tls = format!(
         "postgres://{}:{}@localhost:{port}/{}?sslmode=verify-full",
         c.user,
@@ -305,4 +307,586 @@ fn the_store_keeps_one_connection_across_its_ops() {
         backends(&mut raw).is_empty()
     });
     assert!(gone, "closing the instance closes its kept connection");
+}
+
+// ── the connect path against servers that misbehave ─────────────────────────────────────────
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::Instant;
+
+use busbar_contract::abi::sdk::store::{Cap, Cell, CellKey, Dimension, ReserveRefused};
+use busbar_contract::abi::store::OpId;
+
+use super::harness::{open_loaded, TestStore};
+
+/// One backend message: tag, length, body.
+fn msg(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut m = vec![tag];
+    m.extend_from_slice(&(body.len() as u32 + 4).to_be_bytes());
+    m.extend_from_slice(body);
+    m
+}
+
+/// `AuthenticationOk` and `ReadyForQuery`: a server that lets anyone in.
+fn welcome() -> Vec<u8> {
+    let mut m = msg(b'R', &0_u32.to_be_bytes());
+    m.extend(msg(b'Z', b"I"));
+    m
+}
+
+/// A FATAL `ErrorResponse` with SQLSTATE `code`.
+fn fatal(code: &str, text: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (tag, v) in [(b'S', "FATAL"), (b'C', code), (b'M', text)] {
+        body.push(tag);
+        body.extend_from_slice(v.as_bytes());
+        body.push(0);
+    }
+    body.push(0);
+    msg(b'E', &body)
+}
+
+/// Serve every connection on a thread running `handler`: the port.
+fn fake_server(handler: impl Fn(TcpStream) + Send + Sync + 'static) -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = l.local_addr().expect("addr").port();
+    let handler = Arc::new(handler);
+    std::thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(s) = s else { return };
+            let handler = handler.clone();
+            std::thread::spawn(move || handler(s));
+        }
+    });
+    port
+}
+
+/// A server that accepts the connection and never answers it.
+fn silent_server() -> u16 {
+    fake_server(|mut s| {
+        let mut b = [0_u8; 1024];
+        while s.read(&mut b).is_ok_and(|n| n > 0) {}
+    })
+}
+
+/// The StartupMessage a client opens with (no SSLRequest), read whole.
+fn read_startup(s: &mut TcpStream) -> std::io::Result<()> {
+    let mut len = [0_u8; 4];
+    s.read_exact(&mut len)?;
+    let mut rest = vec![0_u8; (u32::from_be_bytes(len) as usize).saturating_sub(4)];
+    s.read_exact(&mut rest)
+}
+
+/// One frontend message after startup: (tag, body).
+fn read_frontend(s: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut head = [0_u8; 5];
+    s.read_exact(&mut head)?;
+    let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+    let mut body = vec![0_u8; len.saturating_sub(4)];
+    s.read_exact(&mut body)?;
+    Ok((head[0], body))
+}
+
+/// A server that answers the extended-protocol `SHOW transaction_read_only` with `value`, counting
+/// the statements it was sent (`shows`) and every other one (`others`).
+fn read_only_server(value: &'static str, shows: Arc<AtomicUsize>, others: Arc<AtomicUsize>) -> u16 {
+    fake_server(move |mut s| {
+        if read_startup(&mut s).is_err() || s.write_all(&welcome()).is_err() {
+            return;
+        }
+        let (mut sql, mut bound) = (String::new(), false);
+        while let Ok((tag, body)) = read_frontend(&mut s) {
+            match tag {
+                b'P' => {
+                    // Parse: the statement name, then the query text.
+                    let text = &body[body.iter().position(|b| *b == 0).unwrap_or(0) + 1..];
+                    sql = String::from_utf8_lossy(
+                        &text[..text.iter().position(|b| *b == 0).unwrap_or(0)],
+                    )
+                    .into_owned();
+                    if sql.starts_with("SHOW") {
+                        shows.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        others.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                b'Q' => {
+                    others.fetch_add(1, Ordering::SeqCst);
+                    let mut out = msg(b'C', b"OK\0");
+                    out.extend(msg(b'Z', b"I"));
+                    if s.write_all(&out).is_err() {
+                        return;
+                    }
+                }
+                b'B' => bound = true,
+                b'S' => {
+                    let mut out = Vec::new();
+                    if bound {
+                        out.extend(msg(b'2', b""));
+                        let mut row = 1_i16.to_be_bytes().to_vec();
+                        row.extend_from_slice(&(value.len() as i32).to_be_bytes());
+                        row.extend_from_slice(value.as_bytes());
+                        out.extend(msg(b'D', &row));
+                        out.extend(msg(b'C', b"SHOW\0"));
+                        bound = false;
+                    } else {
+                        out.extend(msg(b'1', b""));
+                        out.extend(msg(b't', &0_i16.to_be_bytes()));
+                        let mut col = b"transaction_read_only\0".to_vec();
+                        col.extend_from_slice(&0_i32.to_be_bytes());
+                        col.extend_from_slice(&0_i16.to_be_bytes());
+                        col.extend_from_slice(&25_i32.to_be_bytes());
+                        col.extend_from_slice(&(-1_i16).to_be_bytes());
+                        col.extend_from_slice(&(-1_i32).to_be_bytes());
+                        col.extend_from_slice(&0_i16.to_be_bytes());
+                        let mut rd = 1_i16.to_be_bytes().to_vec();
+                        rd.extend(col);
+                        out.extend(msg(b'T', &rd));
+                    }
+                    out.extend(msg(b'Z', b"I"));
+                    if s.write_all(&out).is_err() {
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let _ = sql;
+    })
+}
+
+/// Open the store on `settings` on a thread, so a connect that never returns FAILS the test
+/// instead of hanging it: the open's result, or `None` past `within`.
+fn open_within(settings: String, within: Duration) -> Option<Result<(), String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(open_loaded(&settings).map(drop));
+    });
+    rx.recv_timeout(within).ok()
+}
+
+/// A keyword connection string for the live server's credentials at `endpoints` (host, port),
+/// with `extra` options.
+fn dsn_at(live: &str, endpoints: &[(&str, u16)], extra: &str) -> String {
+    let c = Config::parse(live).expect("the live url parses");
+    let hosts: Vec<&str> = endpoints.iter().map(|e| e.0).collect();
+    let ports: Vec<String> = endpoints.iter().map(|e| e.1.to_string()).collect();
+    format!(
+        "host={} port={} user='{}' password='{}' dbname='{}' {extra}",
+        hosts.join(","),
+        ports.join(","),
+        c.user,
+        c.password.clone().unwrap_or_default(),
+        c.dbname.clone().unwrap_or_default()
+    )
+}
+
+/// The live server's (host, port).
+fn live_endpoint(live: &str) -> (String, u16) {
+    let c = Config::parse(live).expect("the live url parses");
+    let target = c.targets()[0].1.clone();
+    let (h, p) = target.rsplit_once(':').expect("host:port");
+    (h.to_string(), p.parse().expect("port"))
+}
+
+fn settings_of(dsn: &str) -> String {
+    serde_json::json!({ "url": dsn }).to_string()
+}
+
+/// D8 (RED before: the plaintext that followed the server's `S` stayed in the client's buffer, the
+/// host's upgrade guard looked only at the wire's input, and startup parsed it as TLS-protected):
+/// a server that answers the SSLRequest with `S` and an authentication-ok in ONE write is refused
+/// before the upgrade (CVE-2021-23222).
+#[test]
+fn plaintext_after_the_servers_s_is_refused_before_the_upgrade() {
+    let (ca_der, server) = minted();
+    let port = fake_server(move |mut s| {
+        let mut req = [0_u8; 8];
+        if s.read_exact(&mut req).is_err() {
+            return;
+        }
+        // "S" and the injected AuthenticationOk + ReadyForQuery in ONE write.
+        let mut first = b"S".to_vec();
+        first.extend(welcome());
+        if s.write_all(&first).is_err() {
+            return;
+        }
+        let mut conn = rustls::ServerConnection::new(server.clone()).expect("tls conn");
+        while conn.is_handshaking() {
+            if conn.complete_io(&mut s).is_err() {
+                return;
+            }
+        }
+        // Read what the client sends first, then close: nothing here answers the startup.
+        let mut tls = rustls::StreamOwned::new(conn, s);
+        let _ = tls.read(&mut [0_u8; 1024]);
+    });
+    let settings = settings_of(&format!(
+        "postgres://u:zq9pw@localhost:{port}/d?sslmode=verify-full"
+    ));
+    let e = open_loaded_over(&settings, |d| {
+        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&ca_der)))
+    })
+    .expect_err("a server that injects plaintext is refused");
+    assert!(
+        e.contains("server sent unencrypted data after accepting TLS"),
+        "{e}"
+    );
+}
+
+/// B9 (RED by mutation: fall back to plaintext on any answer): a server that answers the
+/// SSLRequest with `N` fails the open, it is not talked to in the clear.
+#[test]
+fn a_server_that_declines_tls_fails_the_open() {
+    let port = fake_server(|mut s| {
+        let mut req = [0_u8; 8];
+        if s.read_exact(&mut req).is_ok() {
+            let _ = s.write_all(b"N");
+            // A plaintext fallback would send its startup next; answer it so a fallback connects.
+            if read_startup(&mut s).is_ok() {
+                let _ = s.write_all(&welcome());
+                let _ = read_frontend(&mut s);
+            }
+        }
+    });
+    let e = open_loaded(&settings_of(&format!(
+        "postgres://u:zq9pw@127.0.0.1:{port}/d?sslmode=require"
+    )))
+    .expect_err("no TLS, no connection");
+    assert!(e.contains("server does not support TLS"), "{e}");
+}
+
+/// D37 (RED before: `connect_timeout` was ignored, `Wire::bound` never called, and a server that
+/// accepts TCP and never answers held the instance's one connection forever): the dial AND the
+/// handshake are bounded, and the failure is the connection's timeout.
+#[test]
+fn connect_timeout_bounds_a_server_that_never_answers() {
+    let port = silent_server();
+    let started = Instant::now();
+    let settings = settings_of(&format!(
+        "postgres://u:zq9pw@127.0.0.1:{port}/d?connect_timeout=2"
+    ));
+    let got = open_within(settings, Duration::from_secs(20))
+        .expect("the open returned: connect_timeout bounds the handshake");
+    let e = got.expect_err("a silent server never completes the handshake");
+    let took = started.elapsed();
+    assert!(
+        e.contains("deadline passed"),
+        "the connection's timeout, not another failure: {e}"
+    );
+    assert!(
+        took >= Duration::from_secs(2) && took < Duration::from_secs(10),
+        "bounded by connect_timeout=2: {took:?}"
+    );
+}
+
+/// D37/B2 (RED before: the first endpoint's handshake hung): the first endpoint accepts and stays
+/// silent, the second is the live server; the open moves on after the bound passes, which needs the
+/// bound lifted before the first connection is closed (a passed bound answers `close` too).
+#[test]
+fn an_endpoint_that_times_out_hands_over_to_the_next() {
+    let Some(url) = live_url() else { return };
+    let silent = silent_server();
+    let (host, port) = live_endpoint(&url);
+    let dsn = dsn_at(
+        &url,
+        &[("127.0.0.1", silent), (&host, port)],
+        "connect_timeout=2",
+    );
+    let started = Instant::now();
+    let got = open_within(settings_of(&dsn), Duration::from_secs(30))
+        .expect("the open returned: a silent endpoint does not hold the connect");
+    got.expect("the second endpoint answered");
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "the first endpoint was given its bound"
+    );
+}
+
+/// D37: `connect_timeout` bounds a NEW connection's dial and handshake, never the wait for the
+/// instance's one kept connection. Op A holds it longer than the timeout (blocked on a row lock);
+/// op B queued behind it still succeeds.
+#[test]
+fn an_op_queued_behind_a_long_one_is_not_cut_by_connect_timeout() {
+    let Some(url) = live_url() else { return };
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let store = TestStore::open(&format!("{url}{sep}connect_timeout=1")).expect("the store opens");
+    let sub = format!("bb_hold_{}", std::process::id());
+    let mut raw = super::connect_client_with_retry(&url);
+    raw.batch_execute("BEGIN").expect("begin");
+    raw.execute(
+        "INSERT INTO denylist (sub, reason, created_at) VALUES ($1, 'held', 0)
+         ON CONFLICT (sub) DO NOTHING",
+        &[&sub],
+    )
+    .expect("hold the row");
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| RecordStore::add_denylist(&*store, &sub, "blocked behind the lock"));
+        std::thread::sleep(Duration::from_millis(300));
+        let b = scope.spawn(|| RecordStore::list_denylist(&*store));
+        std::thread::sleep(Duration::from_millis(2500));
+        raw.batch_execute("COMMIT").expect("release the row");
+        a.join().unwrap().expect("op A finished");
+        b.join()
+            .unwrap()
+            .expect("op B, queued longer than connect_timeout, still ran");
+    });
+    raw.batch_execute(&format!("DELETE FROM denylist WHERE sub = '{sub}'"))
+        .expect("cleanup");
+}
+
+/// D12 (RED before: failover covered the dial only): an endpoint that accepts and then refuses the
+/// startup (57P03, the server starting up) hands over to the next.
+#[test]
+fn a_startup_refusal_moves_on_to_the_next_endpoint() {
+    let Some(url) = live_url() else { return };
+    let starting = fake_server(|mut s| {
+        if read_startup(&mut s).is_ok() {
+            let _ = s.write_all(&fatal("57P03", "the database system is starting up"));
+        }
+    });
+    let (host, port) = live_endpoint(&url);
+    let dsn = dsn_at(&url, &[("127.0.0.1", starting), (&host, port)], "");
+    open_loaded(&settings_of(&dsn)).expect("the second endpoint accepted the connection");
+    // All endpoints refusing: the LAST refusal is the error (the driver's).
+    let a = fake_server(|mut s| {
+        if read_startup(&mut s).is_ok() {
+            let _ = s.write_all(&fatal("57P03", "first starting up"));
+        }
+    });
+    let b = fake_server(|mut s| {
+        if read_startup(&mut s).is_ok() {
+            let _ = s.write_all(&fatal("53300", "last: too many connections"));
+        }
+    });
+    let e = open_loaded(&settings_of(&format!(
+        "host=127.0.0.1,127.0.0.1 port={a},{b} user=u password=zq9pw dbname=d"
+    )))
+    .expect_err("every endpoint refused");
+    assert!(
+        e.contains("53300") && !e.contains("57P03"),
+        "the last error: {e}"
+    );
+}
+
+/// D10 (RED before: `target_session_attrs` was ignored): `read-write` refuses a server that is
+/// read-only for the session, `read-only` one that is not.
+#[test]
+fn target_session_attrs_refuses_a_server_of_the_wrong_kind() {
+    let Some(url) = live_url() else { return };
+    let (host, port) = live_endpoint(&url);
+    let e = open_loaded(&settings_of(&dsn_at(
+        &url,
+        &[(&host, port)],
+        "target_session_attrs=read-write options='-c default_transaction_read_only=on'",
+    )))
+    .expect_err("a read-only session is refused for read-write");
+    assert!(e.contains("does not allow writes"), "{e}");
+    let e = open_loaded(&settings_of(&dsn_at(
+        &url,
+        &[(&host, port)],
+        "target_session_attrs=read-only",
+    )))
+    .expect_err("a writable session is refused for read-only");
+    assert!(e.contains("is not read-only"), "{e}");
+    open_loaded(&settings_of(&dsn_at(
+        &url,
+        &[(&host, port)],
+        "target_session_attrs=read-write",
+    )))
+    .expect("a writable server satisfies read-write");
+}
+
+/// D10: a standby listed first is passed over for the primary (the failover the attribute exists
+/// for): the first endpoint answers `on`, the second is the live server.
+#[test]
+fn a_read_only_first_endpoint_is_passed_over_for_read_write() {
+    let Some(url) = live_url() else { return };
+    let (shows, others) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let standby = read_only_server("on", shows.clone(), others.clone());
+    let (host, port) = live_endpoint(&url);
+    let dsn = dsn_at(
+        &url,
+        &[("127.0.0.1", standby), (&host, port)],
+        "target_session_attrs=read-write",
+    );
+    open_loaded(&settings_of(&dsn)).expect("the primary took the connection");
+    assert!(shows.load(Ordering::SeqCst) >= 1, "the standby was asked");
+    assert_eq!(
+        others.load(Ordering::SeqCst),
+        0,
+        "nothing but the session check ran on the standby"
+    );
+}
+
+/// D25 (RED before: an ErrorResponse followed by EOF read as "connection closed" and the server's
+/// reason was dropped): a FATAL answer to the first simple query (the migration's advisory lock)
+/// surfaces the server's SQLSTATE and message.
+#[test]
+fn a_fatal_then_eof_on_a_simple_query_surfaces_the_servers_reason() {
+    let port = fake_server(|mut s| {
+        if read_startup(&mut s).is_err() || s.write_all(&welcome()).is_err() {
+            return;
+        }
+        if read_frontend(&mut s).is_ok() {
+            let _ = s.write_all(&fatal(
+                "57P01",
+                "terminating connection due to administrator command",
+            ));
+        }
+    });
+    let e = open_loaded(&settings_of(&format!(
+        "postgres://u:zq9pw@127.0.0.1:{port}/d"
+    )))
+    .expect_err("the server shut the session down");
+    assert!(
+        e.contains("57P01") && e.contains("administrator command"),
+        "{e}"
+    );
+}
+
+/// D25, the extended protocol's first round (`run`): the FATAL answers the Parse, and the drain
+/// that follows hits EOF; the original error is the one reported.
+#[test]
+fn a_fatal_then_eof_on_a_parse_surfaces_the_servers_reason() {
+    let port = fake_server(|mut s| {
+        if read_startup(&mut s).is_err() || s.write_all(&welcome()).is_err() {
+            return;
+        }
+        while let Ok((tag, _)) = read_frontend(&mut s) {
+            match tag {
+                b'Q' => {
+                    let mut out = msg(b'C', b"OK\0");
+                    out.extend(msg(b'Z', b"I"));
+                    if s.write_all(&out).is_err() {
+                        return;
+                    }
+                }
+                b'P' => {
+                    let _ = s.write_all(&fatal(
+                        "57P01",
+                        "terminating connection due to administrator command",
+                    ));
+                    return;
+                }
+                _ => {}
+            }
+        }
+    });
+    let e = open_loaded(&settings_of(&format!(
+        "postgres://u:zq9pw@127.0.0.1:{port}/d"
+    )))
+    .expect_err("the server shut the session down");
+    assert!(
+        e.contains("57P01") && e.contains("administrator command"),
+        "{e}"
+    );
+}
+
+/// D44 (RED before: a transaction dropped uncommitted, as every refused reserve leaves it, made the
+/// session non-idle, the kept connection was discarded and the next op dialled TCP+TLS+SCRAM
+/// afresh): after an Exhausted reserve the next op runs on the same backend.
+#[test]
+fn a_refused_reserve_keeps_the_connection() {
+    let Some(url) = live_url() else { return };
+    let app = format!("bb_refuse_{}", std::process::id());
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let store = TestStore::open(&format!("{url}{sep}application_name={app}")).expect("opens");
+    let mut raw = super::connect_client_with_retry(&url);
+    let backend = |raw: &mut postgres::Client| -> Vec<(i32, String)> {
+        raw.query(
+            "SELECT pid, backend_start::text FROM pg_stat_activity WHERE application_name = $1",
+            &[&app],
+        )
+        .expect("pg_stat_activity")
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect()
+    };
+    let op = || {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let node = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        OpId::from_parts(node, N.fetch_add(1, Ordering::Relaxed) as u64)
+    };
+    let key = CellKey {
+        bucket: &app,
+        pool: None,
+        dimension: Dimension::Requests,
+        window_start: 1_790_000_000_000,
+    };
+    store
+        .window_caps(
+            op(),
+            &[Cap {
+                key,
+                cap: 3,
+                config_gen: 1,
+            }],
+        )
+        .expect("a cap");
+    let before = backend(&mut raw);
+    assert_eq!(before.len(), 1, "one kept connection: {before:?}");
+    let cell = Cell { key, amount: 2 };
+    let mut grants = Vec::new();
+    store
+        .reserve(op(), 0, [cell].into_iter(), &mut grants)
+        .expect("2 of 3");
+    let mut none = Vec::new();
+    assert_eq!(
+        store.reserve(op(), 0, [cell].into_iter(), &mut none),
+        Err(ReserveRefused::Exhausted { cell: 0 })
+    );
+    store.heads().expect("the next op");
+    assert_eq!(
+        backend(&mut raw),
+        before,
+        "the refused reserve and the op after it ran on the one backend"
+    );
+}
+
+/// B3: a failover DSN whose first endpoint is down keeps the connection that the second gave:
+/// the next op asks for that endpoint first and reuses the kept connection, instead of dialling
+/// the first, finding the kept connection is for another target and evicting it.
+#[test]
+fn a_failover_dsn_keeps_the_endpoint_that_connected() {
+    let Some(url) = live_url() else { return };
+    // A port nothing listens on: bound, then released.
+    let dead = TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let app = format!("bb_failover_{}", std::process::id());
+    let (host, port) = live_endpoint(&url);
+    let dsn = dsn_at(
+        &url,
+        &[("127.0.0.1", dead), (&host, port)],
+        &format!("application_name={app}"),
+    );
+    let store = TestStore::open(&dsn).expect("the second endpoint answered");
+    let mut raw = super::connect_client_with_retry(&url);
+    let backends = |raw: &mut postgres::Client| -> Vec<(i32, String)> {
+        raw.query(
+            "SELECT pid, backend_start::text FROM pg_stat_activity WHERE application_name = $1",
+            &[&app],
+        )
+        .expect("pg_stat_activity")
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect()
+    };
+    let after_open = backends(&mut raw);
+    assert_eq!(after_open.len(), 1, "one connection after the open");
+    for i in 0..3 {
+        RecordStore::add_denylist(&*store, &format!("{app}-{i}"), "failover").expect("a write");
+    }
+    assert_eq!(
+        backends(&mut raw),
+        after_open,
+        "every op ran on the connection the open kept"
+    );
 }
