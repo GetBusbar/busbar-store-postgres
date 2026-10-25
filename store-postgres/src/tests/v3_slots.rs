@@ -84,7 +84,6 @@ fn open_refuses_settings_without_a_url() {
         &b""[..],
         &b"  "[..],
         &b"{}"[..],
-        &br#"{"url": 5}"#[..],
         &br#"{"url": "  "}"#[..],
     ] {
         assert_eq!(
@@ -93,6 +92,21 @@ fn open_refuses_settings_without_a_url() {
             "{settings:?}"
         );
     }
+    // A present url of the wrong type says so, rather than "requires a url".
+    for settings in [&br#"{"url": 5}"#[..], &br#"{"url": null}"#[..]] {
+        assert_eq!(
+            TestStore::open_slot(settings).err().as_deref(),
+            Some("invalid postgres plugin config: `url` must be a string"),
+            "{settings:?}"
+        );
+    }
+    // An unknown top-level key is refused, never ignored.
+    assert_eq!(
+        TestStore::open_slot(br#"{"url": "postgres://u@h/d", "x": 1}"#)
+            .err()
+            .as_deref(),
+        Some("invalid postgres plugin config: unknown setting `x` (accepted: url)")
+    );
     let e = TestStore::open_slot(b"{ not json").err().unwrap();
     assert!(e.starts_with("invalid postgres plugin config:"), "{e}");
 }

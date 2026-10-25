@@ -1036,9 +1036,21 @@ fn settings_url(settings: &[u8]) -> Result<String, String> {
         serde_json::from_slice(settings)
             .map_err(|e| format!("invalid postgres plugin config: {e}"))?
     };
-    v.get("url")
-        .and_then(|x| x.as_str())
-        .map(str::trim)
+    if let Some(map) = v.as_object() {
+        if let Some(k) = map.keys().find(|k| k.as_str() != "url") {
+            return Err(format!(
+                "invalid postgres plugin config: unknown setting `{k}` (accepted: url)"
+            ));
+        }
+    }
+    let url = match v.get("url") {
+        None => None,
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        Some(_) => {
+            return Err("invalid postgres plugin config: `url` must be a string".to_string());
+        }
+    };
+    url.map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| {
