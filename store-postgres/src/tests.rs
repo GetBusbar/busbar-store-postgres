@@ -1829,7 +1829,9 @@ fn migrate_refuses_a_database_stamped_newer_than_this_build() {
         ))
         .unwrap();
     }
-    let err = TestStore::open(&iso_url).err().expect("a newer schema is refused");
+    let err = TestStore::open(&iso_url)
+        .err()
+        .expect("a newer schema is refused");
     // The loader prefixes the plugin's name; the store's own words are the tail.
     assert!(
         err.ends_with(&format!(

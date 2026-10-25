@@ -80,12 +80,7 @@ fn release(s: &TestStore, op: OpId, items: &[(u64, u64)]) -> Result<Vec<u64>, Op
 #[test]
 fn open_refuses_settings_without_a_url() {
     let want = "postgres plugin config requires a \"url\" (a libpq connection string)";
-    for settings in [
-        &b""[..],
-        &b"  "[..],
-        &b"{}"[..],
-        &br#"{"url": "  "}"#[..],
-    ] {
+    for settings in [&b""[..], &b"  "[..], &b"{}"[..], &br#"{"url": "  "}"#[..]] {
         assert_eq!(
             TestStore::open_slot(settings).err().as_deref(),
             Some(want),
@@ -1037,7 +1032,9 @@ fn a_release_of_an_expired_slice_returns_zero_and_headroom_returns_once() {
     };
     let iso = Iso::new(&url);
     iso.cap("expired-release", 5);
-    let g = iso.draw("expired-release", 5, 0).expect("draws the whole cap");
+    let g = iso
+        .draw("expired-release", 5, 0)
+        .expect("draws the whole cap");
     // NO reserve between the expiry and the release: the slice is still a row.
     iso.advance_ms(TTL + 1);
     assert_eq!(
@@ -1100,7 +1097,10 @@ fn an_unavailable_reserve_logs_the_reason_it_drops() {
         log.contains("WARN") && log.contains("reserve refused as unavailable"),
         "{log}"
     );
-    assert!(log.contains("42P01") && log.contains("money_epoch"), "{log}");
+    assert!(
+        log.contains("42P01") && log.contains("money_epoch"),
+        "{log}"
+    );
     assert!(!log.contains("postgres://"), "never the DSN: {log}");
 
     // And the live path: a reserve whose fence table is gone answers Unavailable.
