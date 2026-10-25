@@ -54,9 +54,7 @@ fn requests(bucket: &str) -> CellKey<'_> {
 }
 
 fn reserve(s: &TestStore, op: OpId, cells: &[Cell<'_>]) -> Result<Vec<Grant>, ReserveRefused> {
-    let mut grants = Vec::new();
-    s.reserve(op, 0, cells.iter().copied(), &mut grants)
-        .map(|()| grants)
+    reserve_at(s, op, 0, cells)
 }
 
 fn reserve_at(

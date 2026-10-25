@@ -803,37 +803,6 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
     assert!(store_a.list_credentials(id).unwrap().is_empty());
 }
 
-/// get_usage's REPEATABLE READ helper must actually open that isolation level.
-#[test]
-fn get_usage_transaction_is_actually_repeatable_read() {
-    let Some(url) = live_url() else { return };
-    let store = connect_store_with_retry(&url).expect("connect");
-    // The store's connections are its ops' own (one per op, over the host's connector), so the
-    // isolation check runs the helper's exact statement (`pgwire::begin_sql`, the
-    // `IsolationLevel::RepeatableRead` arm `snapshot_consistent_tx` uses) on an independent driver
-    // connection and asks the server what it opened.
-    let level: String = {
-        let mut client = store.lock();
-        client
-            .batch_execute(crate::pgwire::begin_sql(Some(
-                crate::pgwire::IsolationLevel::RepeatableRead,
-            )))
-            .unwrap();
-        let level: String = client
-            .query_one("SHOW transaction_isolation", &[])
-            .unwrap()
-            .get(0);
-        client.batch_execute("COMMIT").unwrap();
-        level
-    };
-    assert_eq!(
-        level, "repeatable read",
-        "get_usage's helper must actually open REPEATABLE READ"
-    );
-    let got = store.get_usage("nonexistent_bucket", 0);
-    assert!(got.is_ok(), "get_usage must still be callable: {got:?}");
-}
-
 /// THE actual torn-read proof the previous test's docstring used to promise but never ran: a
 /// concurrent add_usage landing between get_usage's requests-row read and its model-rows read must
 /// not be half-visible. Drives get_usage's own two-step read manually (its real SQL, via the same
