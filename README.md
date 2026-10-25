@@ -114,6 +114,13 @@ that crate and exports its `door` through `export_door!`.
   same as `disable`; libpq's default of `prefer` is not applied, because this
   store never falls back silently): set `sslmode` explicitly. A Unix-socket
   `host` is refused: the store reaches its server over TCP.
+- **SCRAM unless the operator says otherwise (ruling S4).** With no
+  `require_auth` written, the store answers only SCRAM-SHA-256 (or a server
+  that asks for no password). A server that asks for the password in clear or
+  for MD5 is refused, nothing sent, with a sentence naming the method, the
+  remedy and the server. libpq 16's `require_auth` is the switch:
+  `require_auth=md5`, `password`, a list (`md5,scram-sha-256`) or a negated
+  list (`!password`). 1.5.x answered cleartext and MD5 for any server.
 
 See the doc comments at the top of
 [`store-postgres/src/lib.rs`](store-postgres/src/lib.rs)
