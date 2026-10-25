@@ -2136,7 +2136,24 @@ impl Session {
         )
         .await
         .store()?;
-        if !delta.models.is_empty() {
+        // `UsageDelta.models` is a plain Vec, so one model may be named twice; the contract's
+        // `UsageLedger::apply_delta` folds the entries sequentially, flooring each counter at 0
+        // after every entry. A single `UPDATE … FROM (VALUES …)` applies only ONE joined row per
+        // target row, so a second entry for the same model would be silently dropped. Apply the
+        // entries in ROUNDS instead: round k holds the k-th occurrence of each model, so no round
+        // names a model twice, and the rounds run in order to reproduce the sequential fold. A
+        // delta without duplicates is exactly one round, i.e. the statements it always issued.
+        let mut rounds: Vec<Vec<&busbar_contract::records::ModelTokensDelta>> = Vec::new();
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for m in &delta.models {
+            let n = seen.entry(m.model.as_str()).or_insert(0);
+            if rounds.len() <= *n {
+                rounds.push(Vec::new());
+            }
+            rounds[*n].push(m);
+            *n += 1;
+        }
+        for models in &rounds {
             // TWO statements, both batched over every model, and the split is what makes a
             // NEGATIVE delta (a refund) land. An `INSERT … ON CONFLICT DO UPDATE` can only add
             // `EXCLUDED.col` on conflict, and EXCLUDED is the row the INSERT would have written —
@@ -2144,8 +2161,7 @@ impl Session {
             // row added 0 and was silently lost. Instead: make sure every model's row exists (at
             // zero), then apply the SIGNED deltas to it in one UPDATE, floored at 0 there. A refund
             // against a fresh row floors to 0, exactly as `UsageLedger::apply_model_delta` does.
-            let deltas: Vec<[i64; 4]> = delta
-                .models
+            let deltas: Vec<[i64; 4]> = models
                 .iter()
                 .map(|m| RESERVED_COLUMNS.map(|u| m.usage_units.get(u).copied().unwrap_or(0)))
                 .collect();
@@ -2159,15 +2175,14 @@ impl Session {
                     tokens_cache_write = GREATEST(0, u.tokens_cache_write + v.dcw) \
                  FROM (VALUES ",
             );
-            let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
-                Vec::with_capacity(2 + delta.models.len());
+            let mut ensure_params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(2 + models.len());
             let mut update_params: Vec<&(dyn ToSql + Sync)> =
-                Vec::with_capacity(2 + delta.models.len() * 5);
+                Vec::with_capacity(2 + models.len() * 5);
             ensure_params.push(&bucket_id);
             ensure_params.push(&ws);
             update_params.push(&bucket_id);
             update_params.push(&ws);
-            for (i, (m, d)) in delta.models.iter().zip(deltas.iter()).enumerate() {
+            for (i, (m, d)) in models.iter().zip(deltas.iter()).enumerate() {
                 if i > 0 {
                     ensure.push(',');
                     update.push(',');
@@ -2197,8 +2212,7 @@ impl Session {
             tx.execute(&update, &update_params).await.store()?;
 
             // The OPEN unit classes, the same ensure-then-signed-update shape.
-            let opens: Vec<(&String, &String, i64)> = delta
-                .models
+            let opens: Vec<(&String, &String, i64)> = models
                 .iter()
                 .flat_map(|m| {
                     m.usage_units
