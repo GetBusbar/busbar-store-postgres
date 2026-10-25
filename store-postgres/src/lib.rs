@@ -1339,10 +1339,9 @@ impl Session {
                     params.push(*unit);
                     params.push(count);
                 }
-                // This ON CONFLICT only guards the open-unit rows against a concurrent writer. Two
-                // ModelTokens entries for one model are refused (23505) by the reserved-column
-                // INSERT above, which has no ON CONFLICT, before this statement runs; 1.5.5
-                // refused them too.
+                // Two ModelTokens entries for one model never reach this statement: the
+                // reserved-column INSERT above has no ON CONFLICT, so it refuses them (23505)
+                // first, as 1.5.5's put_usage did.
                 sql.push_str(
                     " ON CONFLICT (bucket_id, window_start, model, unit) DO UPDATE SET \
                      count = usage_ledger_units.count + EXCLUDED.count",
