@@ -479,7 +479,10 @@ fn the_usage_ledger_carries_open_units_and_applies_refunds() {
     let store = connect_store_with_retry(&url).expect("connect");
     let bucket = "vk_units_ledger";
     hard_reset(&store, bucket);
-    let ws = 20_270_501u64;
+    // Below every other test's window (see `USAGE_PURGE_LOCK`): the purge at the end of this test is
+    // global, so it must not reach a sibling's window.
+    let _guard = lock_usage_purge();
+    let ws = 500u64;
 
     let ledger = UsageLedger {
         requests: 4,
