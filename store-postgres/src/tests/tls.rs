@@ -315,7 +315,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
-use busbar_contract::abi::sdk::store::{Cap, Cell, CellKey, Dimension, ReserveRefused};
+use busbar_contract::abi::sdk::store::OpRefused;
 use busbar_contract::abi::store::OpId;
 
 use super::harness::{open_loaded, TestStore};
@@ -784,11 +784,11 @@ fn a_fatal_then_eof_on_a_parse_surfaces_the_servers_reason() {
     );
 }
 
-/// D44 (RED before: a transaction dropped uncommitted, as every refused reserve leaves it, made the
+/// D44 (RED before: a transaction dropped uncommitted, as an `op_id` conflict leaves it, made the
 /// session non-idle, the kept connection was discarded and the next op dialled TCP+TLS+SCRAM
-/// afresh): after an Exhausted reserve the next op runs on the same backend.
+/// afresh): after a refused op the next op runs on the same backend.
 #[test]
-fn a_refused_reserve_keeps_the_connection() {
+fn a_refused_op_keeps_the_connection() {
     let Some(url) = live_url() else { return };
     let app = format!("bb_refuse_{}", std::process::id());
     let sep = if url.contains('?') { '&' } else { '?' };
@@ -812,39 +812,26 @@ fn a_refused_reserve_keeps_the_connection() {
             .as_nanos() as u64;
         OpId::from_parts(node, N.fetch_add(1, Ordering::Relaxed) as u64)
     };
-    let key = CellKey {
-        bucket: &app,
-        pool: None,
-        dimension: Dimension::Requests,
-        window_start: 1_790_000_000_000,
+    let delta = |requests: i64| busbar_contract::records::UsageDelta {
+        requests,
+        ..Default::default()
     };
+    let id = op();
     store
-        .window_caps(
-            op(),
-            &[Cap {
-                key,
-                cap: 3,
-                config_gen: 1,
-            }],
-        )
-        .expect("a cap");
+        .add_usage_op(id, &app, 4_000_000_000_000_002, &delta(1))
+        .expect("applied");
     let before = backend(&mut raw);
     assert_eq!(before.len(), 1, "one kept connection: {before:?}");
-    let cell = Cell { key, amount: 2 };
-    let mut grants = Vec::new();
-    store
-        .reserve(op(), 0, [cell].into_iter(), &mut grants)
-        .expect("2 of 3");
-    let mut none = Vec::new();
     assert_eq!(
-        store.reserve(op(), 0, [cell].into_iter(), &mut none),
-        Err(ReserveRefused::Exhausted { cell: 0 })
+        store.add_usage_op(id, &app, 4_000_000_000_000_002, &delta(2)),
+        Err(OpRefused::Conflict),
+        "the same op_id with another body is refused"
     );
-    store.heads().expect("the next op");
+    store.record_get(&app, b"k").expect("the next op");
     assert_eq!(
         backend(&mut raw),
         before,
-        "the refused reserve and the op after it ran on the one backend"
+        "the refused op and the op after it ran on the one backend"
     );
 }
 
