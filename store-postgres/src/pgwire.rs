@@ -271,7 +271,7 @@ impl Config {
             }
         }
         c.endpoints = endpoints(hosts.as_deref(), hostaddrs.as_deref(), &ports)?;
-        if c.endpoints.iter().any(|e| e.name.starts_with('/')) {
+        if c.endpoints.iter().any(|e| e.dial.starts_with('/')) {
             return Err(config_err(
                 "a Unix-socket host is not supported: the store reaches its server over TCP",
             ));
@@ -348,7 +348,7 @@ fn endpoints(
                 (true, true) => ("localhost", "localhost"),
                 (true, false) => (addr, addr),
                 (false, true) => (name, name),
-                (false, false) => (name, addr),
+                (false, false) => (if name.starts_with('/') { addr } else { name }, addr),
             };
             Ok(Endpoint {
                 name: name.to_string(),
@@ -953,10 +953,13 @@ impl Client {
     /// when the client drops. A transaction the op dropped uncommitted (a replay, a conflict, a
     /// refusal: the common ends of a write) is rolled back first, when the connection is
     /// otherwise whole, so those ends keep the connection instead of costing the next op a fresh
-    /// TCP, TLS and SCRAM handshake; a rollback that fails leaves the session not idle.
+    /// TCP, TLS and SCRAM handshake; a rollback that fails
+    /// (even one the server answers and then returns to idle) is not kept.
     pub async fn release(&mut self) {
         if self.rollback_pending && self.at_ready && self.buf.is_empty() {
-            let _ = self.settle().await;
+            if self.settle().await.is_err() {
+                return;
+            }
         }
         self.keep = self.is_idle();
     }
@@ -1536,6 +1539,17 @@ mod tests {
         assert!(e.to_string().contains("Unix-socket"), "{e}");
         let e = Config::parse("postgres://u@db1,%2Ftmp/d").unwrap_err();
         assert!(e.to_string().contains("Unix-socket"), "{e}");
+    }
+
+    /// 1.5.5 dialled `hostaddr` and used `host` only as a name, so a socket-path host beside a
+    /// hostaddr worked; the Unix-socket refusal is of what is DIALLED (RED before: refused).
+    #[test]
+    fn a_socket_path_host_beside_a_hostaddr_is_dialled_by_address() {
+        let c = Config::parse("host=/tmp hostaddr=127.0.0.1 user=u").unwrap();
+        assert_eq!(c.targets(), [("127.0.0.1", "127.0.0.1:5432".to_string())]);
+        let c = Config::parse("postgres://u@%2Ftmp/d?hostaddr=127.0.0.1").unwrap();
+        assert_eq!(c.targets(), [("127.0.0.1", "127.0.0.1:5432".to_string())]);
+        assert!(Config::parse("host=/tmp user=u").is_err());
     }
 
     /// D28 (RED before: `ranges[i]` indexed out of bounds, a panic): a DataRow with fewer fields
