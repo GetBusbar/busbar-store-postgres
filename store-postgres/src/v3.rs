@@ -300,7 +300,7 @@ impl Session {
         let before = bits(now.saturating_sub(OP_ID_RETENTION_SECS));
         // Best effort: a failed sweep leaves rows that the next sweep takes.
         let _ = self
-            .lock_client()
+            .lock()
             .execute("DELETE FROM store_ops WHERE recorded_at < $1", &[&before])
             .await;
     }
@@ -312,7 +312,7 @@ impl Session {
         body: &str,
     ) -> Result<(Transaction<'_>, Seen), String> {
         self.sweep_ops().await;
-        let mut tx = self.lock_client().transaction().await.map_err(pg)?;
+        let mut tx = self.lock().transaction().await.map_err(pg)?;
         let seen = claim(&mut tx, op, body).await?;
         Ok((tx, seen))
     }
@@ -458,7 +458,7 @@ impl Session {
 
     async fn v3_heads(&mut self) -> Result<Vec<(String, Head)>, String> {
         let rows = self
-            .lock_client()
+            .lock()
             .query(
                 "SELECT stream, MAX(seq) FROM store_journal GROUP BY stream ORDER BY stream",
                 &[],
@@ -485,7 +485,7 @@ impl Session {
         node: &str,
         principal: &str,
     ) -> Result<(), String> {
-        self.lock_client()
+        self.lock()
             .execute(
                 "INSERT INTO store_sessions (session, node, principal) VALUES ($1, $2, $3)
                  ON CONFLICT (session) DO UPDATE SET node = EXCLUDED.node,
@@ -498,7 +498,7 @@ impl Session {
     }
 
     async fn v3_session_remove(&mut self, session: u64) -> Result<(), String> {
-        self.lock_client()
+        self.lock()
             .execute(
                 "DELETE FROM store_sessions WHERE session = $1",
                 &[&bits(session)],
@@ -510,7 +510,7 @@ impl Session {
 
     async fn v3_sessions_for(&mut self, principal: &str) -> Result<Vec<(u64, String)>, String> {
         let rows = self
-            .lock_client()
+            .lock()
             .query(
                 "SELECT session, node FROM store_sessions WHERE principal = $1",
                 &[&principal],
@@ -529,7 +529,7 @@ impl Session {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), String> {
-        self.lock_client()
+        self.lock()
             .execute(
                 "INSERT INTO store_records (schema_id, key, value) VALUES ($1, $2, $3)
                  ON CONFLICT (schema_id, key) DO UPDATE SET value = EXCLUDED.value",
@@ -546,7 +546,7 @@ impl Session {
         key: &[u8],
     ) -> Result<Option<RecordBytes>, String> {
         let row = self
-            .lock_client()
+            .lock()
             .query_opt(
                 "SELECT value FROM store_records WHERE schema_id = $1 AND key = $2",
                 &[&schema, &key],
@@ -567,7 +567,7 @@ impl Session {
             return Ok(Vec::new());
         }
         let rows = self
-            .lock_client()
+            .lock()
             .query(
                 "SELECT key, value FROM store_records
                  WHERE schema_id = $1
