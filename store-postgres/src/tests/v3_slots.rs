@@ -80,19 +80,28 @@ fn release(s: &TestStore, op: OpId, items: &[(u64, u64)]) -> Result<Vec<u64>, Op
 #[test]
 fn open_refuses_settings_without_a_url() {
     let want = "postgres plugin config requires a \"url\" (a libpq connection string)";
-    for settings in [
-        &b""[..],
-        &b"  "[..],
-        &b"{}"[..],
-        &br#"{"url": 5}"#[..],
-        &br#"{"url": "  "}"#[..],
-    ] {
+    for settings in [&b""[..], &b"  "[..], &b"{}"[..], &br#"{"url": "  "}"#[..]] {
         assert_eq!(
             TestStore::open_slot(settings).err().as_deref(),
             Some(want),
             "{settings:?}"
         );
     }
+    // A present url of the wrong type says so, rather than "requires a url".
+    for settings in [&br#"{"url": 5}"#[..], &br#"{"url": null}"#[..]] {
+        assert_eq!(
+            TestStore::open_slot(settings).err().as_deref(),
+            Some("invalid postgres plugin config: `url` must be a string"),
+            "{settings:?}"
+        );
+    }
+    // An unknown top-level key is refused, never ignored.
+    assert_eq!(
+        TestStore::open_slot(br#"{"url": "postgres://u@h/d", "x": 1}"#)
+            .err()
+            .as_deref(),
+        Some("invalid postgres plugin config: unknown setting `x` (accepted: url)")
+    );
     let e = TestStore::open_slot(b"{ not json").err().unwrap();
     assert!(e.starts_with("invalid postgres plugin config:"), "{e}");
 }
@@ -1011,4 +1020,101 @@ fn record_keys_are_raw_bytes_scanned_in_byte_order() {
     assert_eq!(scan(&[0x00]), vec![vec![0x00], vec![0x00, 0xFF]]);
     assert_eq!(scan(&[0xC3, 0x28]), vec![vec![0xC3, 0x28]]);
     assert!(scan(&[0xC3, 0x29]).is_empty());
+}
+
+/// Rule (c): past `valid_until_ms` a slice IS expired and its unreturned part went back to headroom
+/// at expiry, so a release of it answers 0 even when no reserve has reclaimed it yet, and the
+/// headroom comes back exactly once.
+#[test]
+fn a_release_of_an_expired_slice_returns_zero_and_headroom_returns_once() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let iso = Iso::new(&url);
+    iso.cap("expired-release", 5);
+    let g = iso
+        .draw("expired-release", 5, 0)
+        .expect("draws the whole cap");
+    // NO reserve between the expiry and the release: the slice is still a row.
+    iso.advance_ms(TTL + 1);
+    assert_eq!(
+        release(iso.s(), op(), &[(g.slice_id, 5)]),
+        Ok(vec![0]),
+        "an expired slice's remainder is already back in headroom"
+    );
+    iso.draw("expired-release", 5, 0)
+        .expect("the whole cap is drawable again");
+    assert_eq!(
+        iso.draw("expired-release", 1, 0).map(drop),
+        Err(ReserveRefused::Exhausted { cell: 0 }),
+        "headroom came back exactly once"
+    );
+}
+
+/// A `MakeWriter` that keeps what the subscriber writes, for asserting on a log line.
+#[derive(Clone, Default)]
+struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+    type Writer = LogSink;
+    fn make_writer(&'a self) -> LogSink {
+        self.clone()
+    }
+}
+
+/// `ReserveRefused::Unavailable` has no payload on the ABI, so the reason it drops is logged first
+/// (inside a door call the plugin's `tracing` events are captured into its own log). Every site that
+/// answers Unavailable goes through `reserve_unavailable`; the line carries the reason it is given
+/// (SQLSTATE and message, already free of the DSN's password) and the answer stays Unavailable.
+///
+/// The door call itself cannot be observed from a logic-crate test: the door swaps in the contract's
+/// call capture as the thread's subscriber for the span of the call, so a subscriber installed here
+/// sees nothing from inside it. The helper is therefore driven directly, and the live path that
+/// reaches it is covered by the Unavailable answer below.
+#[test]
+fn an_unavailable_reserve_logs_the_reason_it_drops() {
+    let sink = LogSink::default();
+    let sub = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .finish();
+    let refused = tracing::subscriber::with_default(sub, || {
+        crate::v3::reserve_unavailable("42P01: relation \"money_epoch\" does not exist".into())
+    });
+    assert_eq!(refused, ReserveRefused::Unavailable);
+    let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains("WARN") && log.contains("reserve refused as unavailable"),
+        "{log}"
+    );
+    assert!(
+        log.contains("42P01") && log.contains("money_epoch"),
+        "{log}"
+    );
+    assert!(!log.contains("postgres://"), "never the DSN: {log}");
+
+    // And the live path: a reserve whose fence table is gone answers Unavailable.
+    let Some(url) = live_url() else {
+        return;
+    };
+    let iso = Iso::new(&url);
+    iso.cap("unavail", 5);
+    iso.admin
+        .borrow_mut()
+        .batch_execute(&format!("DROP TABLE {}.money_epoch", iso.schema))
+        .unwrap();
+    assert_eq!(
+        iso.draw("unavail", 1, 0).map(drop),
+        Err(ReserveRefused::Unavailable)
+    );
 }

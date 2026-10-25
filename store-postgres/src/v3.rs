@@ -172,6 +172,14 @@ fn unbits(v: i64) -> u64 {
     v as u64
 }
 
+/// `ReserveRefused::Unavailable` carries no payload on the ABI, so the reason would be lost with the
+/// refusal: log it first. `reason` is already rendered by [`pg`] (SQLSTATE and message, no row
+/// values) or scrubbed of the password by the session open; the DSN is never logged.
+pub(crate) fn reserve_unavailable(reason: String) -> ReserveRefused {
+    tracing::warn!(%reason, "postgres store: reserve refused as unavailable");
+    ReserveRefused::Unavailable
+}
+
 fn pg(e: crate::pgwire::Error) -> String {
     render_pg_error(&e)
 }
@@ -583,7 +591,7 @@ impl Session {
         epoch: u64,
         cells: &[(String, Dimension<'static>, u64)],
     ) -> Result<Vec<Grant>, ReserveRefused> {
-        let unavailable = |_: String| ReserveRefused::Unavailable;
+        let unavailable = reserve_unavailable;
         let answer = deduped!(
             self,
             op,
@@ -592,7 +600,7 @@ impl Session {
             unavailable,
             ReserveRefused,
             |tx| {
-                let down = |_: crate::pgwire::Error| ReserveRefused::Unavailable;
+                let down = |e: crate::pgwire::Error| reserve_unavailable(pg(e));
                 // THE EPOCH FENCE. Raise first, in ONE statement and compared UNSIGNED (the epoch
                 // is a u64 kept in a BIGINT; XOR with the sign bit makes BIGINT order equal u64
                 // order), so a raise is never a share-lock upgrade and two raisers cannot deadlock.
@@ -738,6 +746,43 @@ impl Session {
                 )
                 .await
                 .map_err(fail)?;
+                // Slice life (c): past `valid_until_ms` a slice IS expired and its unreturned part
+                // went back to headroom at expiry, so reclaim the expired slices of these slots
+                // (the same reclaim `reserve` does, on the database clock) before the release looks
+                // for them. A reclaimed slice is closed: it answers 0 below, and its units return once.
+                let now: i64 = tx
+                    .query_one(
+                        "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
+                        &[],
+                    )
+                    .await
+                    .map_err(fail)?
+                    .get(0);
+                let expired = tx
+                    .query(
+                        "DELETE FROM money_slices
+                         WHERE slot = ANY($1) AND remaining <> 0 AND valid_until_ms <= $2
+                         RETURNING slot, remaining",
+                        &[&slots, &now],
+                    )
+                    .await
+                    .map_err(fail)?;
+                for r in &expired {
+                    let s: String = r.get(0);
+                    let used = tx
+                        .query_opt("SELECT used FROM money_slots WHERE slot = $1", &[&s])
+                        .await
+                        .map_err(fail)?;
+                    if let Some(used) = used {
+                        let back = unbits(r.get(1));
+                        tx.execute(
+                            "UPDATE money_slots SET used = $2 WHERE slot = $1",
+                            &[&s, &bits(unbits(used.get(0)).saturating_sub(back))],
+                        )
+                        .await
+                        .map_err(fail)?;
+                    }
+                }
                 let mut open: std::collections::HashMap<u64, (String, u64)> = tx
                     .query(
                         "SELECT slice_id, slot, remaining FROM money_slices
@@ -999,9 +1044,21 @@ fn settings_url(settings: &[u8]) -> Result<String, String> {
         serde_json::from_slice(settings)
             .map_err(|e| format!("invalid postgres plugin config: {e}"))?
     };
-    v.get("url")
-        .and_then(|x| x.as_str())
-        .map(str::trim)
+    if let Some(map) = v.as_object() {
+        if let Some(k) = map.keys().find(|k| k.as_str() != "url") {
+            return Err(format!(
+                "invalid postgres plugin config: unknown setting `{k}` (accepted: url)"
+            ));
+        }
+    }
+    let url = match v.get("url") {
+        None => None,
+        Some(serde_json::Value::String(s)) => Some(s.as_str()),
+        Some(_) => {
+            return Err("invalid postgres plugin config: `url` must be a string".to_string());
+        }
+    };
+    url.map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| {
@@ -1191,7 +1248,7 @@ impl StoreSlots for PostgresStore {
             .iter()
             .map(|c| (slot(&c.key), dimension_kind(&c.key.dimension), c.amount))
             .collect();
-        let step = on_conn!(self, cx, |_: String| ReserveRefused::Unavailable, |s| s
+        let step = on_conn!(self, cx, reserve_unavailable, |s| s
             .v3_reserve(op, &body, epoch, &owned)
             .await);
         match step {
