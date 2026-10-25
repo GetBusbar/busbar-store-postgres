@@ -16,6 +16,7 @@
 
 use std::fmt;
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::BytesMut;
@@ -41,27 +42,51 @@ pub enum SslMode {
     Require,
 }
 
+/// Which kind of session a connect accepts (libpq's `target_session_attrs`, the 1.5.5 driver's
+/// set): the others libpq has (`primary`, `standby`, `prefer-standby`) the driver refused too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAttrs {
+    /// Any server.
+    Any,
+    /// A server that accepts writes (`transaction_read_only` is off).
+    ReadWrite,
+    /// A server that does not (`transaction_read_only` is on).
+    ReadOnly,
+}
+
+/// One server to try: the name it is known by (the TLS check's server name, and what is shown), the
+/// address the connector dials (libpq's `hostaddr` when given, else the name) and its port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    name: String,
+    dial: String,
+    port: u16,
+}
+
 /// A parsed connection string (the URL or the libpq keyword form).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
-    pub host: String,
-    pub port: u16,
-    /// The endpoints after the first, in order (libpq's multi-host list): a connect the first
-    /// refuses tries each in turn.
-    pub more: Vec<(String, u16)>,
+    /// The servers, in the order a connect tries them (libpq's multi-host list): a connect the
+    /// first fails tries each in turn.
+    endpoints: Vec<Endpoint>,
     pub user: String,
     pub password: Option<String>,
     pub dbname: Option<String>,
     pub application_name: Option<String>,
     pub options: Option<String>,
     pub ssl: SslMode,
+    /// `connect_timeout` in milliseconds (whole seconds in the string, as the driver read it);
+    /// `None` = no bound of the store's own.
+    connect_timeout_ms: Option<u32>,
+    target_session_attrs: SessionAttrs,
 }
 
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let first = self.endpoints.first();
         f.debug_struct("Config")
-            .field("host", &self.host)
-            .field("port", &self.port)
+            .field("host", &first.map(|e| e.name.as_str()))
+            .field("port", &first.map(|e| e.port))
             .field("user", &self.user)
             .field("dbname", &self.dbname)
             .finish_non_exhaustive()
@@ -137,30 +162,37 @@ impl Config {
             }
             if let Some(q) = query {
                 for kv in q.split('&').filter(|kv| !kv.is_empty()) {
-                    let (k, v) = kv
-                        .split_once('=')
-                        .ok_or_else(|| config_err(format!("invalid query parameter `{kv}`")))?;
+                    // The malformed pair is NOT echoed: a password holding a `?` or `&` splits
+                    // here, and its tail would land in the error (and the log).
+                    let (k, v) = kv.split_once('=').ok_or_else(|| {
+                        config_err("invalid query parameter (expected key=value)")
+                    })?;
                     pairs.push((decode(k)?, decode(v)?));
                 }
             }
         } else {
             pairs = keywords(s)?;
         }
+        // Whether the string carries a password: an unknown option's key is then not named, since
+        // a password that split on a space or `=` leaves its tail as a "key" here.
+        let has_password =
+            crate::dsn_password(s).is_some() || pairs.iter().any(|(k, _)| k == "password");
         let mut c = Config {
-            host: String::new(),
-            port: 5432,
-            more: Vec::new(),
+            endpoints: Vec::new(),
             user: String::new(),
             password: None,
             dbname: None,
             application_name: None,
             options: None,
             ssl: SslMode::Plain,
+            connect_timeout_ms: None,
+            target_session_attrs: SessionAttrs::Any,
         };
-        let (mut hosts, mut ports) = (String::new(), String::new());
+        let (mut hosts, mut hostaddrs, mut ports) = (None, None, String::new());
         for (k, v) in pairs {
             match k.as_str() {
-                "host" | "hostaddr" => hosts = v,
+                "host" => hosts = Some(v),
+                "hostaddr" => hostaddrs = Some(v),
                 "port" => ports = v,
                 "user" => c.user = v,
                 "password" => c.password = Some(v),
@@ -176,31 +208,70 @@ impl Config {
                         }
                     }
                 }
-                // Accepted and served by the host instead: its deadlines bound every connect, and
-                // its connector keeps the connection.
-                "connect_timeout"
-                | "keepalives"
+                // Whole seconds, as the 1.5.5 driver read them: more than zero bounds the dial and
+                // the handshake of a new connection, zero or less is no bound.
+                "connect_timeout" => {
+                    let secs: i64 = v
+                        .parse()
+                        .map_err(|_| config_err("invalid value for option `connect_timeout`"))?;
+                    c.connect_timeout_ms = (secs > 0)
+                        .then(|| u32::try_from(secs.saturating_mul(1000)).unwrap_or(u32::MAX));
+                }
+                "target_session_attrs" => {
+                    c.target_session_attrs = match v.as_str() {
+                        "any" => SessionAttrs::Any,
+                        "read-write" => SessionAttrs::ReadWrite,
+                        "read-only" => SessionAttrs::ReadOnly,
+                        _ => {
+                            return Err(config_err(
+                                "invalid value for option `target_session_attrs` \
+                                 (any, read-write or read-only)",
+                            ));
+                        }
+                    }
+                }
+                // Refused rather than ignored: the 1.5.5 driver (no TLS client of its own, so no
+                // channel binding) refused `require`, and a server that gets no binding could not
+                // be the one the operator required.
+                "channel_binding" => match v.as_str() {
+                    "disable" | "prefer" => {}
+                    "require" => {
+                        return Err(config_err(
+                            "channel_binding=require is not supported: this client has no \
+                             SCRAM-SHA-256-PLUS, so it could not authenticate the way that asks \
+                             (use prefer or disable)",
+                        ));
+                    }
+                    _ => return Err(config_err("invalid value for option `channel_binding`")),
+                },
+                // Refused rather than ignored: the connection is verified against busbar's trust
+                // anchors through the host, so a root certificate named here would never apply.
+                "sslrootcert" => {
+                    return Err(config_err(
+                        "sslrootcert is not supported: the connection is verified against \
+                         busbar's trust anchors, not a per-store root certificate",
+                    ));
+                }
+                // Accepted and served by the host instead: its connector keeps the connection and
+                // its sockets.
+                "keepalives"
                 | "keepalives_idle"
-                | "target_session_attrs"
-                | "channel_binding"
                 | "load_balance_hosts"
                 | "tcp_user_timeout"
                 | "keepalives_interval"
                 | "keepalives_retries"
-                | "sslrootcert"
                 | "sslnegotiation" => {}
+                _ if has_password => {
+                    return Err(config_err(
+                        "unknown option (its name is withheld: the connection string carries a \
+                         password)",
+                    ));
+                }
                 _ => return Err(config_err(format!("unknown option `{k}`"))),
             }
         }
-        let mut endpoints = endpoints(&hosts, &ports)?.into_iter();
-        (c.host, c.port) = endpoints
-            .next()
-            .unwrap_or_else(|| ("localhost".into(), 5432));
-        c.more = endpoints.collect();
-        if std::iter::once(&c.host)
-            .chain(c.more.iter().map(|(h, _)| h))
-            .any(|h| h.starts_with('/'))
-        {
+        c.endpoints = endpoints(hosts.as_deref(), hostaddrs.as_deref(), &ports)?;
+        if c.endpoints.iter().any(|e| e.dial.starts_with('/')) {
             return Err(config_err(
                 "a Unix-socket host is not supported: the store reaches its server over TCP",
             ));
@@ -211,12 +282,13 @@ impl Config {
         Ok(c)
     }
 
-    /// Every endpoint, in the order a connect tries them: `(host, host:port)`.
+    /// Every endpoint, in the order a connect tries them: `(name, dial host:port)`.
+    #[cfg(test)]
     #[must_use]
     pub fn targets(&self) -> Vec<(&str, String)> {
-        std::iter::once((self.host.as_str(), self.port))
-            .chain(self.more.iter().map(|(h, p)| (h.as_str(), *p)))
-            .map(|(h, p)| (h, target(h, p)))
+        self.endpoints
+            .iter()
+            .map(|e| (e.name.as_str(), target(&e.dial, e.port)))
             .collect()
     }
 }
@@ -229,10 +301,25 @@ fn target(host: &str, port: u16) -> String {
     }
 }
 
-/// libpq's host and port lists, paired: one port for every host, or one port (or none, 5432) for
-/// them all. An empty host is `localhost`, an empty port 5432.
-fn endpoints(hosts: &str, ports: &str) -> Result<Vec<(String, u16)>, Error> {
-    let hosts: Vec<&str> = hosts.split(',').collect();
+/// libpq's host, hostaddr and port lists, paired by position: one port for every endpoint, or one
+/// per endpoint; a hostaddr is the address to dial (an IP) and its host the name. An endpoint with
+/// neither is `localhost`, an empty port 5432. A `host` list and a `hostaddr` list must be as long
+/// as each other.
+fn endpoints(
+    hosts: Option<&str>,
+    hostaddrs: Option<&str>,
+    ports: &str,
+) -> Result<Vec<Endpoint>, Error> {
+    let names: Vec<&str> = hosts.map_or_else(Vec::new, |h| h.split(',').collect());
+    let addrs: Vec<&str> = hostaddrs.map_or_else(Vec::new, |h| h.split(',').collect());
+    if !names.is_empty() && !addrs.is_empty() && names.len() != addrs.len() {
+        return Err(config_err(format!(
+            "could not match {} host names to {} hostaddr values",
+            names.len(),
+            addrs.len()
+        )));
+    }
+    let n = names.len().max(addrs.len()).max(1);
     let ports = ports
         .split(',')
         .map(|p| {
@@ -244,24 +331,32 @@ fn endpoints(hosts: &str, ports: &str) -> Result<Vec<(String, u16)>, Error> {
             }
         })
         .collect::<Result<Vec<u16>, Error>>()?;
-    if ports.len() != 1 && ports.len() != hosts.len() {
+    if ports.len() != 1 && ports.len() != n {
         return Err(config_err(format!(
-            "could not match {} port numbers to {} hosts",
-            ports.len(),
-            hosts.len()
+            "could not match {} port numbers to {n} hosts",
+            ports.len()
         )));
     }
-    Ok(hosts
-        .iter()
-        .enumerate()
-        .map(|(i, h)| {
-            let host = if h.is_empty() { "localhost" } else { h };
-            (
-                host.to_string(),
-                ports[if ports.len() == 1 { 0 } else { i }],
-            )
+    (0..n)
+        .map(|i| {
+            let name = names.get(i).copied().unwrap_or("");
+            let addr = addrs.get(i).copied().unwrap_or("");
+            if !addr.is_empty() && addr.parse::<std::net::IpAddr>().is_err() {
+                return Err(config_err("invalid value for option `hostaddr`"));
+            }
+            let (name, dial) = match (name.is_empty(), addr.is_empty()) {
+                (true, true) => ("localhost", "localhost"),
+                (true, false) => (addr, addr),
+                (false, true) => (name, name),
+                (false, false) => (if name.starts_with('/') { addr } else { name }, addr),
+            };
+            Ok(Endpoint {
+                name: name.to_string(),
+                dial: dial.to_string(),
+                port: ports[if ports.len() == 1 { 0 } else { i }],
+            })
         })
-        .collect())
+        .collect()
 }
 
 fn decode(s: &str) -> Result<String, Error> {
@@ -313,7 +408,11 @@ fn keywords(s: &str) -> Result<Vec<(String, String)>, Error> {
             it.next();
         }
         if it.next() != Some('=') {
-            return Err(config_err(format!("unexpected EOF after `{key}`")));
+            // The token is NOT echoed: it is not a well-formed `key=`, so it may be the tail of a
+            // password that held a space, or a userinfo without its scheme.
+            return Err(config_err(
+                "unexpected EOF: a connection parameter without `=` (expected key=value)",
+            ));
         }
         while it.peek().is_some_and(|c| c.is_whitespace()) {
             it.next();
@@ -579,7 +678,19 @@ impl Row {
                 ),
             )));
         }
-        let raw = self.ranges[i].clone().map(|r| &self.body.buffer()[r]);
+        // A DataRow with fewer fields than the RowDescription named columns is the server's
+        // protocol violation: an error on the missing column, never an out-of-bounds panic.
+        let Some(range) = self.ranges.get(i) else {
+            return Err(Error::new(Kind_::FromSql(
+                i,
+                format!(
+                    "the server sent a row of {} fields for {} columns",
+                    self.ranges.len(),
+                    self.columns.len()
+                ),
+            )));
+        };
+        let raw = range.clone().map(|r| &self.body.buffer()[r]);
         T::from_sql_nullable(ty, raw).map_err(|e| Error::new(Kind_::FromSql(i, e.to_string())))
     }
 }
@@ -624,61 +735,118 @@ pub type Param<'a> = &'a (dyn ToSql + Sync);
 
 impl Client {
     /// Connect over `wire` (its need 0) to the server `cfg` names, secure the connection when
-    /// `cfg` asks, and authenticate.
+    /// `cfg` asks, and authenticate. The endpoints are tried in order (libpq's list), the one that
+    /// last connected first (`preferred`, so a failover DSN does not evict the kept connection to
+    /// try its first endpoint again on every op): any failure of one endpoint's connect (the dial,
+    /// the TLS refusal, the server's startup error, a `target_session_attrs` mismatch) closes it
+    /// and moves on to the next, and when all fail the last failure is the error (the driver's).
     ///
     /// # Errors
     /// The connector's failure (as a connect error), a TLS refusal, or the server's refusal.
-    pub async fn connect(wire: Wire, cfg: &Config) -> Result<Client, Error> {
-        // libpq's endpoint list: open; on a refusal close and try the next, in order.
-        let mut host = cfg.host.as_str();
-        let mut failed = None;
-        for (h, target) in cfg.targets() {
-            match wire.connect(0, Some(&target)).await {
-                Ok(()) => {
-                    host = h;
-                    failed = None;
-                    break;
+    pub async fn connect(
+        wire: Wire,
+        cfg: &Config,
+        preferred: &AtomicUsize,
+    ) -> Result<Client, Error> {
+        let n = cfg.endpoints.len();
+        let first = preferred.load(Ordering::Relaxed);
+        let first = if first < n { first } else { 0 };
+        let mut last = None;
+        for i in std::iter::once(first).chain((0..n).filter(|i| *i != first)) {
+            match Self::attempt(&wire, cfg, &cfg.endpoints[i]).await {
+                Ok(c) => {
+                    preferred.store(i, Ordering::Relaxed);
+                    return Ok(c);
                 }
                 Err(e) => {
+                    // The bound comes off BEFORE the close: a bound that has passed answers every
+                    // wire call with its timeout, the close included, which would leave this
+                    // endpoint's socket in place under the next one's connect.
+                    wire.unbound();
                     wire.close().await;
-                    failed = Some(e);
+                    last = Some(e);
                 }
             }
         }
-        if let Some(e) = failed {
-            return Err(Error::connect(e));
-        }
-        let reused = wire.reused();
+        Err(last.unwrap_or_else(|| config_err("no server to connect to")))
+    }
+
+    /// One endpoint's connect: dial, secure, authenticate, check the session's kind.
+    async fn attempt(wire: &Wire, cfg: &Config, endpoint: &Endpoint) -> Result<Client, Error> {
+        // `connect_timeout` bounds a NEW connection's dial (the connector's own timeout for it) and
+        // its handshake (`Wire::bound`); never the wait for the instance's one kept connection,
+        // which another op may hold for as long as its statement runs.
+        let ms = cfg.connect_timeout_ms.unwrap_or(0);
+        wire.connect_timed(0, Some(&target(&endpoint.dial, endpoint.port)), ms)
+            .await
+            .map_err(Error::connect)?;
         let mut c = Client {
-            wire,
+            wire: wire.clone(),
             buf: BytesMut::new(),
             rollback_pending: false,
             status: b'I',
             at_ready: true,
             keep: false,
         };
-        if reused {
+        if wire.reused() {
             // A kept connection: secured and authenticated by the op that established it, and
             // idle when it was kept.
             return Ok(c);
         }
+        if ms > 0 {
+            wire.bound(ms);
+        }
+        c.handshake(cfg, endpoint).await?;
+        wire.unbound();
+        Ok(c)
+    }
+
+    async fn handshake(&mut self, cfg: &Config, endpoint: &Endpoint) -> Result<(), Error> {
         if cfg.ssl == SslMode::Require {
             let mut out = BytesMut::new();
             frontend::ssl_request(&mut out);
-            c.send(&out).await?;
-            let answer = c.read_byte().await?;
+            self.send(&out).await?;
+            let answer = self.read_byte().await?;
             if answer != b'S' {
                 return Err(Error::new(Kind_::Tls(
                     "server does not support TLS".to_string(),
                 )));
             }
-            c.wire
-                .upgrade_secure(Some(host))
+            // Anything the server sent after its `S` went out in the clear, and would be parsed
+            // after the upgrade as if the secured server had sent it (CVE-2021-23222, STARTTLS
+            // response injection). The host's guard sees only the wire's input, which this
+            // client's reads have already moved into its own buffer: the check is here.
+            if !self.buf.is_empty() {
+                return Err(Error::new(Kind_::Tls(
+                    "server sent unencrypted data after accepting TLS".to_string(),
+                )));
+            }
+            self.wire
+                .upgrade_secure(Some(&endpoint.name))
                 .await
                 .map_err(|e| Error::new(Kind_::Tls(e.to_string())))?;
         }
-        c.startup(cfg).await?;
-        Ok(c)
+        self.startup(cfg).await?;
+        if cfg.target_session_attrs != SessionAttrs::Any {
+            let row = self.query_one("SHOW transaction_read_only", &[]).await?;
+            let read_only: &str = row.try_get(0)?;
+            match (cfg.target_session_attrs, read_only) {
+                (SessionAttrs::ReadWrite, "on") => {
+                    return Err(Error::connect(
+                        "target_session_attrs=read-write refused this server: it does not allow \
+                         writes (transaction_read_only is on)",
+                    ));
+                }
+                (SessionAttrs::ReadOnly, "off") => {
+                    return Err(Error::connect(
+                        "target_session_attrs=read-only refused this server: it is not read-only \
+                         (transaction_read_only is off)",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     async fn startup(&mut self, cfg: &Config) -> Result<(), Error> {
@@ -782,8 +950,17 @@ impl Client {
     }
 
     /// The op is done with the connection: keep it if the session is idle, else it is discarded
-    /// when the client drops.
-    pub fn release(&mut self) {
+    /// when the client drops. A transaction the op dropped uncommitted (a replay, a conflict, a
+    /// refusal: the common ends of a write) is rolled back first, when the connection is
+    /// otherwise whole, so those ends keep the connection instead of costing the next op a fresh
+    /// TCP, TLS and SCRAM handshake; a rollback that fails
+    /// (even one the server answers and then returns to idle) is not kept.
+    pub async fn release(&mut self) {
+        if self.rollback_pending && self.at_ready && self.buf.is_empty() {
+            if self.settle().await.is_err() {
+                return;
+            }
+        }
         self.keep = self.is_idle();
     }
 
@@ -862,12 +1039,15 @@ impl Client {
         self.send(&out).await?;
         let mut failed = None;
         loop {
-            match self.read().await? {
-                Message::ReadyForQuery(_) => break,
-                Message::ErrorResponse(e) if failed.is_none() => {
+            match self.read().await {
+                Ok(Message::ReadyForQuery(_)) => break,
+                Ok(Message::ErrorResponse(e)) if failed.is_none() => {
                     failed = Some(Error::new(Kind_::Db(DbError::parse(&e))));
                 }
-                _ => {}
+                Ok(_) => {}
+                // A FATAL (57P01 admin shutdown, 53300) is followed by the server closing the
+                // socket: the reason it gave is the error, not the close.
+                Err(e) => return Err(failed.unwrap_or(e)),
             }
         }
         failed.map_or(Ok(()), Err)
@@ -913,7 +1093,9 @@ impl Client {
                 }
                 Message::ErrorResponse(e) => {
                     let err = Error::new(Kind_::Db(DbError::parse(&e)));
-                    self.drain().await?;
+                    // The connection is unusable when the drain fails (not idle, so not kept);
+                    // the server's error is still the one to report.
+                    let _ = self.drain().await;
                     return Err(err);
                 }
                 Message::ReadyForQuery(_) => break,
@@ -966,7 +1148,11 @@ impl Client {
         let mut affected = 0;
         let mut failed = None;
         loop {
-            match self.read().await? {
+            let message = match self.read().await {
+                Ok(m) => m,
+                Err(e) => return Err(failed.unwrap_or(e)),
+            };
+            match message {
                 Message::BindComplete | Message::EmptyQueryResponse => {}
                 Message::DataRow(body) => {
                     if failed.is_none() {
@@ -1238,6 +1424,167 @@ mod tests {
         assert_eq!(t, ["a:6000", "b:6000"]);
         let c = Config::parse("host=a,b port=1,2 user=u").unwrap();
         assert_eq!(c.targets()[1], ("b", "b:2".to_string()));
+    }
+
+    /// D11 (RED before: `host` and `hostaddr` shared one slot, the last won): `hostaddr` is the
+    /// address that is dialled and `host` the name the TLS check and the errors use (libpq, and the
+    /// 1.5.5 driver), paired by position; a hostaddr that is no IP, or a list of another length, is
+    /// refused.
+    #[test]
+    fn hostaddr_is_dialled_and_host_is_the_name() {
+        let c = Config::parse("host=db.internal hostaddr=10.1.2.3 port=6000 user=u").unwrap();
+        assert_eq!(c.targets(), [("db.internal", "10.1.2.3:6000".to_string())]);
+        let c = Config::parse("host=a,b hostaddr=10.0.0.1,::1 user=u").unwrap();
+        assert_eq!(
+            c.targets(),
+            [
+                ("a", "10.0.0.1:5432".to_string()),
+                ("b", "[::1]:5432".to_string())
+            ]
+        );
+        let c = Config::parse("hostaddr=10.1.2.3 user=u").unwrap();
+        assert_eq!(c.targets(), [("10.1.2.3", "10.1.2.3:5432".to_string())]);
+        let e = Config::parse("host=db hostaddr=not-an-ip user=u").unwrap_err();
+        assert!(e.to_string().contains("hostaddr"), "{e}");
+        assert!(Config::parse("host=a,b hostaddr=10.0.0.1 user=u").is_err());
+        // The port list matches the longer of the two lists.
+        let c = Config::parse("hostaddr=10.0.0.1,10.0.0.2 port=1,2 user=u").unwrap();
+        assert_eq!(c.targets()[1].1, "10.0.0.2:2");
+    }
+
+    /// D10 (RED before: any value was accepted and ignored): `target_session_attrs` is `any`,
+    /// `read-write` or `read-only` (the 1.5.5 driver's set); anything else is refused naming them.
+    #[test]
+    fn target_session_attrs_takes_the_drivers_values_only() {
+        for ok in ["any", "read-write", "read-only"] {
+            Config::parse(&format!("host=db user=u target_session_attrs={ok}")).unwrap();
+        }
+        let e = Config::parse("host=db user=u target_session_attrs=primary").unwrap_err();
+        assert!(e.to_string().contains("target_session_attrs"), "{e}");
+        assert!(
+            e.to_string().contains("read-write"),
+            "names the accepted values: {e}"
+        );
+    }
+
+    /// D9 (RED before: both were accepted and silently ignored): this client has no SCRAM-PLUS, so
+    /// `channel_binding=require` could not be honoured, and the connection is verified against
+    /// busbar's trust anchors, so a per-store `sslrootcert` could not be. 1.5.5 refused both.
+    #[test]
+    fn what_this_client_cannot_honour_is_refused_not_ignored() {
+        let e = Config::parse("host=db user=u channel_binding=require").unwrap_err();
+        assert!(e.to_string().contains("channel_binding"), "{e}");
+        Config::parse("host=db user=u channel_binding=prefer").unwrap();
+        Config::parse("host=db user=u channel_binding=disable").unwrap();
+        assert!(Config::parse("host=db user=u channel_binding=sometimes").is_err());
+        let e = Config::parse("host=db user=u sslrootcert=/etc/ca.pem").unwrap_err();
+        assert!(e.to_string().contains("sslrootcert"), "{e}");
+        let e =
+            Config::parse("postgres://u@db/d?sslmode=verify-full&sslrootcert=/ca.pem").unwrap_err();
+        assert!(e.to_string().contains("sslrootcert"), "{e}");
+    }
+
+    /// D37 (RED before: accepted and ignored): `connect_timeout` is whole seconds as the driver
+    /// reads it, a number that is not one is refused.
+    #[test]
+    fn connect_timeout_is_whole_seconds() {
+        for ok in ["5", "0", "-1"] {
+            Config::parse(&format!("host=db user=u connect_timeout={ok}")).unwrap();
+        }
+        let e = Config::parse("host=db user=u connect_timeout=soon").unwrap_err();
+        assert!(e.to_string().contains("connect_timeout"), "{e}");
+        assert!(Config::parse("postgres://u@db/d?connect_timeout=2.5").is_err());
+    }
+
+    /// D26 (RED before: the unparsed fragment was echoed): a configuration error never repeats a
+    /// token of the string that is not a well-formed `key=`, because a password with a space, a `?`
+    /// or a missing `user:` prefix splits there and its tail would be echoed; an unknown option's
+    /// key is named only when the string carries no password.
+    #[test]
+    fn a_config_error_never_echoes_a_password_tail() {
+        for dsn in [
+            "host=db user=u password=pa zq9tail",
+            "postgres://u:pa?zq9tail@h/db",
+            "u:zq9tail@h/db",
+            "host=db user=u password='pa zq9tail' zq9tail",
+        ] {
+            let e = Config::parse(dsn).unwrap_err().to_string();
+            assert!(
+                !e.contains("zq9tail"),
+                "{dsn}: the error echoed a fragment: {e}"
+            );
+        }
+        // The key of an unknown option is the operator's, when no password rides along.
+        let e = Config::parse("host=db user=u zq9key=1")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("zq9key"), "{e}");
+        let e = Config::parse("host=db user=u password=s3 zq9key=1")
+            .unwrap_err()
+            .to_string();
+        assert!(!e.contains("zq9key") && e.contains("unknown option"), "{e}");
+        let e = Config::parse("postgres://u:s3@db/d?zq9key=1")
+            .unwrap_err()
+            .to_string();
+        assert!(!e.contains("zq9key") && e.contains("unknown option"), "{e}");
+    }
+
+    /// B9: the store reaches its server over TCP, so a Unix-socket host is refused in the URL
+    /// forms too (RED by mutation: drop the `starts_with('/')` refusal).
+    #[test]
+    fn a_unix_socket_host_is_refused_in_every_url_form() {
+        let e = Config::parse("postgres://u@%2Fvar%2Frun%2Fpostgresql/d").unwrap_err();
+        assert!(e.to_string().contains("Unix-socket"), "{e}");
+        let e = Config::parse("postgres://u@/d?host=/tmp").unwrap_err();
+        assert!(e.to_string().contains("Unix-socket"), "{e}");
+        let e = Config::parse("postgres://u@db1,%2Ftmp/d").unwrap_err();
+        assert!(e.to_string().contains("Unix-socket"), "{e}");
+    }
+
+    /// 1.5.5 dialled `hostaddr` and used `host` only as a name, so a socket-path host beside a
+    /// hostaddr worked; the Unix-socket refusal is of what is DIALLED (RED before: refused).
+    #[test]
+    fn a_socket_path_host_beside_a_hostaddr_is_dialled_by_address() {
+        let c = Config::parse("host=/tmp hostaddr=127.0.0.1 user=u").unwrap();
+        assert_eq!(c.targets(), [("127.0.0.1", "127.0.0.1:5432".to_string())]);
+        let c = Config::parse("postgres://u@%2Ftmp/d?hostaddr=127.0.0.1").unwrap();
+        assert_eq!(c.targets(), [("127.0.0.1", "127.0.0.1:5432".to_string())]);
+        assert!(Config::parse("host=/tmp user=u").is_err());
+    }
+
+    /// D28 (RED before: `ranges[i]` indexed out of bounds, a panic): a DataRow with fewer fields
+    /// than the RowDescription named columns is an error on the missing column, not a panic.
+    #[test]
+    fn a_data_row_short_of_its_columns_is_an_error_not_a_panic() {
+        use bytes::BytesMut;
+        use fallible_iterator::FallibleIterator;
+        use postgres_protocol::message::backend::Message;
+        use postgres_types::Type;
+        use std::sync::Arc;
+
+        // A DataRow of ONE field ("ab") against a RowDescription of two columns.
+        let mut raw = BytesMut::from(&b"D\0\0\0\x0c\0\x01\0\0\0\x02ab"[..]);
+        let Some(Message::DataRow(body)) = Message::parse(&mut raw).unwrap() else {
+            panic!("a data row");
+        };
+        let column = |name: &str| super::Column {
+            name: name.to_string(),
+            type_: Type::TEXT,
+        };
+        let columns: Arc<[super::Column]> = vec![column("a"), column("b")].into();
+        let mut ranges = Vec::new();
+        let mut it = body.ranges();
+        while let Some(r) = it.next().unwrap() {
+            ranges.push(r);
+        }
+        let row = super::Row {
+            columns,
+            body,
+            ranges,
+        };
+        assert_eq!(row.try_get::<_, &str>(0).unwrap(), "ab");
+        let e = row.try_get::<_, &str>(1).unwrap_err();
+        assert!(e.to_string().contains("column 1"), "{e}");
     }
 
     #[test]
