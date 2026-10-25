@@ -738,6 +738,43 @@ impl Session {
                 )
                 .await
                 .map_err(fail)?;
+                // Slice life (c): past `valid_until_ms` a slice IS expired and its unreturned part
+                // went back to headroom at expiry, so reclaim the expired slices of these slots
+                // (the same reclaim `reserve` does, on the database clock) before the release looks
+                // for them. A reclaimed slice is closed: it answers 0 below, and its units return once.
+                let now: i64 = tx
+                    .query_one(
+                        "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
+                        &[],
+                    )
+                    .await
+                    .map_err(fail)?
+                    .get(0);
+                let expired = tx
+                    .query(
+                        "DELETE FROM money_slices
+                         WHERE slot = ANY($1) AND remaining <> 0 AND valid_until_ms <= $2
+                         RETURNING slot, remaining",
+                        &[&slots, &now],
+                    )
+                    .await
+                    .map_err(fail)?;
+                for r in &expired {
+                    let s: String = r.get(0);
+                    let used = tx
+                        .query_opt("SELECT used FROM money_slots WHERE slot = $1", &[&s])
+                        .await
+                        .map_err(fail)?;
+                    if let Some(used) = used {
+                        let back = unbits(r.get(1));
+                        tx.execute(
+                            "UPDATE money_slots SET used = $2 WHERE slot = $1",
+                            &[&s, &bits(unbits(used.get(0)).saturating_sub(back))],
+                        )
+                        .await
+                        .map_err(fail)?;
+                    }
+                }
                 let mut open: std::collections::HashMap<u64, (String, u64)> = tx
                     .query(
                         "SELECT slice_id, slot, remaining FROM money_slices
