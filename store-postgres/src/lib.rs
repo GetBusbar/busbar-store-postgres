@@ -657,10 +657,6 @@ impl Session {
         &mut self.client
     }
 
-    pub(crate) fn lock_client(&mut self) -> &mut Client {
-        &mut self.client
-    }
-
     /// Open a transaction that gives every statement inside it ONE consistent snapshot, taken at the
     /// transaction's first statement — REPEATABLE READ, not the default READ COMMITTED (which gives
     /// each statement its own fresh snapshot, a torn-read hazard for any multi-statement read like
@@ -1119,20 +1115,15 @@ impl Session {
         // TOCTOU window the plain `SELECT` above cannot -- two concurrent delete_key calls on the
         // same id now genuinely serialize (the loser's UPDATE matches 0 rows) instead of both
         // unconditionally overwriting `deleted_at`/`revision` regardless of which committed first.
-        let changed = tx
-            .execute(
-                "UPDATE keys SET enabled=FALSE, deleted_at=$2, revision=$3 \
+        tx.execute(
+            "UPDATE keys SET enabled=FALSE, deleted_at=$2, revision=$3 \
                  WHERE id=$1 AND deleted_at IS NULL",
-                &[&id, &now, &rev],
-            )
-            .await
-            .store()?;
+            &[&id, &now, &rev],
+        )
+        .await
+        .store()?;
         // A concurrent delete_key committed between our SELECT and this UPDATE: idempotent no-op,
         // same as the `Some(true)` branch above -- not an error.
-        if changed == 0 {
-            tx.commit().await.store()?;
-            return Ok(());
-        }
         tx.commit().await.store()?;
         Ok(())
     }
@@ -2310,13 +2301,6 @@ impl Session {
         }
     }
 }
-
-const _: fn() = || {
-    fn assert_tosql<T: ToSql>() {}
-    assert_tosql::<i64>();
-    assert_tosql::<Option<i64>>();
-    assert_tosql::<bool>();
-};
 
 // ── THE PLUGIN DOOR ─────────────────────────────────────────────────────────────────────────────
 // One door, both ways in (THE DESIGN §11, DECISIONS #2 rule (1)): `v3` invokes `store_door!` over
