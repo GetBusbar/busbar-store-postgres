@@ -91,18 +91,62 @@ fn fold_client(settings: &[u8]) -> postgres::Client {
     let url = v["url"]
         .as_str()
         .expect("conformance.json's settings name a url");
-    // Straight to the live server, in the clear: the TLS front is the store's, not this client's.
+    // Straight to the live server, in the clear, as the live url's own user: the TLS front is the
+    // store's, and the canary role the store authenticates as is the suite's to make.
+    let admin = std::env::var("BUSBAR_TEST_POSTGRES_URL").unwrap_or_default();
+    let admin_userinfo = admin
+        .split_once("://")
+        .and_then(|(_, rest)| rest.rsplit_once('@'))
+        .map_or("busbar:busbar", |(u, _)| u);
     let url = url
         .replace(conformance_host::FAR_END, upstream())
-        .replace("sslmode=require", "sslmode=disable");
-    postgres::Client::connect(&url, postgres::NoTls)
-        .expect("the live Postgres accepts the test client")
+        .replace("sslmode=require", "sslmode=disable")
+        .replacen(&format!("{CANARY_ROLE}:{}", canary()), admin_userinfo, 1);
+    let mut c = postgres::Client::connect(&url, postgres::NoTls)
+        .expect("the live Postgres accepts the test client");
+    canary_role(&mut c);
+    c
+}
+
+/// THE CANARY'S ROLE: the store authenticates as it with the credential conformance.json names, so
+/// every fold's handshake carries it and the suite's canary searches for it.
+const CANARY_ROLE: &str = "conf_canary";
+
+fn canary() -> String {
+    let inputs: serde_json::Value =
+        serde_json::from_str(include_str!("conformance.json")).expect("conformance.json is JSON");
+    inputs["credentials"][0]
+        .as_str()
+        .expect("conformance.json names the canary credential")
+        .to_owned()
+}
+
+fn canary_role(c: &mut postgres::Client) {
+    static MADE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    let mut made = MADE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *made {
+        return;
+    }
+    let pw = canary();
+    c.batch_execute(&format!(
+        "DO $$ BEGIN CREATE ROLE {CANARY_ROLE} LOGIN; \
+         EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
+         ALTER ROLE {CANARY_ROLE} LOGIN PASSWORD '{pw}'; \
+         DO $$ BEGIN EXECUTE format('GRANT ALL ON DATABASE %I TO {CANARY_ROLE}', \
+         current_database()); END $$;"
+    ))
+    .expect("the canary role is made");
+    *made = true;
 }
 
 /// The suite's namespace hook: the fold's schema, made before its open.
 fn create_fold_schema(namespace: &str, settings: &[u8]) {
     fold_client(settings)
-        .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{namespace}\""))
+        .batch_execute(&format!(
+            "CREATE SCHEMA IF NOT EXISTS \"{namespace}\" AUTHORIZATION {CANARY_ROLE}"
+        ))
         .expect("the fold's schema is created");
 }
 

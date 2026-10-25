@@ -211,6 +211,16 @@ fn tls_proxy(upstream: String, server: Arc<rustls::ServerConfig>) -> u16 {
     port
 }
 
+/// The password the live fixture URL carries, as the test was handed it (the store itself only
+/// ever holds it sealed).
+fn fixture_password(url: &str) -> String {
+    url.split_once("://")
+        .and_then(|(_, rest)| rest.rsplit_once('@'))
+        .and_then(|(userinfo, _)| userinfo.split_once(':'))
+        .map(|(_, p)| p.to_owned())
+        .unwrap_or_default()
+}
+
 /// The live server's settings with the proxy in front: `postgres://...@localhost:<port>/...?sslmode=verify-full`.
 fn through_proxy(url: &str, port: u16) -> (String, String) {
     let c = Config::parse(url).expect("the live url parses");
@@ -218,7 +228,7 @@ fn through_proxy(url: &str, port: u16) -> (String, String) {
     let tls = format!(
         "postgres://{}:{}@localhost:{port}/{}?sslmode=verify-full",
         c.user,
-        c.password.clone().unwrap_or_default(),
+        fixture_password(url),
         c.dbname.clone().unwrap_or_default()
     );
     (upstream, tls)
@@ -477,7 +487,7 @@ fn dsn_at(live: &str, endpoints: &[(&str, u16)], extra: &str) -> String {
         hosts.join(","),
         ports.join(","),
         c.user,
-        c.password.clone().unwrap_or_default(),
+        fixture_password(live),
         c.dbname.clone().unwrap_or_default()
     )
 }

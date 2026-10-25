@@ -19,6 +19,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use busbar_contract::abi::sdk::cred::{Cred, CredUrl, PasswordAt, Seal};
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
 use postgres_protocol::authentication::sasl::{self, ChannelBinding, ScramSha256};
@@ -64,13 +65,14 @@ pub struct Endpoint {
 }
 
 /// A parsed connection string (the URL or the libpq keyword form).
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Config {
     /// The servers, in the order a connect tries them (libpq's multi-host list): a connect the
     /// first fails tries each in turn.
     endpoints: Vec<Endpoint>,
     pub user: String,
-    pub password: Option<String>,
+    /// The password, sealed: the chip builds every auth message from it.
+    pub password: Option<Cred>,
     pub dbname: Option<String>,
     pub application_name: Option<String>,
     pub options: Option<String>,
@@ -105,6 +107,27 @@ impl Config {
     /// A malformed string, an unknown option, a Unix-socket host (this store reaches its server
     /// over the host's connector, which dials TCP) or no user.
     pub fn parse(s: &str) -> Result<Self, Error> {
+        Self::from_cred(&CredUrl::parse(s).map_err(config_err)?)
+    }
+
+    /// [`Config::parse`] over a connection string already split, its password sealed.
+    ///
+    /// # Errors
+    /// As [`Config::parse`].
+    pub fn from_cred(input: &CredUrl) -> Result<Self, Error> {
+        match input.password_at() {
+            Some(PasswordAt::UserinfoUnencoded) => {
+                return Err(config_err("invalid query parameter (expected key=value)"))
+            }
+            Some(PasswordAt::Query("pass")) => {
+                return Err(config_err(
+                    "unknown option (its name is withheld: the connection string carries a \
+                     password)",
+                ))
+            }
+            _ => {}
+        }
+        let s = input.public();
         let mut pairs: Vec<(String, String)> = Vec::new();
         if let Some(rest) = s
             .strip_prefix("postgresql://")
@@ -175,12 +198,11 @@ impl Config {
         }
         // Whether the string carries a password: an unknown option's key is then not named, since
         // a password that split on a space or `=` leaves its tail as a "key" here.
-        let has_password =
-            crate::dsn_password(s).is_some() || pairs.iter().any(|(k, _)| k == "password");
+        let has_password = input.password().is_some();
         let mut c = Config {
             endpoints: Vec::new(),
             user: String::new(),
-            password: None,
+            password: input.password().cloned(),
             dbname: None,
             application_name: None,
             options: None,
@@ -195,7 +217,6 @@ impl Config {
                 "hostaddr" => hostaddrs = Some(v),
                 "port" => ports = v,
                 "user" => c.user = v,
-                "password" => c.password = Some(v),
                 "dbname" => c.dbname = Some(v),
                 "application_name" => c.application_name = Some(v),
                 "options" => c.options = Some(v),
@@ -883,27 +904,18 @@ impl Client {
         self.send(&out).await?;
         let password = || {
             cfg.password
-                .as_deref()
-                .map(str::as_bytes)
+                .as_ref()
                 .ok_or_else(|| Error::new(Kind_::Config("password missing".to_string())))
         };
         loop {
             match self.read().await? {
                 Message::AuthenticationOk => break,
                 Message::AuthenticationCleartextPassword => {
-                    let mut out = BytesMut::new();
-                    frontend::password_message(password()?, &mut out).map_err(parse_err)?;
-                    self.send(&out).await?;
+                    self.send_sealed(&password()?.pg_password_message()).await?;
                 }
                 Message::AuthenticationMd5Password(b) => {
-                    let hash = postgres_protocol::authentication::md5_hash(
-                        cfg.user.as_bytes(),
-                        password()?,
-                        b.salt(),
-                    );
-                    let mut out = BytesMut::new();
-                    frontend::password_message(hash.as_bytes(), &mut out).map_err(parse_err)?;
-                    self.send(&out).await?;
+                    let seal = password()?.pg_md5_message(&cfg.user, b.salt());
+                    self.send_sealed(&seal).await?;
                 }
                 Message::AuthenticationSasl(b) => {
                     let mut scram = false;
@@ -916,24 +928,39 @@ impl Client {
                             "unsupported SASL mechanism".to_string(),
                         )));
                     }
-                    let mut s = ScramSha256::new(password()?, ChannelBinding::unsupported());
+                    let pass = password()?;
+                    // The client-first message carries only a fresh nonce (and no user, as libpq
+                    // sends it); the proof is the chip's.
+                    let first = ScramSha256::new(b"", ChannelBinding::unsupported())
+                        .message()
+                        .to_vec();
                     let mut out = BytesMut::new();
-                    frontend::sasl_initial_response(sasl::SCRAM_SHA_256, s.message(), &mut out)
+                    frontend::sasl_initial_response(sasl::SCRAM_SHA_256, &first, &mut out)
                         .map_err(parse_err)?;
                     self.send(&out).await?;
                     let Message::AuthenticationSaslContinue(cont) = self.read_auth().await? else {
                         return Err(parse_err("unexpected message during SASL"));
                     };
-                    s.update(cont.data())
-                        .map_err(|e| Error::new(Kind_::Authentication(e.to_string())))?;
-                    let mut out = BytesMut::new();
-                    frontend::sasl_response(s.message(), &mut out).map_err(parse_err)?;
-                    self.send(&out).await?;
+                    let scram_err =
+                        |e: &dyn fmt::Display| Error::new(Kind_::Authentication(e.to_string()));
+                    let bare = std::str::from_utf8(&first)
+                        .ok()
+                        .and_then(|m| m.strip_prefix("n,,"))
+                        .ok_or_else(|| scram_err(&"invalid SCRAM client-first message"))?;
+                    let server_first = std::str::from_utf8(cont.data())
+                        .map_err(|_| scram_err(&"invalid message length"))?;
+                    let (seal, link) = pass
+                        .pg_scram_sha256(bare, server_first, b"n,,")
+                        .map_err(|e| scram_err(&e))?;
+                    self.send_sealed(&seal).await?;
                     let Message::AuthenticationSaslFinal(fin) = self.read_auth().await? else {
                         return Err(parse_err("unexpected message during SASL"));
                     };
-                    s.finish(fin.data())
-                        .map_err(|e| Error::new(Kind_::Authentication(e.to_string())))?;
+                    let server_final = std::str::from_utf8(fin.data())
+                        .map_err(|_| scram_err(&"invalid message length"))?;
+                    if !link.verify(server_final) {
+                        return Err(scram_err(&"invalid server signature"));
+                    }
                 }
                 Message::ErrorResponse(e) => return Err(Error::new(Kind_::Db(DbError::parse(&e)))),
                 Message::NoticeResponse(_) => {}
@@ -982,6 +1009,14 @@ impl Client {
             return;
         }
         self.keep = self.is_idle();
+    }
+
+    async fn send_sealed(&mut self, seal: &Seal) -> Result<(), Error> {
+        self.at_ready = false;
+        self.wire
+            .write_sealed(seal)
+            .await
+            .map_err(|e| Error::new(Kind_::Io(e.to_string())))
     }
 
     async fn send(&mut self, bytes: &[u8]) -> Result<(), Error> {
@@ -1402,14 +1437,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.user, "u@x");
-        assert_eq!(c.password.as_deref(), Some("p:ss"));
+        assert!(c.password.as_ref().is_some_and(|p| p.verify_eq(b"p:ss")));
         assert_eq!(c.targets()[0].1, "db.internal:6543");
         assert_eq!(c.dbname.as_deref(), Some("busbar"));
         assert_eq!(c.ssl, SslMode::Require);
         assert_eq!(c.application_name.as_deref(), Some("bb"));
         let c = Config::parse("postgresql://u@[::1]/d").unwrap();
         assert_eq!(c.targets()[0].1, "[::1]:5432");
-        assert_eq!(c.password, None);
+        assert!(c.password.is_none());
     }
 
     #[test]
@@ -1418,7 +1453,7 @@ mod tests {
             Config::parse("host = db port=5433 user=u password='se cret' dbname=x sslmode=require")
                 .unwrap();
         assert_eq!(c.targets()[0].1, "db:5433");
-        assert_eq!(c.password.as_deref(), Some("se cret"));
+        assert!(c.password.as_ref().is_some_and(|p| p.verify_eq(b"se cret")));
         assert_eq!(c.ssl, SslMode::Require);
     }
 

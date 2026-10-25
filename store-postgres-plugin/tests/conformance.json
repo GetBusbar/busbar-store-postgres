@@ -1,5 +1,6 @@
 {
-  "settings": { "url": "postgres://busbar:busbar@localhost:52670/busbar_test?sslmode=require&options=-c%20search_path%3D{fold}" },
+  "settings": { "url": "postgres://conf_canary:CANARY-pg-conf-8d1f@localhost:52670/busbar_test?sslmode=require&options=-c%20search_path%3D{fold}" },
+  "credentials": ["CANARY-pg-conf-8d1f"],
   "store": {
     "credential_kind": "sigv4",
     "node": 7,
