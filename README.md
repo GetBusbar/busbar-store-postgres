@@ -108,9 +108,12 @@ that crate and exports its `door` through `export_door!`.
   the next operation connects afresh rather than needing a restart.
 - **TLS through busbar.** `sslmode=require`, `verify-ca` and
   `verify-full` secure the connection through busbar's connector and its
-  trust anchors (always verifying the certificate and name); `disable`,
-  `allow` and `prefer` connect in plaintext, as 1.5.x (`NoTls`) did. A Unix-socket `host` is refused: the store
-  reaches its server over TCP.
+  trust anchors (always verifying the certificate and name); `disable`
+  connects in plaintext, as 1.5.x (`NoTls`) did. `allow` and `prefer` are
+  refused, never downgraded silently. An ABSENT `sslmode` is plaintext (the
+  same as `disable`; libpq's default of `prefer` is not applied, because this
+  store never falls back silently): set `sslmode` explicitly. A Unix-socket
+  `host` is refused: the store reaches its server over TCP.
 
 See the doc comments at the top of
 [`store-postgres/src/lib.rs`](store-postgres/src/lib.rs)
@@ -122,7 +125,28 @@ thin `cdylib` adapter around it.
 
 | Setting | Required | Default | Notes |
 |---|---|---|---|
-| `url` | yes | — | A libpq connection string, URL (`postgres://user:pass@host:5432/busbar?sslmode=require`) or keyword form (`host=... user=... password=... dbname=...`). Connections go through busbar's connector; `connect_timeout` (whole seconds) bounds a new connection's dial and handshake, and `channel_binding=require` and `sslrootcert` are refused (no SCRAM-PLUS; trust is busbar's). `sslmode=require`/`verify-*` secures the connection through busbar; the other modes are plaintext. |
+| `url` | yes | — | A libpq connection string, URL (`postgres://user:pass@host:5432/busbar?sslmode=require`) or keyword form (`host=... user=... password=... dbname=...`). Connections go through busbar's connector. See the lists below. |
+
+The only setting is `url`; any other top-level key is refused
+(`unknown setting`), and a `url` that is not a string is refused.
+
+**Connection-string options honoured:** `host`, `hostaddr`, `port` (a
+comma-separated list of several endpoints, tried in order), `user`,
+`password`, `dbname`, `application_name`, `options`, `target_session_attrs`
+(`any`, `read-write`, `read-only`), `channel_binding` (`disable` or `prefer`),
+`sslmode` (`disable`, `require`, `verify-ca`, `verify-full`; absent means
+`disable`) and `connect_timeout` (whole seconds; it bounds a new connection's
+dial and handshake; `0` or less means no bound, as in libpq; a value that is
+not a whole number is refused).
+
+**Refused, with an explanation (never silently ignored):** `sslmode=allow`
+and `sslmode=prefer`, `channel_binding=require` (no SCRAM-PLUS), `sslrootcert`
+(trust is busbar's), a Unix-socket `host`, `keepalives`, `keepalives_idle`,
+`keepalives_interval`, `keepalives_count` (and `keepalives_retries`),
+`load_balance_hosts`, `tcp_user_timeout` and `sslnegotiation` (the host's
+connector owns the connection and its sockets), and any unknown option.
+
+A database stamped with a newer schema than this build is refused at open.
 
 ## Build
 
@@ -166,6 +190,8 @@ store v3 table — with RED arms that prove the comparison is not
 vacuous.
 
 ### Tests need a real Postgres
+
+Run the whole workspace with `cargo test --workspace --locked`.
 
 Unlike a `kind: hook` plugin, this store's only meaningful coverage is
 against a **live Postgres** — there is no useful mock for "did the SQL
@@ -246,12 +272,6 @@ store:
 
 — see [`docs/configuration.md`](https://github.com/GetBusbar/busbar/blob/main/docs/configuration.md)
 for the full store config reference.
-
-## Tests
-
-```bash
-cargo test --workspace --locked
-```
 
 ## License
 
