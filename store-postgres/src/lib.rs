@@ -1339,8 +1339,9 @@ impl Session {
                     params.push(*unit);
                     params.push(count);
                 }
-                // Two ModelTokens entries for one model would name the same unit twice; summed,
-                // the same way `UsageLedger::apply_delta` folds them, rather than a key violation.
+                // Two ModelTokens entries for one model never reach this statement: the
+                // reserved-column INSERT above has no ON CONFLICT, so it refuses them (23505)
+                // first, as 1.5.5's put_usage did.
                 sql.push_str(
                     " ON CONFLICT (bucket_id, window_start, model, unit) DO UPDATE SET \
                      count = usage_ledger_units.count + EXCLUDED.count",
@@ -2136,7 +2137,24 @@ impl Session {
         )
         .await
         .store()?;
-        if !delta.models.is_empty() {
+        // `UsageDelta.models` is a plain Vec, so one model may be named twice; the contract's
+        // `UsageLedger::apply_delta` folds the entries sequentially, flooring each counter at 0
+        // after every entry. A single `UPDATE … FROM (VALUES …)` applies only ONE joined row per
+        // target row, so a second entry for the same model would be silently dropped. Apply the
+        // entries in ROUNDS instead: round k holds the k-th occurrence of each model, so no round
+        // names a model twice, and the rounds run in order to reproduce the sequential fold. A
+        // delta without duplicates is exactly one round, i.e. the statements it always issued.
+        let mut rounds: Vec<Vec<&busbar_contract::records::ModelTokensDelta>> = Vec::new();
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for m in &delta.models {
+            let n = seen.entry(m.model.as_str()).or_insert(0);
+            if rounds.len() <= *n {
+                rounds.push(Vec::new());
+            }
+            rounds[*n].push(m);
+            *n += 1;
+        }
+        for models in &rounds {
             // TWO statements, both batched over every model, and the split is what makes a
             // NEGATIVE delta (a refund) land. An `INSERT … ON CONFLICT DO UPDATE` can only add
             // `EXCLUDED.col` on conflict, and EXCLUDED is the row the INSERT would have written —
@@ -2144,8 +2162,7 @@ impl Session {
             // row added 0 and was silently lost. Instead: make sure every model's row exists (at
             // zero), then apply the SIGNED deltas to it in one UPDATE, floored at 0 there. A refund
             // against a fresh row floors to 0, exactly as `UsageLedger::apply_model_delta` does.
-            let deltas: Vec<[i64; 4]> = delta
-                .models
+            let deltas: Vec<[i64; 4]> = models
                 .iter()
                 .map(|m| RESERVED_COLUMNS.map(|u| m.usage_units.get(u).copied().unwrap_or(0)))
                 .collect();
@@ -2159,15 +2176,14 @@ impl Session {
                     tokens_cache_write = GREATEST(0, u.tokens_cache_write + v.dcw) \
                  FROM (VALUES ",
             );
-            let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
-                Vec::with_capacity(2 + delta.models.len());
+            let mut ensure_params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(2 + models.len());
             let mut update_params: Vec<&(dyn ToSql + Sync)> =
-                Vec::with_capacity(2 + delta.models.len() * 5);
+                Vec::with_capacity(2 + models.len() * 5);
             ensure_params.push(&bucket_id);
             ensure_params.push(&ws);
             update_params.push(&bucket_id);
             update_params.push(&ws);
-            for (i, (m, d)) in delta.models.iter().zip(deltas.iter()).enumerate() {
+            for (i, (m, d)) in models.iter().zip(deltas.iter()).enumerate() {
                 if i > 0 {
                     ensure.push(',');
                     update.push(',');
@@ -2197,8 +2213,7 @@ impl Session {
             tx.execute(&update, &update_params).await.store()?;
 
             // The OPEN unit classes, the same ensure-then-signed-update shape.
-            let opens: Vec<(&String, &String, i64)> = delta
-                .models
+            let opens: Vec<(&String, &String, i64)> = models
                 .iter()
                 .flat_map(|m| {
                     m.usage_units
@@ -2434,9 +2449,10 @@ impl Session {
         // worth reporting, and this store never restates a digest it was handed).
         //
         // The INSERT and the read-back share ONE transaction and the read takes `FOR SHARE`, so the
-        // conflicting row cannot be purged out from under the comparison; the bounded loop covers
-        // the row vanishing before the share lock lands (the position is then free, so insert). No
-        // path returns Ok without the record being stored.
+        // conflicting row cannot be purged out from under the comparison. There is no retry loop: if
+        // the row vanishes before the share lock lands (the position is then free) this returns
+        // `Ok(false)`, NOT success, and the v3 caller turns that into a failure the kernel retries.
+        // No path returns `Ok(true)` without the record being stored.
         let inserted = tx
             .execute(
                 "INSERT INTO plane_chain (kind, parent, seq, id, ts, disposition, body)
