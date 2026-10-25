@@ -900,3 +900,87 @@ fn a_failover_dsn_keeps_the_endpoint_that_connected() {
         "every op ran on the connection the open kept"
     );
 }
+
+/// A server that asks `ask` after the startup, records the tag of each message it gets back, and
+/// refuses the first with 28P01.
+fn asking_server(ask: Vec<u8>, got: Arc<std::sync::Mutex<Vec<u8>>>) -> u16 {
+    fake_server(move |mut s| {
+        if read_startup(&mut s).is_err() || s.write_all(&ask).is_err() {
+            return;
+        }
+        if let Ok((tag, _)) = read_frontend(&mut s) {
+            got.lock().unwrap().push(tag);
+            let _ = s.write_all(&fatal("28P01", "the test server saw a password"));
+        }
+    })
+}
+
+/// RULING S4 (RED before: the store answered AuthenticationCleartextPassword and
+/// AuthenticationMD5Password for any server): a server that asks for the password in clear or for
+/// MD5 gets nothing unless the operator's `require_auth` allows that method. The refusal names the
+/// method, the remedy and the server; with the allowance the password message goes out.
+#[test]
+fn a_server_asking_for_cleartext_or_md5_gets_nothing_unless_require_auth_allows_it() {
+    let cleartext = msg(b'R', &3_u32.to_be_bytes());
+    let mut md5 = 5_u32.to_be_bytes().to_vec();
+    md5.extend_from_slice(&[1, 2, 3, 4]);
+    let md5 = msg(b'R', &md5);
+    for (ask, method, allow) in [(cleartext, "in clear", "password"), (md5, "MD5", "md5")] {
+        for dsn in [
+            "postgres://u:zq9pw@127.0.0.1:{port}/d",
+            "postgres://u:zq9pw@127.0.0.1:{port}/d?require_auth=scram-sha-256",
+        ] {
+            let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let port = asking_server(ask.clone(), got.clone());
+            let dsn = dsn.replace("{port}", &port.to_string());
+            let e = open_loaded(&settings_of(&dsn)).expect_err("refused");
+            assert!(
+                e.contains(method)
+                    && e.contains(&format!("require_auth={allow}"))
+                    && e.contains(&format!("server 127.0.0.1:{port}"))
+                    && !e.contains("zq9pw"),
+                "{dsn}: {e}"
+            );
+            assert!(
+                got.lock().unwrap().is_empty(),
+                "no password message reached the server: {dsn}"
+            );
+        }
+        let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let port = asking_server(ask.clone(), got.clone());
+        let e = open_loaded(&settings_of(&format!(
+            "postgres://u:zq9pw@127.0.0.1:{port}/d?require_auth={allow}"
+        )))
+        .expect_err("the test server refuses once it has the password");
+        assert!(e.contains("28P01"), "{e}");
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec![b'p'],
+            "the password message went out"
+        );
+    }
+}
+
+/// libpq's `require_auth` rule for a server that asks for no password: allowed with none written
+/// (the 1.5.5 behaviour, a trust server), refused when the operator's list leaves `none` out.
+#[test]
+fn require_auth_without_none_refuses_a_server_that_asks_for_no_password() {
+    let port = fake_server(|mut s| {
+        if read_startup(&mut s).is_ok() {
+            let _ = s.write_all(&welcome());
+        }
+    });
+    let e = open_loaded(&settings_of(&format!(
+        "postgres://u:zq9pw@127.0.0.1:{port}/d?require_auth=scram-sha-256"
+    )))
+    .expect_err("refused");
+    assert!(
+        e.contains("asked for no authentication") && e.contains("server 127.0.0.1"),
+        "{e}"
+    );
+    let e = open_loaded(&settings_of(&format!(
+        "postgres://u:zq9pw@127.0.0.1:{port}/d"
+    )))
+    .expect_err("the test server closes after its welcome");
+    assert!(!e.contains("asked for no authentication"), "{e}");
+}

@@ -19,7 +19,8 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use busbar_contract::abi::sdk::cred::{Cred, CredUrl, PasswordAt, Seal};
+use busbar_contract::abi::sdk::chip::Refused;
+use busbar_contract::abi::sdk::cred::{Cred, CredUrl, PasswordAt, PgAuth, RequireAuth, Seal};
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
 use postgres_protocol::authentication::sasl::{self, ChannelBinding, ScramSha256};
@@ -77,6 +78,10 @@ pub struct Config {
     pub application_name: Option<String>,
     pub options: Option<String>,
     pub ssl: SslMode,
+    /// The auth methods the operator allows (libpq 16's `require_auth`; ruling S4): with none
+    /// written, SCRAM-SHA-256 or no password at all, never the password in clear or MD5. The
+    /// sealed password carries the same allowance, and the chip refuses the rest itself.
+    pub require_auth: RequireAuth,
     /// `connect_timeout` in milliseconds (whole seconds in the string, as the driver read it);
     /// `None` = no bound of the store's own.
     connect_timeout_ms: Option<u32>,
@@ -207,6 +212,7 @@ impl Config {
             application_name: None,
             options: None,
             ssl: SslMode::Plain,
+            require_auth: RequireAuth::DEFAULT,
             connect_timeout_ms: None,
             target_session_attrs: SessionAttrs::Any,
         };
@@ -237,6 +243,13 @@ impl Config {
                             return Err(config_err("invalid value for option `sslmode`"));
                         }
                     }
+                }
+                // libpq 16's switch for an auth method weaker than SCRAM (ruling S4): the operator's
+                // to write, never this store's to assume.
+                "require_auth" => {
+                    c.require_auth = RequireAuth::parse(&v).map_err(|e| {
+                        config_err(format!("invalid value for option `require_auth`: {e}"))
+                    })?;
                 }
                 // Whole seconds, as the 1.5.5 driver read them: more than zero bounds the dial and
                 // the handshake of a new connection, zero or less is no bound.
@@ -647,6 +660,27 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// The server asked for no authentication, and the operator's `require_auth` leaves `none` out.
+const NO_AUTH_REFUSED: Refused = Refused(
+    "the server asked for no authentication, which the operator's `require_auth` does not allow \
+     (add `none` to it to allow a server that asks for no password)",
+);
+
+/// RULING S4: an auth method below the operator's floor, refused before any credential byte went
+/// out. The sentence names the method, the remedy and the server, and the refusal is recorded as a
+/// credential event in the plugin's log.
+fn auth_refused(endpoint: &Endpoint, why: &dyn fmt::Display) -> Error {
+    let server = target(&endpoint.name, endpoint.port);
+    tracing::warn!(
+        target: "busbar::credential",
+        outcome = "refused",
+        server = %server,
+        reason = %why,
+        "postgres store: credential refused: the server's auth method is below the operator's floor"
+    );
+    Error::new(Kind_::Authentication(format!("{why} (server {server})")))
+}
+
 fn parse_err(e: impl fmt::Display) -> Error {
     Error::new(Kind_::Parse(e.to_string()))
 }
@@ -865,7 +899,7 @@ impl Client {
                 .await
                 .map_err(|e| Error::new(Kind_::Tls(e.to_string())))?;
         }
-        self.startup(cfg).await?;
+        self.startup(cfg, endpoint).await?;
         if cfg.target_session_attrs != SessionAttrs::Any {
             let row = self.query_one("SHOW transaction_read_only", &[]).await?;
             let read_only: &str = row.try_get(0)?;
@@ -888,7 +922,7 @@ impl Client {
         Ok(())
     }
 
-    async fn startup(&mut self, cfg: &Config) -> Result<(), Error> {
+    async fn startup(&mut self, cfg: &Config, endpoint: &Endpoint) -> Result<(), Error> {
         let mut params: Vec<(&str, &str)> = vec![("client_encoding", "UTF8"), ("user", &cfg.user)];
         if let Some(db) = &cfg.dbname {
             params.push(("database", db));
@@ -907,17 +941,31 @@ impl Client {
                 .as_ref()
                 .ok_or_else(|| Error::new(Kind_::Config("password missing".to_string())))
         };
+        let refused = |why: &dyn fmt::Display| auth_refused(endpoint, why);
+        // Whether the server asked for any authentication before its AuthenticationOk.
+        let mut asked = false;
         loop {
             match self.read().await? {
-                Message::AuthenticationOk => break,
+                Message::AuthenticationOk => {
+                    if !asked && !cfg.require_auth.allows(PgAuth::None) {
+                        return Err(refused(&NO_AUTH_REFUSED));
+                    }
+                    break;
+                }
                 Message::AuthenticationCleartextPassword => {
-                    self.send_sealed(&password()?.pg_password_message()).await?;
+                    asked = true;
+                    let seal = password()?.pg_password_message().map_err(|r| refused(&r))?;
+                    self.send_sealed(&seal).await?;
                 }
                 Message::AuthenticationMd5Password(b) => {
-                    let seal = password()?.pg_md5_message(&cfg.user, b.salt());
+                    asked = true;
+                    let seal = password()?
+                        .pg_md5_message(&cfg.user, b.salt())
+                        .map_err(|r| refused(&r))?;
                     self.send_sealed(&seal).await?;
                 }
                 Message::AuthenticationSasl(b) => {
+                    asked = true;
                     let mut scram = false;
                     let mut mechs = b.mechanisms();
                     while let Some(m) = mechs.next().map_err(parse_err)? {
@@ -927,6 +975,9 @@ impl Client {
                         return Err(Error::new(Kind_::Authentication(
                             "unsupported SASL mechanism".to_string(),
                         )));
+                    }
+                    if !cfg.require_auth.allows(PgAuth::ScramSha256) {
+                        return Err(refused(&busbar_contract::abi::sdk::chip::PG_SCRAM_REFUSED));
                     }
                     let pass = password()?;
                     // The client-first message carries only a fresh nonce (and no user, as libpq
@@ -1428,7 +1479,7 @@ impl Transaction<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{begin_sql, Config, IsolationLevel, SslMode};
+    use super::{begin_sql, Config, IsolationLevel, PgAuth, RequireAuth, SslMode};
 
     #[test]
     fn a_url_parses_into_its_parts() {
@@ -1537,6 +1588,38 @@ mod tests {
         let e =
             Config::parse("postgres://u@db/d?sslmode=verify-full&sslrootcert=/ca.pem").unwrap_err();
         assert!(e.to_string().contains("sslrootcert"), "{e}");
+    }
+
+    /// RULING S4: `require_auth` (libpq 16) is the operator's switch for an auth method weaker
+    /// than SCRAM. With none written only SCRAM-SHA-256 (or no password) is allowed; a value
+    /// libpq would refuse is refused, never read as an allowance, and never echoes the password.
+    #[test]
+    fn require_auth_is_the_operators_allowance() {
+        let c = Config::parse("postgres://u:zq9pw@db/d").unwrap();
+        assert_eq!(c.require_auth, RequireAuth::DEFAULT);
+        let c = Config::parse("postgres://u:zq9pw@db/d?require_auth=md5,scram-sha-256").unwrap();
+        assert!(c.require_auth.allows(PgAuth::Md5) && !c.require_auth.allows(PgAuth::Password));
+        assert!(c
+            .password
+            .as_ref()
+            .is_some_and(|p| p.floor().pg().allows(PgAuth::Md5)));
+        let c = Config::parse("host=db user=u password=zq9pw require_auth=password").unwrap();
+        assert!(c.require_auth.allows(PgAuth::Password));
+        for bad in ["md4", "md5,!password", "md5,md5"] {
+            for dsn in [
+                format!("host=db user=u password=zq9pw require_auth={bad}"),
+                format!("postgres://u:zq9pw@db/d?require_auth={bad}"),
+            ] {
+                let e = Config::parse(&dsn)
+                    .map(drop)
+                    .expect_err("refused")
+                    .to_string();
+                assert!(
+                    e.contains("require_auth") && !e.contains("zq9pw"),
+                    "{dsn}: {e}"
+                );
+            }
+        }
     }
 
     /// A downgrade nobody asked for is refused: `prefer` and `allow` would fall back to plaintext
