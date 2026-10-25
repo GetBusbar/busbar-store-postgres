@@ -956,10 +956,12 @@ impl Client {
     /// TCP, TLS and SCRAM handshake; a rollback that fails
     /// (even one the server answers and then returns to idle) is not kept.
     pub async fn release(&mut self) {
-        if self.rollback_pending && self.at_ready && self.buf.is_empty() {
-            if self.settle().await.is_err() {
-                return;
-            }
+        if self.rollback_pending
+            && self.at_ready
+            && self.buf.is_empty()
+            && self.settle().await.is_err()
+        {
+            return;
         }
         self.keep = self.is_idle();
     }
