@@ -12,6 +12,17 @@ use busbar_contract::records::{
 };
 
 mod harness;
+
+/// Windows are BANDED, like the plane-record timestamps. `purge_windows_before` is GLOBAL: its cutoff
+/// deletes every usage window below it in the SHARED database, whoever wrote it. The two tests that
+/// purge (here and in `v160_shapes`) therefore write ONLY windows below 2_000 and hold
+/// [`lock_usage_purge`] so they cannot take each other's rows; every other test writes windows at or
+/// above `86_400`, far above any cutoff either purge uses.
+static USAGE_PURGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_usage_purge() -> std::sync::MutexGuard<'static, ()> {
+    USAGE_PURGE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 pub(crate) use harness::TestStore;
 
 /// One model's ledger row from the four RESERVED token classes (zero classes left out, the way the
@@ -760,18 +771,26 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
     let Some(url) = live_url() else { return };
     let store_a = connect_store_with_retry(&url).expect("connect a");
     let store_b = connect_store_with_retry(&url).expect("connect b");
+    // Connected BEFORE the race starts: connecting inside the racing thread costs milliseconds the
+    // other delete does not pay, so the two deletes ran one after the other and the race this test
+    // names never happened.
+    let store_c = connect_store_with_retry(&url).expect("connect c");
     let id = "vk_concurrent_del1";
     hard_reset(&store_a, id);
     store_a.put_key(&sample_key(id)).unwrap();
     let cred = sample_cred(id, 0, "AKIA_CONCURRENT1");
     store_a.put_credential(&cred).unwrap();
 
-    let url_b = url.clone();
-    let id_b = id.to_string();
-    let handle = std::thread::spawn(move || {
-        let store_b2 = connect_store_with_retry(&url_b).expect("connect b2");
-        store_b2.delete_key(&id_b)
-    });
+    let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handle = {
+        let start = start.clone();
+        let id_c = id.to_string();
+        std::thread::spawn(move || {
+            start.wait();
+            store_c.delete_key(&id_c)
+        })
+    };
+    start.wait();
     let r1 = store_b.delete_key(id);
     let r2 = handle.join().unwrap();
     assert!(
@@ -1216,8 +1235,19 @@ fn denylist_add_is_listed_and_a_repeat_add_updates_the_reason() {
         .lock()
         .execute("DELETE FROM denylist WHERE sub=$1", &[&sub]);
 
-    let before = now_secs();
+    // Bracketed with SystemTime DIRECTLY, never the crate's own `now_secs()` (see
+    // `delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision`): with the function
+    // under test as its own oracle, a `now_secs()` stubbed to a constant satisfies the lower bound
+    // trivially.
+    let wall = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let before = wall();
     store.add_denylist(&sub, "first reason").unwrap();
+    let after = wall();
     assert!(
         store.list_denylist().unwrap().contains(&sub),
         "an added subject must appear in list_denylist"
@@ -1234,9 +1264,9 @@ fn denylist_add_is_listed_and_a_repeat_add_updates_the_reason() {
         .unwrap()
         .get(0);
     assert!(
-        read_u64(created_at) >= before,
-        "denylist.created_at must be the wall-clock second the subject was denied (expected at \
-         least {before}), got {created_at}"
+        (before..=after).contains(&read_u64(created_at)),
+        "denylist.created_at must be the wall-clock second the subject was denied (expected \
+         {before}..={after}), got {created_at}"
     );
 
     store.add_denylist(&sub, "corrected reason").unwrap();
@@ -1348,6 +1378,7 @@ fn list_audit_tail_returns_the_newest_entries_oldest_first() {
 #[test]
 fn purge_windows_and_metering_delete_only_what_is_older_than_the_boundary() {
     let Some(url) = live_url() else { return };
+    let _guard = lock_usage_purge();
     let store = connect_store_with_retry(&url).expect("connect");
     let bucket = format!("vk_purge_{}", unique_suffix());
     let old_ws = 1_000u64;
@@ -1945,10 +1976,66 @@ fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() 
         );
     }
 
+    // The failure must NAME the permission denial. `is_err()` alone is satisfied by ANY later,
+    // unrelated failure: a migrate that swallowed the 42501 and then tripped over something else
+    // (or a connect that failed for a reason that has nothing to do with this role's grants) would
+    // pass while the denial this test exists to propagate was lost.
+    let err = match TestStore::open(&limited_url) {
+        Ok(_) => panic!(
+            "migrate must never silently succeed against a role that can't actually read its own \
+             bookkeeping table"
+        ),
+        Err(e) => e,
+    };
     assert!(
-        TestStore::open(&limited_url).is_err(),
-        "migrate must never silently succeed against a role that can't actually read its own \
-         bookkeeping table"
+        err.contains("42501") || err.to_lowercase().contains("permission denied"),
+        "the refusal must carry the insufficient_privilege (42501) denial, got: {err}"
+    );
+}
+
+/// TWO NODES BOOTING AGAINST ONE FRESH DATABASE. Every node runs `migrate()` on connect, and a fleet
+/// restarted together does it at the same instant; `pg_advisory_lock` is what serialises them. Without
+/// it both run `CREATE TABLE IF NOT EXISTS` / the schema DDL concurrently, which is not safe in
+/// Postgres (concurrent creation of the same relation fails on the catalogue's unique index), so one
+/// node's connect would fail on a clean first boot. Both opens must succeed, and the version must be
+/// stamped exactly once.
+#[test]
+fn two_nodes_opening_a_fresh_database_together_both_migrate_cleanly() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_race");
+    let iso_url = tmp.url();
+
+    let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let nodes: Vec<_> = (0..2)
+        .map(|_| {
+            let (start, iso_url) = (start.clone(), iso_url.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                TestStore::open(&iso_url)
+            })
+        })
+        .collect();
+    let opened: Vec<_> = nodes.into_iter().map(|n| n.join().unwrap()).collect();
+    for (i, r) in opened.iter().enumerate() {
+        assert!(
+            r.is_ok(),
+            "node {i} failed to open a fresh database while another migrated it: {:?}",
+            r.as_ref().err()
+        );
+    }
+
+    let store = opened.into_iter().next().unwrap().unwrap();
+    let stamped: i64 = store
+        .lock()
+        .query_one(
+            "SELECT COUNT(*) FROM busbar_schema WHERE version=$1",
+            &[&SCHEMA_VERSION],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        stamped, 1,
+        "the schema version must be stamped exactly once"
     );
 }
 
