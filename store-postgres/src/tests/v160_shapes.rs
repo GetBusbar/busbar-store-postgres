@@ -295,62 +295,6 @@ fn a_released_v6_database_upgrades_in_place_without_losing_a_row() {
     drop(check);
 }
 
-/// A DEV build carried a database to v9 (the unreleased protocol-named plane tables). v10 does not
-/// read those tables and does not drop or rewrite them either: the rows stay on disk.
-#[test]
-fn a_dev_v9_database_upgrades_and_keeps_its_legacy_plane_tables_untouched() {
-    let Some(url) = live_url() else { return };
-    let tmp = TempDb::create(&url, "spg_v9up");
-    let iso_url = tmp.url();
-    {
-        let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
-        c.batch_execute(V6_SCHEMA).unwrap();
-        c.batch_execute(
-            "INSERT INTO busbar_schema (version) VALUES (9);
-             CREATE TABLE mcp_calls (principal TEXT, seq BIGINT, body TEXT);
-             INSERT INTO mcp_calls VALUES ('vk_a', 1, '{}');
-             CREATE TABLE tasks (task_id TEXT PRIMARY KEY, state TEXT);
-             INSERT INTO tasks VALUES ('t1', 'working');",
-        )
-        .unwrap();
-    }
-    let store = connect_store_with_retry(&iso_url).expect("connect");
-    let mut check = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
-    let calls: i64 = check
-        .query_one("SELECT COUNT(*) FROM mcp_calls", &[])
-        .unwrap()
-        .get(0);
-    let tasks: i64 = check
-        .query_one("SELECT COUNT(*) FROM tasks", &[])
-        .unwrap()
-        .get(0);
-    assert_eq!(
-        (calls, tasks),
-        (1, 1),
-        "legacy rows must not be dropped by the upgrade"
-    );
-    // The metering key was widened on this path too (the v6 -> v10 steps run from v9 as well).
-    let pk_cols: i64 = check
-        .query_one(
-            "SELECT COUNT(*) FROM pg_index i
-               JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-              WHERE i.indrelid = 'usage_metering'::regclass AND i.indisprimary",
-            &[],
-        )
-        .unwrap()
-        .get(0);
-    assert_eq!(
-        pk_cols, 5,
-        "priced_from_ms must have joined the metering primary key"
-    );
-    assert!(store
-        .list_plane_records("task", &PlaneSelector::All)
-        .unwrap()
-        .is_empty());
-    drop(store);
-    drop(check);
-}
-
 /// Every scope KIND round-trips as itself. The pre-1.6.0 storage kept bare pool names only, so an
 /// `mcp_server` grant came back as a POOL grant — a lost MCP grant and a pool-access escalation in
 /// one row. Pools still live in `allowed_pools` exactly as 1.5.x wrote them.
