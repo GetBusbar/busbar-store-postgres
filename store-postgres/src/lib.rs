@@ -194,19 +194,17 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
     out
 }
 
-/// Store schema version. The last release (1.5.x) is v6; a pre-v5 database is dropped and recreated
-/// (1.5.0 was unreleased).
-/// - v6: one-time backfill of `usage_windows.billable_requests` where it is 0 beside nonzero
-///   `requests`, gated on the crossing: the shape is also what a fully refunded window looks like,
-///   so repeating it would re-bill refunds.
-/// - v7-v9 (dev builds only): typed task/mcp tables, never read or dropped by v10.
-/// - v10 (1.6.0), in place and additive: `keys` gains `idp_subject`/`binding_mode`/`minted_by`/
-///   `idp_provider`/`allowed_scopes_by_kind`; open usage units get `usage_ledger_units` and
-///   `usage_metering_units`; `usage_metering.priced_from_ms` joins its key; the kind-tagged
-///   `plane_records`, `plane_chain` and `plane_tokens`.
-/// - v11: `store_ops` (the durable `op_id` dedupe log) and `store_records`.
-/// - v13: the tables of the deleted money, journal and session slots go, with their dedupe rows.
+/// Store schema version. The last release (1.5.x) is v6, and a database older than v6 is refused:
+/// no release ever wrote one. v6 -> v13 upgrades in place:
+/// - v10 (1.6.0): `keys` gains `idp_subject`/`binding_mode`/`minted_by`/`idp_provider`/
+///   `allowed_scopes_by_kind`; open usage units get `usage_ledger_units` and `usage_metering_units`;
+///   `usage_metering.priced_from_ms` joins its key; the kind-tagged `plane_records`, `plane_chain`
+///   and `plane_tokens`.
+/// - v11-v13: `store_ops` (the durable `op_id` dedupe log) and `store_records`.
 const SCHEMA_VERSION: i64 = 13;
+
+/// The oldest schema any release wrote.
+const FIRST_RELEASED_SCHEMA: i64 = 6;
 
 /// The plane-record kinds whose retention is TERMINAL-ONLY: `purge_plane_records_before` drops a
 /// row of one only once its `disposition` is `Terminal` (an interrupted task waiting on a human sits
@@ -601,49 +599,14 @@ impl Session {
         if version == SCHEMA_VERSION {
             return Ok(());
         }
+        if version != 0 && version < FIRST_RELEASED_SCHEMA {
+            return Err(RecordStoreError(format!(
+                "postgres store: database schema v{version} predates v{FIRST_RELEASED_SCHEMA}, the \
+                 oldest released schema; refusing to open"
+            )));
+        }
         let mut tx = client.transaction().await.store()?;
-        if version < 5 {
-            let legacy: bool = tx
-                .query_one(
-                    "SELECT to_regclass('usage_counters') IS NOT NULL
-                        OR to_regclass('virtual_keys') IS NOT NULL
-                        OR to_regclass('aws_credentials') IS NOT NULL",
-                    &[],
-                )
-                .await
-                .store()?
-                .get(0);
-            if legacy {
-                tx.batch_execute(
-                    "DROP TABLE IF EXISTS virtual_keys;
-                     DROP TABLE IF EXISTS aws_credentials;
-                     DROP TABLE IF EXISTS keys CASCADE;
-                     DROP TABLE IF EXISTS credentials;
-                     DROP TABLE IF EXISTS usage_counters;
-                     DROP TABLE IF EXISTS usage_windows;
-                     DROP TABLE IF EXISTS usage_ledger;
-                     DROP TABLE IF EXISTS usage_metering;
-                     DROP TABLE IF EXISTS audit_log;
-                     DROP TABLE IF EXISTS denylist;
-                     DROP TABLE IF EXISTS store_revision;",
-                )
-                .await
-                .store()?;
-            }
-        }
         tx.batch_execute(SCHEMA).await.store()?;
-        // v6 one-time backfill — see SCHEMA_VERSION's doc comment for why this is safe as a
-        // gated-once value backfill and would NOT be safe as a repeated/per-boot heuristic. Only
-        // fires when crossing INTO v6 (a store already at v6+ never re-runs this).
-        if version < 6 {
-            tx.execute(
-                "UPDATE usage_windows SET billable_requests = requests \
-                 WHERE billable_requests = 0 AND requests > 0",
-                &[],
-            )
-            .await
-            .store()?;
-        }
         // v10: `SCHEMA`'s `CREATE TABLE IF NOT EXISTS` never alters an existing table, so on a v6
         // database these statements ARE the upgrade. Gated on crossing INTO v10 because `ALTER TABLE`
         // takes an ACCESS EXCLUSIVE lock even as a no-op, and every node's connect runs `migrate()`.
@@ -656,21 +619,6 @@ impl Session {
                 "ALTER TABLE usage_metering DROP CONSTRAINT IF EXISTS usage_metering_pkey;
                  ALTER TABLE usage_metering ADD CONSTRAINT usage_metering_pkey
                      PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms);",
-            )
-            .await
-            .store()?;
-        }
-        // v13 — see SCHEMA_VERSION. The deleted slots' tables and dedupe rows go in the same
-        // transaction as the version stamp, so a crash part-way re-runs it whole.
-        if version < 13 {
-            tx.batch_execute(
-                "DROP TABLE IF EXISTS money_slices;
-                 DROP TABLE IF EXISTS money_slots;
-                 DROP TABLE IF EXISTS money_epoch;
-                 DROP TABLE IF EXISTS store_journal;
-                 DROP TABLE IF EXISTS store_sessions;
-                 DELETE FROM store_ops WHERE split_part(body, ':', 1) NOT IN
-                     ('append_plane_record', 'add_usage_batch', 'add_metering_batch');",
             )
             .await
             .store()?;
