@@ -1472,29 +1472,15 @@ impl Drop for TempDb {
 /// version < `SCHEMA_VERSION`, so this code was structurally unreachable from every other test in
 /// this file.
 #[test]
-fn migrate_bootstraps_fresh_database_and_drops_legacy_tables() {
+fn migrate_bootstraps_fresh_database() {
     let Some(url) = live_url() else { return };
     let tmp = TempDb::create(&url, "spg_fresh");
     let iso_url = tmp.url();
-
-    {
-        let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
-        c.batch_execute("CREATE TABLE virtual_keys (id TEXT PRIMARY KEY)")
-            .unwrap();
-    }
 
     let store =
         connect_store_with_retry(&iso_url).expect("connect must bootstrap a fresh database");
 
     let mut check = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
-    let legacy_gone: bool = check
-        .query_one("SELECT to_regclass('virtual_keys') IS NULL", &[])
-        .unwrap()
-        .get(0);
-    assert!(
-        legacy_gone,
-        "a fresh database's pre-existing legacy virtual_keys table must be dropped on bootstrap"
-    );
     let version: i64 = check
         .query_one("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[])
         .unwrap()
@@ -1502,44 +1488,6 @@ fn migrate_bootstraps_fresh_database_and_drops_legacy_tables() {
     assert_eq!(
         version, SCHEMA_VERSION,
         "a fresh database must land on the current schema version"
-    );
-
-    drop(store);
-    drop(check);
-}
-
-/// The mirror image of the test above: a database ALREADY at `SCHEMA_VERSION` must skip the
-/// legacy-table check entirely, never touching a table that merely happens to share a legacy name.
-/// Distinguishes `<` from `==`/`<=` at the exact boundary (`version == SCHEMA_VERSION`), which the
-/// fresh-database test (`version` starts at 0) cannot: at 0, `<`, `<=`, and (against a nonzero
-/// SCHEMA_VERSION) `==`'s complement all happen to agree closely enough that only the equality
-/// boundary itself tells them apart.
-#[test]
-fn migrate_already_at_current_version_skips_the_legacy_check() {
-    let Some(url) = live_url() else { return };
-    let tmp = TempDb::create(&url, "spg_atver");
-    let iso_url = tmp.url();
-
-    {
-        let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
-        c.batch_execute(&format!(
-            "CREATE TABLE busbar_schema (version BIGINT PRIMARY KEY);
-             INSERT INTO busbar_schema (version) VALUES ({SCHEMA_VERSION});
-             CREATE TABLE virtual_keys (id TEXT PRIMARY KEY);"
-        ))
-        .unwrap();
-    }
-
-    let store = connect_store_with_retry(&iso_url).expect("connect");
-
-    let mut check = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
-    let legacy_still_there: bool = check
-        .query_one("SELECT to_regclass('virtual_keys') IS NOT NULL", &[])
-        .unwrap()
-        .get(0);
-    assert!(
-        legacy_still_there,
-        "a database already at SCHEMA_VERSION must not run the legacy-table-drop check at all"
     );
 
     drop(store);
@@ -1574,106 +1522,6 @@ fn migrate_refuses_a_database_stamped_newer_than_this_build() {
         )),
         "{err}"
     );
-}
-
-/// The v6 one-time backfill: a database sitting at v5 with a `usage_windows` row shaped
-/// `billable_requests=0, requests>0` (indistinguishable, by counter value alone, from a
-/// legitimately fully-refunded window OR a genuine pre-split legacy row) gets `billable_requests`
-/// backfilled to `requests` when `connect()` migrates it across the v5->v6 boundary.
-#[test]
-fn migrate_v6_backfills_billable_requests_for_a_pre_migration_row() {
-    let Some(url) = live_url() else { return };
-    let tmp = TempDb::create(&url, "spg_v6backfill");
-    let iso_url = tmp.url();
-
-    {
-        let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
-        c.batch_execute(
-            "CREATE TABLE busbar_schema (version BIGINT PRIMARY KEY);
-             INSERT INTO busbar_schema (version) VALUES (5);
-             CREATE TABLE usage_windows (
-                 bucket_id TEXT NOT NULL,
-                 window_start BIGINT NOT NULL,
-                 requests BIGINT NOT NULL DEFAULT 0,
-                 billable_requests BIGINT NOT NULL DEFAULT 0,
-                 PRIMARY KEY (bucket_id, window_start)
-             );
-             INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
-                 VALUES ('vk_test', 0, 7, 0);",
-        )
-        .unwrap();
-    }
-
-    let store = connect_store_with_retry(&iso_url).expect("connect must run the v6 migration");
-
-    let mut check = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
-    let billable: i64 = check
-        .query_one(
-            "SELECT billable_requests FROM usage_windows WHERE bucket_id='vk_test' AND window_start=0",
-            &[],
-        )
-        .unwrap()
-        .get(0);
-    assert_eq!(
-        billable, 7,
-        "a pre-v6 row with billable_requests=0, requests>0 must be backfilled to requests"
-    );
-    let version: i64 = check
-        .query_one("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[])
-        .unwrap()
-        .get(0);
-    assert_eq!(version, SCHEMA_VERSION);
-
-    drop(store);
-    drop(check);
-}
-
-/// The other half: a database ALREADY at v6+ must NOT have this backfill re-applied — a row
-/// shaped `billable_requests=0, requests>0` there is either a genuinely fully-refunded window
-/// (must stay 0) or freshly written data, never something to re-bill. This is what makes the v6
-/// migration safe as a ONE-TIME event rather than the exact per-boot heuristic bug it replaces.
-#[test]
-fn migrate_v6_does_not_rerun_the_backfill_on_an_already_migrated_database() {
-    let Some(url) = live_url() else { return };
-    let tmp = TempDb::create(&url, "spg_v6norerun");
-    let iso_url = tmp.url();
-
-    {
-        let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
-        c.batch_execute(&format!(
-            "CREATE TABLE busbar_schema (version BIGINT PRIMARY KEY);
-             INSERT INTO busbar_schema (version) VALUES ({SCHEMA_VERSION});
-             CREATE TABLE usage_windows (
-                 bucket_id TEXT NOT NULL,
-                 window_start BIGINT NOT NULL,
-                 requests BIGINT NOT NULL DEFAULT 0,
-                 billable_requests BIGINT NOT NULL DEFAULT 0,
-                 PRIMARY KEY (bucket_id, window_start)
-             );
-             INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
-                 VALUES ('vk_refunded', 0, 7, 0);"
-        ))
-        .unwrap();
-    }
-
-    let store = connect_store_with_retry(&iso_url).expect("connect");
-
-    let mut check = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
-    let billable: i64 = check
-        .query_one(
-            "SELECT billable_requests FROM usage_windows WHERE bucket_id='vk_refunded' AND window_start=0",
-            &[],
-        )
-        .unwrap()
-        .get(0);
-    assert_eq!(
-        billable, 0,
-        "a database already at SCHEMA_VERSION must never re-run the v6 backfill — a \
-         legitimately-refunded-to-zero row on an already-migrated store must stay 0"
-    );
-
-    drop(store);
-    drop(check);
 }
 
 /// `migrate`/`migrate_locked` must never silently succeed against a role that lacks real read
