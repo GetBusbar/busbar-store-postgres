@@ -2,25 +2,28 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store v3 slots ([`StoreSlots`]) against a live Postgres: durable `op_id` dedupe (S1-S4)
-//! across a reconnect, the money slots (`window_caps`, `reserve`, `slice_release`), the journal
-//! (`append_batch`, `heads`), sessions and the kernel-held records. Every name is namespaced per
-//! run, so the shared test database never carries one run's rows into another's assertions.
+//! across a reconnect, and the kernel-held records. Every name is namespaced per run, so the shared test database never carries one run's
+//! rows into another's assertions.
 
 use super::*;
-use busbar_contract::abi::sdk::store::{
-    Cap, CapsRefused, Cell, CellKey, Dimension, Grant, OpRefused, ReserveRefused,
-};
+use busbar_contract::abi::sdk::store::OpRefused;
 use busbar_contract::abi::store::OpId;
-use busbar_contract::kinds::RecordBytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A namespace unique to this run.
 fn ns() -> String {
+    // The counter keeps two tests started in the same clock tick apart (they would share a bucket
+    // and push conflicting caps for it).
+    static N: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    format!("v3-{}-{nanos}", std::process::id())
+    format!(
+        "v3-{}-{nanos}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// A fresh `op_id` per call, unique across runs (the node half is the run's clock).
@@ -37,44 +40,32 @@ fn store(url: &str) -> TestStore {
     connect_store_with_retry(url).expect("connect")
 }
 
-fn requests(bucket: &str) -> CellKey<'_> {
-    CellKey {
-        bucket,
-        pool: None,
-        dimension: Dimension::Requests,
-        window_start: 1_790_000_000_000,
-    }
-}
-
-fn reserve(s: &TestStore, op: OpId, cells: &[Cell<'_>]) -> Result<Vec<Grant>, ReserveRefused> {
-    let mut grants = Vec::new();
-    s.reserve(op, 0, cells.iter().copied(), &mut grants)
-        .map(|()| grants)
-}
-
-fn release(s: &TestStore, op: OpId, items: &[(u64, u64)]) -> Result<Vec<u64>, OpRefused> {
-    let mut back = Vec::new();
-    s.slice_release(op, 0, items.iter().copied(), &mut back)
-        .map(|()| back)
-}
-
 /// `open` is the settings' judge: the 1.5.5 refusals, in the store's own words.
 #[test]
 fn open_refuses_settings_without_a_url() {
     let want = "postgres plugin config requires a \"url\" (a libpq connection string)";
-    for settings in [
-        &b""[..],
-        &b"  "[..],
-        &b"{}"[..],
-        &br#"{"url": 5}"#[..],
-        &br#"{"url": "  "}"#[..],
-    ] {
+    for settings in [&b""[..], &b"  "[..], &b"{}"[..], &br#"{"url": "  "}"#[..]] {
         assert_eq!(
             TestStore::open_slot(settings).err().as_deref(),
             Some(want),
             "{settings:?}"
         );
     }
+    // A present url of the wrong type says so, rather than "requires a url".
+    for settings in [&br#"{"url": 5}"#[..], &br#"{"url": null}"#[..]] {
+        assert_eq!(
+            TestStore::open_slot(settings).err().as_deref(),
+            Some("invalid postgres plugin config: `url` must be a string"),
+            "{settings:?}"
+        );
+    }
+    // An unknown top-level key is refused, never ignored.
+    assert_eq!(
+        TestStore::open_slot(br#"{"url": "postgres://u@h/d", "x": 1}"#)
+            .err()
+            .as_deref(),
+        Some("invalid postgres plugin config: unknown setting `x` (accepted: url)")
+    );
     let e = TestStore::open_slot(b"{ not json").err().unwrap();
     assert!(e.starts_with("invalid postgres plugin config:"), "{e}");
 }
@@ -88,7 +79,7 @@ fn an_op_id_dedupes_durably_across_a_reconnect() {
     };
     let ns = ns();
     let bucket = format!("{ns}-b");
-    // A window no parallel test's `purge_windows_before` cutoff reaches.
+    // A window no other test writes.
     const WINDOW: u64 = 4_000_000_000_000_000;
     let a = store(&url);
     let delta = UsageDelta {
@@ -121,203 +112,46 @@ fn an_op_id_dedupes_durably_across_a_reconnect() {
     );
 
     // A fork is FAILED and not recorded: the same op_id with a body that now fits applies.
-    let _audit = lock_audit_table();
-    let seq = 9_000_000_000_000 + u64::from(std::process::id());
-    let rec = |action: &str| AuditRecord {
-        seq,
+    let parent = format!("{ns}-chain");
+    let rec = |hash: &str| PlaneRecord {
+        kind: "call".into(),
+        id: parent.clone(),
+        parent: Some(parent.clone()),
+        seq: 1,
         ts: 1,
-        action: action.into(),
-        resource: ns.clone(),
-        outcome: "ok".into(),
-        principal: "p".into(),
-        prev_hash: String::new(),
-        hash: "h".into(),
+        disposition: PlaneDisposition::Active,
+        body: format!("{{\"hash\":\"{hash}\"}}").into_bytes(),
     };
-    let first = op();
-    b.append_audit_op(first, &rec("one")).expect("appended");
+    let clear = |s: &TestStore| {
+        s.lock()
+            .execute(
+                "DELETE FROM plane_chain WHERE kind = 'call' AND parent = $1",
+                &[&parent],
+            )
+            .unwrap();
+    };
+    clear(&b);
+    b.append_plane_record_op(op(), rec("one").view())
+        .expect("appended");
     let fork = op();
     assert!(matches!(
-        b.append_audit_op(fork, &rec("two")),
+        b.append_plane_record_op(fork, rec("two").view()),
         Err(OpRefused::Failed(_))
     ));
-    b.lock()
-        .execute("DELETE FROM audit_log WHERE seq = $1", &[&(seq as i64)])
-        .unwrap();
-    b.append_audit_op(fork, &rec("two"))
+    clear(&b);
+    b.append_plane_record_op(fork, rec("two").view())
         .expect("a failed op was not recorded, so its retry is evaluated afresh");
-    b.lock()
-        .execute("DELETE FROM audit_log WHERE seq = $1", &[&(seq as i64)])
-        .unwrap();
-}
-
-/// The money slots: no cap is NoCap, a cap admits exactly its headroom, a release gives it back,
-/// a replayed reserve answers the ORIGINAL grants, and a cap re-pushed at its generation with a
-/// different value is a conflict.
-#[test]
-fn caps_reserve_and_release_follow_the_1_5_5_rules() {
-    let Some(url) = live_url() else {
-        return;
-    };
-    let ns = ns();
-    let s = store(&url);
-    let key = requests(&ns);
-    let cell = Cell { key, amount: 2 };
-    assert_eq!(
-        reserve(&s, op(), &[cell]),
-        Err(ReserveRefused::NoCap { cell: 0 })
-    );
-    s.window_caps(
-        op(),
-        &[Cap {
-            key,
-            cap: 3,
-            config_gen: 1,
-        }],
-    )
-    .expect("cap pushed");
-    assert_eq!(
-        s.window_caps(
-            op(),
-            &[Cap {
-                key,
-                cap: 4,
-                config_gen: 1,
-            }],
-        ),
-        Err(CapsRefused::CapConflict { index: 0 })
-    );
-
-    let id = op();
-    let grants = reserve(&s, id, &[cell]).expect("2 of 3 granted");
-    assert_eq!(grants.len(), 1);
-    assert_eq!(grants[0].granted, 2);
-    assert_eq!(reserve(&s, id, &[cell]), Ok(grants.clone()), "replay");
-    assert_eq!(
-        reserve(&s, op(), &[cell]),
-        Err(ReserveRefused::Exhausted { cell: 0 }),
-        "2 + 2 > 3"
-    );
-    assert_eq!(
-        release(&s, op(), &[(grants[0].slice_id, 5)]),
-        Ok(vec![2]),
-        "the release is clamped to what the slice holds"
-    );
-    assert!(reserve(&s, op(), &[cell]).is_ok(), "the headroom came back");
-    assert!(matches!(
-        release(&s, op(), &[(u64::MAX, 1)]),
-        Err(OpRefused::Failed(_))
-    ));
-}
-
-/// A RELEASE ON WINDOW 0 IS FINAL (`abi::store::money` slice life (e)): the release takes back
-/// the unspent it names, the slice closes (another release answers 0), and the spent rest stays
-/// counted against the cap. A rolling window keeps the partial-release rule.
-#[test]
-fn a_release_on_window_zero_is_final() {
-    let Some(url) = live_url() else {
-        return;
-    };
-    let ns = ns();
-    let s = store(&url);
-    let zero = CellKey {
-        bucket: &ns,
-        pool: None,
-        dimension: Dimension::NanoUnits,
-        window_start: 0,
-    };
-    s.window_caps(
-        op(),
-        &[Cap {
-            key: zero,
-            cap: 10,
-            config_gen: 1,
-        }],
-    )
-    .expect("cap pushed");
-    let draw = |amount| [Cell { key: zero, amount }];
-    let g = reserve(&s, op(), &draw(6)).expect("6 of 10");
-    let id = g[0].slice_id;
-    assert_eq!(release(&s, op(), &[(id, 2)]), Ok(vec![2]));
-    assert_eq!(
-        release(&s, op(), &[(id, 4)]),
-        Ok(vec![0]),
-        "a window-0 slice stayed open after its release"
-    );
-    reserve(&s, op(), &draw(6)).expect("the returned 2 are drawable");
-    assert_eq!(
-        reserve(&s, op(), &draw(1)),
-        Err(ReserveRefused::Exhausted { cell: 0 }),
-        "the spent 4 stay counted"
-    );
-
-    // The control: on a rolling window a partial release leaves the rest open.
-    let rolling = requests(&ns);
-    s.window_caps(
-        op(),
-        &[Cap {
-            key: rolling,
-            cap: 10,
-            config_gen: 1,
-        }],
-    )
-    .expect("cap pushed");
-    let g = reserve(
-        &s,
-        op(),
-        &[Cell {
-            key: rolling,
-            amount: 6,
-        }],
-    )
-    .expect("draw");
-    assert_eq!(release(&s, op(), &[(g[0].slice_id, 2)]), Ok(vec![2]));
-    assert_eq!(release(&s, op(), &[(g[0].slice_id, 4)]), Ok(vec![4]));
-    // A slice never granted still fails the release.
-    assert!(matches!(
-        release(&s, op(), &[(u64::MAX, 1)]),
-        Err(OpRefused::Failed(_))
-    ));
+    clear(&b);
 }
 
 /// The journal, sessions and kernel-held records.
 #[test]
-fn journal_sessions_and_records_round_trip() {
+fn records_round_trip() {
     let Some(url) = live_url() else {
         return;
     };
     let ns = ns();
     let s = store(&url);
-    let rows = |n: u8| -> Vec<RecordBytes> {
-        (0..n).map(|i| RecordBytes::new(vec![i]).unwrap()).collect()
-    };
-    let first = s.append_batch(op(), &ns, &rows(2)).expect("appended");
-    assert_eq!(first.seq, 2);
-    let id = op();
-    let second = s.append_batch(id, &ns, &rows(3)).expect("appended");
-    assert_eq!(second.seq, 5);
-    assert_eq!(s.append_batch(id, &ns, &rows(3)), Ok(second), "replay");
-    let heads = s.heads().expect("heads");
-    assert_eq!(
-        heads
-            .iter()
-            .find(|(stream, _)| *stream == ns)
-            .map(|h| h.1.seq),
-        Some(5)
-    );
-
-    let principal = format!("{ns}-p");
-    s.session_put(u64::MAX, "node-a", &principal).unwrap();
-    s.session_put(7, "node-b", &principal).unwrap();
-    s.session_put(7, "node-c", &principal).unwrap();
-    assert_eq!(
-        s.sessions_for(&principal).unwrap(),
-        vec![(7, "node-c".to_string()), (u64::MAX, "node-a".to_string())]
-    );
-    s.session_remove(u64::MAX).unwrap();
-    s.session_remove(u64::MAX).unwrap();
-    s.session_remove(7).unwrap();
-    assert!(s.sessions_for(&principal).unwrap().is_empty());
-
     s.record_put(&ns, b"a/1", b"one").unwrap();
     s.record_put(&ns, b"a/2", b"two").unwrap();
     s.record_put(&ns, b"b/1", b"other").unwrap();
@@ -341,6 +175,56 @@ fn journal_sessions_and_records_round_trip() {
         s.record_scan(&ns, b"", 0).unwrap().is_empty(),
         "limit 0 is nothing"
     );
+}
+
+/// Record keys are raw bytes: NUL, 0xFF and non-UTF-8 sequences are keys like any other, a scan runs
+/// in byte order, and a prefix equal to a whole key returns that key too.
+#[test]
+fn record_keys_are_raw_bytes_scanned_in_byte_order() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let keys: [&[u8]; 7] = [
+        &[0xFF, 0x00],
+        &[0x00],
+        &[0xFF],
+        &[0xC3, 0x28],
+        &[0x00, 0xFF],
+        &[0xFF, 0xFF],
+        &[0x7F],
+    ];
+    for (i, k) in keys.iter().enumerate() {
+        s.record_put(&ns, k, &[i as u8]).unwrap();
+    }
+    let scan = |prefix: &[u8]| -> Vec<Vec<u8>> {
+        s.record_scan(&ns, prefix, 100)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
+    };
+    assert_eq!(
+        scan(&[]),
+        vec![
+            vec![0x00],
+            vec![0x00, 0xFF],
+            vec![0x7F],
+            vec![0xC3, 0x28],
+            vec![0xFF],
+            vec![0xFF, 0x00],
+            vec![0xFF, 0xFF],
+        ]
+    );
+    assert_eq!(
+        scan(&[0xFF]),
+        vec![vec![0xFF], vec![0xFF, 0x00], vec![0xFF, 0xFF]],
+        "a prefix equal to a whole key includes that key"
+    );
+    assert_eq!(scan(&[0x00]), vec![vec![0x00], vec![0x00, 0xFF]]);
+    assert_eq!(scan(&[0xC3, 0x28]), vec![vec![0xC3, 0x28]]);
+    assert!(scan(&[0xC3, 0x29]).is_empty());
 }
 
 /// AN EMPTY PUT REMOVES THE ROW (slot 40's rule, ARCHITECT 2026-10-21): the host writes every

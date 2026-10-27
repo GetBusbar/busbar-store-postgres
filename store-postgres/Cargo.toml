@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "busbar-store-postgres"
-version = "1.0.0"
-publish = false            # internal workspace crate; never goes to crates.io
-edition = "2021"
-rust-version = "1.97"
-description = "The Postgres backend for busbar's durable governance store — the shared, multi-node db plugin. Implements busbar_contract::records::RecordStore over a mutex-guarded sync postgres client."
-license = "Apache-2.0"
+version = "1.6.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The Postgres backend for busbar's durable governance store — the shared, multi-node db plugin. Serves the store v3 table (StoreSlots) over the host's connector with its own async Postgres wire client (pgwire)."
+
+[lints]
+workspace = true
 
 [dependencies]
 # The ONE busbar crate this plugin names (#40: contract only; DECISIONS #84 merged the plugin SDK
@@ -23,6 +26,8 @@ postgres-types = { workspace = true }
 bytes = { workspace = true }
 fallible-iterator = { workspace = true }
 serde_json = { workspace = true }
+# `ReserveRefused::Unavailable` has no payload; the reason is logged (captured into the plugin's own log).
+tracing = { workspace = true }
 
 [dev-dependencies]
 # The `Store` contract conformance suite used to arrive here as `busbar-plugin-testkit`; the owner
@@ -31,6 +36,8 @@ serde_json = { workspace = true }
 # Its plane-record checks serialize stand-in rows with serde derive, hence this one dev-dependency;
 # no busbar crate beyond `busbar-contract` is needed.
 serde = { workspace = true }
+# The unavailable-reason log test installs a capturing subscriber.
+tracing-subscriber = { workspace = true }
 # The live tests open the store through the REAL loader on a dispatcher, its connections over the
 # loader's test connection table (`tcp_conns`, `test-support`), and verify on an independent
 # connection of the `postgres` driver's own.
