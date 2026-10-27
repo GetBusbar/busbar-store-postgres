@@ -2,8 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store v3 slots ([`StoreSlots`]) against a live Postgres: durable `op_id` dedupe (S1-S4)
-//! across a reconnect, the kernel-held records, and the v13 upgrade that drops the deleted slots'
-//! tables. Every name is namespaced per run, so the shared test database never carries one run's
+//! across a reconnect, and the kernel-held records. Every name is namespaced per run, so the shared test database never carries one run's
 //! rows into another's assertions.
 
 use super::*;
@@ -176,63 +175,6 @@ fn records_round_trip() {
         s.record_scan(&ns, b"", 0).unwrap().is_empty(),
         "limit 0 is nothing"
     );
-}
-
-/// A store in a SCHEMA of its own, so a test that rewinds the schema version touches no other test's
-/// tables. The schema is dropped with the guard.
-struct Iso {
-    admin: std::cell::RefCell<postgres::Client>,
-    schema: String,
-    url: String,
-    store: Option<TestStore>,
-}
-
-impl Iso {
-    fn new(url: &str) -> Self {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!(
-            "f1_{}_{nanos}_{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        );
-        let mut admin = connect_client_with_retry(url);
-        admin
-            .batch_execute(&format!("CREATE SCHEMA {schema}"))
-            .expect("create the test schema");
-        let sep = if url.contains('?') { '&' } else { '?' };
-        let url = format!("{url}{sep}options=-c%20search_path%3D{schema}");
-        let store = Some(store(&url));
-        Iso {
-            admin: admin.into(),
-            schema,
-            url,
-            store,
-        }
-    }
-
-    fn s(&self) -> &TestStore {
-        self.store.as_ref().expect("open")
-    }
-
-    /// A RESTART: the instance goes away and a fresh one opens over the same state.
-    fn restart(&mut self) {
-        self.store = None;
-        self.store = Some(store(&self.url));
-    }
-}
-
-impl Drop for Iso {
-    fn drop(&mut self) {
-        self.store = None;
-        let _ = self
-            .admin
-            .get_mut()
-            .batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema));
-    }
 }
 
 /// Record keys are raw bytes: NUL, 0xFF and non-UTF-8 sequences are keys like any other, a scan runs
