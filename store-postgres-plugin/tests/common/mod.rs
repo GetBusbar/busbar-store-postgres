@@ -19,7 +19,7 @@ use busbar_plugin_loader::dispatch::{
     LinkedRow, NoSink,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
-use busbar_plugin_loader::tcp_conns::TcpConns;
+use busbar_test_kit::tcp_conns::TcpConns;
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
 /// failure, never a skip: the dropped-in door is what these tests prove.
