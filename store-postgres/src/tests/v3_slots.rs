@@ -226,3 +226,53 @@ fn record_keys_are_raw_bytes_scanned_in_byte_order() {
     assert_eq!(scan(&[0xC3, 0x28]), vec![vec![0xC3, 0x28]]);
     assert!(scan(&[0xC3, 0x29]).is_empty());
 }
+
+/// AN EMPTY PUT REMOVES THE ROW (slot 40's rule, ARCHITECT 2026-10-21): the host writes every
+/// strike as an empty `record_put` and reads empty as absent, so the row LEAVES the table:
+/// `record_get` answers `None`, `record_scan` never returns it, and the table shrinks. Removing a
+/// row that is not there is `Ok`.
+#[test]
+fn an_empty_put_removes_the_row() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let held = || -> i64 {
+        s.lock()
+            .query_one(
+                "SELECT COUNT(*) FROM store_records WHERE schema_id = $1",
+                &[&ns],
+            )
+            .expect("count")
+            .get(0)
+    };
+    s.record_put(&ns, b"a/1", b"one").unwrap();
+    s.record_put(&ns, b"a/2", b"two").unwrap();
+    assert_eq!(held(), 2);
+
+    s.record_put(&ns, b"a/1", b"").unwrap();
+    assert_eq!(held(), 1, "the struck row left the table");
+    assert!(s.record_get(&ns, b"a/1").unwrap().is_none());
+    let scan: Vec<(Vec<u8>, Vec<u8>)> = s
+        .record_scan(&ns, b"a/", 10)
+        .unwrap()
+        .into_iter()
+        .map(|(k, v)| (k, v.as_slice().to_vec()))
+        .collect();
+    assert_eq!(
+        scan,
+        vec![(b"a/2".to_vec(), b"two".to_vec())],
+        "a scan never returns a struck row"
+    );
+
+    s.record_put(&ns, b"a/9", b"").unwrap();
+    assert_eq!(held(), 1, "a strike of nothing is Ok and changes nothing");
+    s.record_put(&ns, b"a/1", b"again").unwrap();
+    assert_eq!(
+        s.record_get(&ns, b"a/1")
+            .unwrap()
+            .map(|r| r.as_slice().to_vec()),
+        Some(b"again".to_vec())
+    );
+}

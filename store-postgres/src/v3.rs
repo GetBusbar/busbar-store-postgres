@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The store v3 slots this backend answers beyond the 1.5.5 op set ([`StoreSlots`]): the
+//! The store v3 slots this backend answers beyond the base op set ([`StoreSlots`]): the
 //! `op_id`-carrying writes (the usage and metering batches and the plane-record append), the
 //! kernel-held records, and the door (`store_door!`) over all of it. The store keeps ledger counts
 //! and records only; money is a view on ledger x rate card.
@@ -19,7 +19,7 @@
 //! ensures the schema, so an unreachable or refusing server fails the load.
 //!
 //! Every `u64` this module's own record and dedupe columns take is stored BIT-FOR-BIT in a BIGINT
-//! (`as i64`). The ops delegated to the 1.5.5 code keep that code's rules: usage and metering totals
+//! (`as i64`). The ops delegated to the base code keep that code's rules: usage and metering totals
 //! clamp, and appends refuse a value outside their column.
 
 use std::sync::atomic::Ordering;
@@ -271,12 +271,26 @@ impl Session {
         Ok(())
     }
 
+    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row: it is
+    /// the host's strike, so `record_get` then answers `None` and
+    /// `record_scan` never returns it. Removing a row that is not there is `Ok`.
     async fn v3_record_put(
         &mut self,
         schema: &str,
         key: &[u8],
         value: &[u8],
     ) -> Result<(), String> {
+        if value.is_empty() {
+            return self
+                .lock()
+                .execute(
+                    "DELETE FROM store_records WHERE schema_id = $1 AND key = $2",
+                    &[&schema, &key],
+                )
+                .await
+                .map(drop)
+                .map_err(pg);
+        }
         self.lock()
             .execute(
                 "INSERT INTO store_records (schema_id, key, value) VALUES ($1, $2, $3)
@@ -421,7 +435,7 @@ macro_rules! pass {
     };
 }
 
-/// Each listed 1.5.5 slot: copy its arguments (the body runs across the op's entries) and run the
+/// Each listed base slot: copy its arguments (the body runs across the op's entries) and run the
 /// `Session` method of the same name on the op's connection.
 macro_rules! legacy_slots {
     ($($name:ident($($arg:ident $sep:tt $ty:ty),*) -> $ret:ty;)*) => {$(
@@ -455,8 +469,8 @@ impl StoreSlots for PostgresStore {
         PostgresStore::new(&url).map_err(|e| e.0)
     }
 
-    /// Reach the server and ensure the schema (1.5.5's connect + migrate, at the same moment: the
-    /// load), in the driver's words when it cannot.
+    /// Reach the server and ensure the schema (connect + migrate, at the same moment: the load),
+    /// in the driver's words when it cannot.
     fn connect(&self, cx: &mut Op<'_>) -> Step<Result<(), String>> {
         on_conn!(self, cx, |e| e, |s| s.migrate().await.map_err(|e| e.0))
     }
@@ -537,7 +551,7 @@ impl StoreSlots for PostgresStore {
             .await)
     }
 
-    // The 1.5.5 op set: each the 1.5.5 body, on the op's connection, over owned copies of its
+    // The base op set: each the store's own body, on the op's connection, over owned copies of its
     // arguments (`:` marks a borrowed argument, `=` one passed by value).
     legacy_slots! {
         put_key(key: &VirtualKey) -> ();
