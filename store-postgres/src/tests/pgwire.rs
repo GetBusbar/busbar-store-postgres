@@ -294,3 +294,46 @@ fn a_snapshot_transaction_begins_repeatable_read() {
     );
     assert_eq!(begin_sql(None), "BEGIN");
 }
+
+/// The connection's prepared statements stay bounded: past `STATEMENTS_KEPT` the least recently
+/// run is dropped and its Close queued for the next Parse; a stale statement is dropped the same
+/// way, and `26000` (the session's statements deallocated) drops them all.
+#[test]
+fn prepared_statements_drop_the_least_recently_run_past_the_bound() {
+    use std::sync::Arc;
+
+    let stmt = |n: usize| {
+        Arc::new(super::Statement {
+            name: format!("s{n}"),
+            types: Vec::new(),
+            columns: Vec::new().into(),
+        })
+    };
+    let mut c = super::Cache::default();
+    for n in 0..super::STATEMENTS_KEPT {
+        c.get(&format!("q{n}"));
+        c.insert(&format!("q{n}"), stmt(n));
+    }
+    assert!(c.closing.is_empty());
+    // q0 runs again, so q1 is now the least recently run.
+    assert_eq!(c.get("q0").map(|s| s.name.clone()).as_deref(), Some("s0"));
+    c.get("new");
+    c.insert("new", stmt(9999));
+    assert_eq!(c.by_sql.len(), super::STATEMENTS_KEPT);
+    assert_eq!(c.closing, ["s1"]);
+    assert!(c.get("q1").is_none() && c.get("q0").is_some());
+
+    c.forget("q0");
+    assert_eq!(c.closing, ["s1", "s0"]);
+    c.forget_all();
+    assert!(c.by_sql.is_empty());
+    assert_eq!(c.closing.len(), super::STATEMENTS_KEPT + 1);
+
+    let stale = super::Error::server("26000", "prepared statement \"s3\" does not exist");
+    assert!(super::is_stale_statement(&stale));
+    let changed = super::Error::server("0A000", "cached plan must not change result type");
+    assert!(super::is_stale_statement(&changed));
+    assert!(!super::is_stale_statement(&super::Error::server(
+        "42P01", "no table"
+    )));
+}
