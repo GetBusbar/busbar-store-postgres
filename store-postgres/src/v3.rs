@@ -77,12 +77,20 @@ pub const NEEDS: &[Need] = &[Need {
     deny_response_headers_len: 0,
 }];
 
+/// The settings paths this store declares may hold a secret reference (`secret_refs`): `url`, the
+/// one setting that carries the connection's credentials (`user:password@host`). busbar
+/// resolves a reference only where the Statement declares one and refuses it anywhere else (G14:
+/// each plugin declares its secret fields), so a 1.5.5 config's `url: {env: …}` keeps booting.
+const SECRET_REFS: &[busbar_contract::abi::mechanism::call::AbiStr] =
+    &[busbar_contract::abi::sdk::door::abi_str("url")];
+
 busbar_contract::store_door!(
     PostgresStore,
     NAME,
     env!("CARGO_PKG_VERSION"),
     64,
-    needs: NEEDS
+    needs: NEEDS,
+    secret_refs: SECRET_REFS
 );
 
 /// RUN ONE OP on the instance's kept connection (a fresh one when none is kept): open the session
