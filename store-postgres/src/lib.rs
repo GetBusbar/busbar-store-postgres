@@ -1499,8 +1499,9 @@ impl Session {
             .collect();
         let chain = tx
             .execute(
-                "DELETE FROM plane_chain WHERE kind=$1 AND ts < $2",
-                &[&kind, &cutoff],
+                "DELETE FROM plane_chain
+                 WHERE kind=$1 AND ts < $2 AND (NOT $3 OR disposition = 'terminal')",
+                &[&kind, &cutoff, &terminal_only],
             )
             .await
             .store()?;
