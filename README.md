@@ -42,7 +42,7 @@ explicitly in production; do not assume they move together.
 ### Upgrading from a 1.5.x deployment
 
 The first connect of this build upgrades an existing database **in place**
-(schema v6 → v10, inside one transaction, under the same advisory lock every
+(schema v6 → this build's current schema, inside one transaction, under the same advisory lock every
 node's migration takes). Nothing is dropped and no existing row changes
 meaning:
 
@@ -56,13 +56,19 @@ meaning:
 - New tables: `usage_ledger_units` and `usage_metering_units` (unit classes
   other than the four reserved token classes), and `plane_records`,
   `plane_chain`, `plane_tokens` (busbar's durable A2A tasks, MCP call log,
-  upstream demotions, push-callback capabilities and single-use approvals).
+  upstream demotions, push-callback capabilities and single-use approvals),
+  plus the store v3 tables `store_ops` and `store_records` (op-id dedupe and
+  the kernel's records). The store keeps ledger counts, not money: busbar
+  derives money from the counts and its rate card.
+- Schema v13 drops the tables a pre-release v11/v12 build created for the
+  deleted store slots (`money_slots`, `money_slices`, `money_epoch`,
+  `store_journal`, `store_sessions`) and their op-id dedupe rows.
 
 A database a pre-release dev build took to schema v7–v9 keeps its
 `mcp_calls`/`tasks`/`task_events`/`mcp_demotions`/`spent_ask_states` tables
 untouched; busbar 1.6.0 no longer reads them.
 
-It is a `cdylib` that implements busbar's `RecordStore` trait (via the plugin SDK in
+It is a `cdylib` that serves busbar's store v3 table (`StoreSlots`, via the plugin SDK in
 [`busbar-contract`](https://github.com/GetBusbar/busbar/tree/main/crates/busbar-contract))
 and is loaded in-process by busbar over the signed hybrid plugin ABI —
 `dlopen`'d, not spawned as a separate process.
@@ -71,9 +77,8 @@ This repo is a same-repo, 2-crate Cargo workspace: it brings 100% of
 what it needs. All the SQL and schema logic lives in the
 `busbar-store-postgres` crate (`store-postgres/`, a same-repo sibling
 this plugin wraps — a custom build can also link it statically instead
-of loading this cdylib); `store-postgres-plugin/src/lib.rs` only adapts
-the engine's JSON config (`{"url": "postgres://..."}`) into a
-`PostgresStore`.
+of loading this cdylib); `store-postgres-plugin/src/lib.rs` only re-exports
+that crate and exports its `door` through `export_door!`.
 
 
 - **A shared, multi-node governance store.** `store: sqlite` is
@@ -106,9 +111,12 @@ the engine's JSON config (`{"url": "postgres://..."}`) into a
   the next operation connects afresh rather than needing a restart.
 - **TLS through busbar.** `sslmode=require`, `verify-ca` and
   `verify-full` secure the connection through busbar's connector and its
-  trust anchors (always verifying the certificate and name); `disable`,
-  `allow` and `prefer` connect in plaintext, as 1.5.x (`NoTls`) did. A Unix-socket `host` is refused: the store
-  reaches its server over TCP.
+  trust anchors (always verifying the certificate and name); `disable`
+  connects in plaintext, as 1.5.x (`NoTls`) did. `allow` and `prefer` are
+  refused, never downgraded silently. An ABSENT `sslmode` is plaintext (the
+  same as `disable`; libpq's default of `prefer` is not applied, because this
+  store never falls back silently): set `sslmode` explicitly. A Unix-socket
+  `host` is refused: the store reaches its server over TCP.
 
 See the doc comments at the top of
 [`store-postgres/src/lib.rs`](store-postgres/src/lib.rs)
@@ -120,7 +128,28 @@ thin `cdylib` adapter around it.
 
 | Setting | Required | Default | Notes |
 |---|---|---|---|
-| `url` | yes | — | A libpq connection string, URL (`postgres://user:pass@host:5432/busbar?sslmode=require`) or keyword form (`host=... user=... password=... dbname=...`). Connections go through busbar's connector, whose deadlines bound every connect (`connect_timeout` is accepted and ignored). `sslmode=require`/`verify-*` secures the connection through busbar; the other modes are plaintext. |
+| `url` | yes | — | A libpq connection string, URL (`postgres://user:pass@host:5432/busbar?sslmode=require`) or keyword form (`host=... user=... password=... dbname=...`). Connections go through busbar's connector. See the lists below. |
+
+The only setting is `url`; any other top-level key is refused
+(`unknown setting`), and a `url` that is not a string is refused.
+
+**Connection-string options honoured:** `host`, `hostaddr`, `port` (a
+comma-separated list of several endpoints, tried in order), `user`,
+`password`, `dbname`, `application_name`, `options`, `target_session_attrs`
+(`any`, `read-write`, `read-only`), `channel_binding` (`disable` or `prefer`),
+`sslmode` (`disable`, `require`, `verify-ca`, `verify-full`; absent means
+`disable`) and `connect_timeout` (whole seconds; it bounds a new connection's
+dial and handshake; `0` or less means no bound, as in libpq; a value that is
+not a whole number is refused).
+
+**Refused, with an explanation (never silently ignored):** `sslmode=allow`
+and `sslmode=prefer`, `channel_binding=require` (no SCRAM-PLUS), `sslrootcert`
+(trust is busbar's), a Unix-socket `host`, `keepalives`, `keepalives_idle`,
+`keepalives_interval`, `keepalives_count` (and `keepalives_retries`),
+`load_balance_hosts`, `tcp_user_timeout` and `sslnegotiation` (the host's
+connector owns the connection and its sockets), and any unknown option.
+
+A database stamped with a newer schema than this build is refused at open.
 
 ## Build
 
@@ -142,9 +171,7 @@ This is a same-repo, 2-crate Cargo workspace (`store-postgres/`, the
 real logic crate — which also carries the store's one door, `door`,
 from `store_door!` over its `StoreSlots` implementation (`src/v3.rs`) —
 and `store-postgres-plugin/`, the thin `cdylib` that exports that door as
-`busbar_plugin_door` through `export_door!`, and also registers the store on
-the cold store lane (`export_store_plugin!`) that the busbar kernel at the pin
-boots a configured `store:` through; see [members](Cargo.toml)).
+`busbar_plugin_door` through `export_door!`; see [members](Cargo.toml)).
 
 Its one busbar dependency is `busbar-contract` (plus
 `busbar-plugin-loader`, dev-only, for the conformance and end-to-end
@@ -166,6 +193,8 @@ store v3 table — with RED arms that prove the comparison is not
 vacuous.
 
 ### Tests need a real Postgres
+
+Run the whole workspace with `cargo test --workspace --locked`.
 
 Unlike a `kind: hook` plugin, this store's only meaningful coverage is
 against a **live Postgres** — there is no useful mock for "did the SQL
@@ -246,12 +275,6 @@ store:
 
 — see [`docs/configuration.md`](https://github.com/GetBusbar/busbar/blob/main/docs/configuration.md)
 for the full store config reference.
-
-## Tests
-
-```bash
-cargo test --workspace --locked
-```
 
 ## License
 

@@ -862,7 +862,12 @@ fn trust_ns(tag: &str) -> String {
     format!("{}-{}", tag, std::process::id())
 }
 
-const TRUST_NOW: u64 = 2_000_000_000;
+/// The trust tests' clock. `redeem_plane_token` sweeps its whole kind of every entry with
+/// `expires_at < now`, and the store-conformance single-use check redeems an `ask` token that
+/// expires at 2_000_000_000 (sweeping at 1_700_000_000). So this band sits strictly BELOW 2e9 (no
+/// sweep here, at most `TRUST_NOW + 11`, can evict that token between its two redemptions) and
+/// every token here expires ABOVE 1.7e9 (the conformance sweep reaches none of them).
+const TRUST_NOW: u64 = 1_900_000_000;
 
 fn demotions(store: &TestStore) -> Vec<serde_json::Value> {
     store
@@ -1098,6 +1103,32 @@ fn redeeming_evicts_entries_whose_token_can_no_longer_be_presented() {
     reset_tokens(&store, "ask", &[&short, &long, &other]);
 }
 
+/// THE SWEEP BOUNDARY IS STRICT: an entry whose `expires_at` EQUALS the sweeping redemption's `now`
+/// is still live and must stay in the ledger, so its second presentation is refused. Sweeping with
+/// `<=` would evict it one second early and hand a still-valid approval back.
+#[test]
+fn a_ledger_entry_expiring_exactly_now_is_not_swept() {
+    let url = require_live_url();
+    let (edge, sweeper) = (trust_ns("nonce-edge"), trust_ns("nonce-edge-sweeper"));
+    let store = connect_store_with_retry(&url).expect("connect");
+    reset_tokens(&store, "ask", &[&edge, &sweeper]);
+
+    let deadline = TRUST_NOW + 10;
+    assert!(store
+        .redeem_plane_token("ask", &edge, deadline, TRUST_NOW)
+        .unwrap());
+    assert!(store
+        .redeem_plane_token("ask", &sweeper, deadline + 900, deadline)
+        .unwrap());
+    assert!(
+        !store
+            .redeem_plane_token("ask", &edge, deadline, TRUST_NOW)
+            .unwrap(),
+        "an entry expiring exactly at the sweep's `now` was evicted: the sweep must be `<`, not `<=`"
+    );
+    reset_tokens(&store, "ask", &[&edge, &sweeper]);
+}
+
 /// REFUSED RATHER THAN CLAMPED: a `now` clamped to `i64::MAX` would sweep the kind's entire ledger
 /// and then report the insert as a first redemption — every spent token reopened at once.
 /// `expires_at` alone saturates: `u64::MAX` is busbar's "never expires" for a minting claim (the
@@ -1237,7 +1268,9 @@ fn plane_token_live_refuses_a_lapsed_token_and_an_unknown_one() {
 /// THE IDENTITY COLUMNS CARRY AN EXPLICIT COLLATION, asserted from the catalogue so the DDL cannot
 /// quietly lose it. Under an inherited non-deterministic ICU collation two ids differing only in case
 /// would collide on a primary key, and a token differing only in case from a spent one would be
-/// refused as spent.
+/// refused as spent. The lookup is scoped to the connection's schema: the plugin conformance suite
+/// creates per-fold schemas holding their own `plane_*` tables, and a bare `relname` match would
+/// return several rows (`query_one` fails) or read another schema's collation.
 #[test]
 fn the_plane_identity_columns_pin_a_byte_exact_collation() {
     let url = require_live_url();
@@ -1258,7 +1291,8 @@ fn the_plane_identity_columns_pin_a_byte_exact_collation() {
                 "SELECT c.collname FROM pg_attribute a
                    JOIN pg_class t ON t.oid = a.attrelid
                    LEFT JOIN pg_collation c ON c.oid = a.attcollation
-                  WHERE t.relname = $1 AND a.attname = $2 AND a.attnum > 0",
+                  WHERE t.relname = $1 AND a.attname = $2 AND a.attnum > 0
+                    AND t.relnamespace = to_regnamespace(current_schema())",
                 &[&table, &column],
             )
             .map(|r| r.get(0))

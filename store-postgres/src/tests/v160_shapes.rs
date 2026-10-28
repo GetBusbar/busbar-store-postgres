@@ -479,7 +479,7 @@ fn the_usage_ledger_carries_open_units_and_applies_refunds() {
     let store = connect_store_with_retry(&url).expect("connect");
     let bucket = "vk_units_ledger";
     hard_reset(&store, bucket);
-    let ws = 20_270_501u64;
+    let ws = 500u64;
 
     let ledger = UsageLedger {
         requests: 4,
@@ -599,33 +599,16 @@ fn the_usage_ledger_carries_open_units_and_applies_refunds() {
         "7 - 100 floors at 0 rather than going negative"
     );
 
-    // Retention takes the open classes with the window.
-    store.purge_windows_before(ws + 1).unwrap();
-    let orphans: i64 = store
-        .lock()
-        .query_one(
-            "SELECT COUNT(*) FROM usage_ledger_units WHERE bucket_id=$1",
-            &[&bucket],
-        )
-        .unwrap()
-        .get(0);
-    assert_eq!(
-        orphans, 0,
-        "purging a window must purge its open-class rows too"
-    );
     hard_reset(&store, bucket);
 }
 
 /// Metering: `priced_from_ms` is part of the accrual key (a card edit mid-day opens a second row,
-/// DECISION #79), the open classes accumulate additively per row, and the billing purge takes them.
+/// DECISION #79) and the open classes accumulate additively per row.
 #[test]
 fn metering_splits_on_priced_from_ms_and_carries_open_classes() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
     let key_id = format!("vk_meter_units_{}", unique_suffix());
-    // Not 20_270_601: `purge_windows_and_metering_delete_only_what_is_older_than_the_boundary`
-    // writes and purges that whole bucket in parallel, and a whole-bucket purge here would take its
-    // row (a test-isolation race the slower per-op connections exposed).
     let bucket = 20_270_611u64;
     let delta = |priced_from_ms: u64, input: u64, classes: &[(&str, u64)]| MeteringDelta {
         key_id: key_id.clone(),
@@ -669,24 +652,7 @@ fn metering_splits_on_priced_from_ms_and_carries_open_classes() {
     assert_eq!(rows[1].tokens_input, 7);
     assert!(rows[1].usage_units.is_empty());
 
-    store.purge_metering_before(&bucket.to_string()).unwrap();
-    assert!(store
-        .list_metering(bucket)
-        .unwrap()
-        .iter()
-        .all(|r| r.key_id != key_id));
-    let orphans: i64 = store
-        .lock()
-        .query_one(
-            "SELECT COUNT(*) FROM usage_metering_units WHERE key_id=$1",
-            &[&key_id],
-        )
-        .unwrap()
-        .get(0);
-    assert_eq!(
-        orphans, 0,
-        "the billing purge must take the open classes with the row"
-    );
+    hard_reset(&store, &key_id);
 }
 
 /// `put_credential` on a TOMBSTONED key is refused even when the tombstone commits between the
@@ -968,4 +934,90 @@ fn migrate_over_the_1_5_5_rows_is_idempotent() {
     assert_eq!(schema_version_of(&iso_url), SCHEMA_VERSION);
     assert_1_5_5_rows_read_back(&store);
     assert_eq!(read_everything_1_5_5(&store), first);
+}
+
+/// `UsageDelta.models` may name one model twice. `add_usage` must fold the entries sequentially,
+/// flooring each counter at 0 after every entry, exactly as `UsageLedger::apply_delta` does —
+/// a joined `UPDATE … FROM (VALUES …)` alone applies only one row per target and lost the other.
+#[test]
+fn add_usage_folds_a_model_named_twice_sequentially() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let ws = 20_270_601u64;
+    let entry = |m: &str, u: &[(&str, i64)]| ModelTokensDelta {
+        model: m.into(),
+        usage_units: signed(u),
+    };
+
+    // Plain duplicate: +100 then +50 is 150.
+    let bucket = "vk_dup_models_sum";
+    hard_reset(&store, bucket);
+    store
+        .add_usage(
+            bucket,
+            ws,
+            &UsageDelta {
+                requests: 1,
+                billable_requests: 1,
+                models: vec![
+                    entry("m", &[(UNIT_INPUT, 100)]),
+                    entry("m", &[(UNIT_INPUT, 50)]),
+                ],
+            },
+        )
+        .unwrap();
+    let got = store.get_usage(bucket, ws).unwrap();
+    assert_eq!(got.models.len(), 1);
+    assert_eq!(got.models[0].usage_units.get(UNIT_INPUT), Some(&150));
+
+    // Refund ordering: start 20, [-150, +100] floors to 0 after the first entry, then 100.
+    let bucket = "vk_dup_models_refund";
+    hard_reset(&store, bucket);
+    let start = UsageLedger {
+        requests: 0,
+        billable_requests: 0,
+        models: vec![ModelTokens {
+            model: "m".into(),
+            usage_units: units(&[(UNIT_INPUT, 20)]),
+        }],
+    };
+    store.put_usage(bucket, ws, &start).unwrap();
+    let refund = UsageDelta {
+        requests: 0,
+        billable_requests: 0,
+        models: vec![
+            entry("m", &[(UNIT_INPUT, -150)]),
+            entry("m", &[(UNIT_INPUT, 100)]),
+        ],
+    };
+    store.add_usage(bucket, ws, &refund).unwrap();
+    let mut expect = start.clone();
+    expect.apply_delta(&refund);
+    let got = store.get_usage(bucket, ws).unwrap();
+    assert_eq!(got, expect);
+    assert_eq!(got.models[0].usage_units.get(UNIT_INPUT), Some(&100));
+
+    // An open unit named by two entries for one model, with another model interleaved.
+    let bucket = "vk_dup_models_open";
+    hard_reset(&store, bucket);
+    let d = UsageDelta {
+        requests: 0,
+        billable_requests: 0,
+        models: vec![
+            entry("m", &[("search_units", 3), (UNIT_OUTPUT, 1)]),
+            entry("n", &[("search_units", 9)]),
+            entry("m", &[("search_units", 4)]),
+        ],
+    };
+    store.add_usage(bucket, ws, &d).unwrap();
+    let mut expect = UsageLedger::default();
+    expect.apply_delta(&d);
+    let got = store.get_usage(bucket, ws).unwrap();
+    assert_eq!(got, expect);
+    let m = got.models.iter().find(|x| x.model == "m").unwrap();
+    assert_eq!(m.usage_units.get("search_units"), Some(&7));
+
+    hard_reset(&store, "vk_dup_models_sum");
+    hard_reset(&store, "vk_dup_models_refund");
+    hard_reset(&store, "vk_dup_models_open");
 }

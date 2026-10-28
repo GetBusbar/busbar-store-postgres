@@ -5,19 +5,21 @@
 //! dispatcher, every connection over the host's connection path (the loader's test connection
 //! table, `tcp_conns::TcpConns`, plain TCP), opened with `open`'s connect step. [`TestStore`]
 //! answers the 1.5.5 op set through the loader's synchronous bridge (`RecordStore`, by deref) and
-//! the store v3 slots through `StoreCalls`, in the slots' own result types; [`TestStore::lock`] is
+//! the `op_id` and record slots through `StoreCalls`, in the slots' own result types; [`TestStore::lock`] is
 //! an INDEPENDENT `postgres` driver connection for the raw SQL a test sets up or verifies with.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 
-use busbar_contract::abi::sdk::store::{
-    Cap, CapsRefused, Cell, Grant, OpRefused, ReserveRefused, StoreSlots,
-};
+use busbar_contract::abi::sdk::store::{OpRefused, StoreSlots};
 use busbar_contract::abi::store::OpId;
-use busbar_contract::kinds::{Head, RecordBytes};
-use busbar_contract::records::{AuditRecord, UsageDelta};
+use busbar_contract::kinds::RecordBytes;
+use busbar_contract::records::{PlaneRecordRef, UsageDelta};
+use busbar_contract::services::{
+    Caller, DiskDest, HookAsk, HostServices, Later, NestAsk, Ran, Reading, RecordsList, Snapshot,
+    Stored, UNSERVED,
+};
 use busbar_contract::store_calls::{StoreCalls, StoreFailure};
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
@@ -64,6 +66,92 @@ fn mint() -> OpId {
     )
 }
 
+/// The host services a store op can reach in a test: the CLOCK alone, on the dispatcher's own
+/// timebase, every other service refusing as a host that does not serve it. `Wire::bound` reads the
+/// host's clock (no clock: no bound), so a test of the connect timeout needs one; the shared
+/// double the fleet uses (`busbar_contract::services::double`) is behind a dev-only feature of the
+/// contract this crate does not enable, so the refusing bodies are spelled out here.
+struct ClockOnly;
+
+fn refused() -> Ran {
+    Ran::Now(Stored::refused(UNSERVED))
+}
+
+impl HostServices for ClockOnly {
+    fn now(&self) -> Reading {
+        Reading {
+            wall_ns: 0,
+            mono_ns: busbar_plugin_loader::dispatch::now_ns(),
+        }
+    }
+    fn dest_judge(&self, _: &str, _: u32, _: u32, _: Option<Later>) -> Ran {
+        refused()
+    }
+    fn records_get(&self, _: &Caller, _: &str, _: &[u8], _: Later) -> Ran {
+        refused()
+    }
+    fn records_list(&self, _: &Caller, _: RecordsList, _: Later) -> Ran {
+        refused()
+    }
+    fn records_claim(&self, _: &Caller, _: &str, _: &[u8], _: u64, _: Later) -> Ran {
+        refused()
+    }
+    fn sign(&self, _: &Caller, _: &[u8]) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+    fn trust_sight(&self, _: &Caller, _: &str, _: &str, _: Later) -> Ran {
+        refused()
+    }
+    fn trust_due(&self, _: &Caller) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+    fn trust_verify(&self, _: &Caller, _: &str, _: &[u8], _: &[u8]) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+    fn entitlement_check(&self, _: &Caller, _: Option<u64>, _: &str) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+    fn random_fill(&self, _: u64) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+    fn records_secret(&self, _: &str, _: &str, _: Later) -> Ran {
+        refused()
+    }
+    fn unit_nest(&self, _: &Caller, _: Option<u64>, _: NestAsk, _: Later) -> Ran {
+        refused()
+    }
+    fn work_open(&self, _: &Caller, _: Option<u64>, _: &str, _: &[u8], _: Later) -> Ran {
+        refused()
+    }
+    fn work_find(&self, _: &Caller, _: Option<u64>, _: &[u8], _: Later) -> Ran {
+        refused()
+    }
+    fn work_settle(&self, _: &Caller, _: Option<u64>, _: u64, _: &[u8], _: Later) -> Ran {
+        refused()
+    }
+    fn work_resume(&self, _: &Caller, _: Option<u64>, _: u64, _: Later) -> Ran {
+        refused()
+    }
+    fn disk_append(&self, _: &DiskDest, _: Vec<u8>, _: Later) -> Ran {
+        refused()
+    }
+    fn verify_lookup(&self, _: &Caller, _: &[u8], _: Later) -> Ran {
+        refused()
+    }
+    fn verify_store(&self, _: &Caller, _: &[u8], _: &[u8], _: u64) -> Stored {
+        Stored::refused(UNSERVED)
+    }
+    fn content_scan(&self, _: &Caller, _: Option<u64>, _: &[u8], _: Later) -> Ran {
+        refused()
+    }
+    fn hook_call(&self, _: &Caller, _: Option<u64>, _: HookAsk, _: Later) -> Ran {
+        refused()
+    }
+    fn snapshot_read(&self, _: &Caller, _: u32) -> Snapshot {
+        Snapshot::Refused(UNSERVED)
+    }
+}
+
 /// The store's linked door opened on `settings` over the loader, its needs on a [`TcpConns`].
 pub(crate) fn open_loaded(settings: &str) -> Result<LoadedStore, String> {
     open_loaded_over(settings, |d| Arc::new(TcpConns::new(d.conn_waker())))
@@ -74,7 +162,10 @@ pub(crate) fn open_loaded_over(
     settings: &str,
     conns: impl FnOnce(&Dispatcher) -> Arc<dyn busbar_contract::conn::DeclaredConns>,
 ) -> Result<LoadedStore, String> {
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let d = Arc::new(Dispatcher::with_services(
+        DispatchConfig::default(),
+        Arc::new(ClockOnly),
+    ));
     let conns = conns(&d);
     let row = LinkedRow::of(crate::door).map_err(|e| e.to_string())?;
     let p = load_linked::<Store>(
@@ -158,90 +249,12 @@ impl TestStore {
         block_on(StoreCalls::add_usage_batch(&self.store, op, &cells)).map_err(op_refused)
     }
 
-    pub(crate) fn append_audit_op(&self, op: OpId, entry: &AuditRecord) -> Result<(), OpRefused> {
-        block_on(StoreCalls::append_audit_batch(
-            &self.store,
-            op,
-            std::slice::from_ref(entry),
-        ))
-        .map_err(op_refused)
-    }
-
-    pub(crate) fn reserve<'c>(
+    pub(crate) fn append_plane_record_op(
         &self,
         op: OpId,
-        epoch: u64,
-        cells: impl Iterator<Item = Cell<'c>>,
-        grants: &mut impl Extend<Grant>,
-    ) -> Result<(), ReserveRefused> {
-        let cells: Vec<Cell<'c>> = cells.collect();
-        match block_on(StoreCalls::reserve(&self.store, op, epoch, &cells)) {
-            Ok(g) => {
-                grants.extend(g);
-                Ok(())
-            }
-            Err(StoreFailure::Reserve(r)) => Err(r),
-            Err(StoreFailure::Conflict) => Err(ReserveRefused::Conflict),
-            Err(_) => Err(ReserveRefused::Unavailable),
-        }
-    }
-
-    pub(crate) fn slice_release(
-        &self,
-        op: OpId,
-        epoch: u64,
-        items: impl Iterator<Item = (u64, u64)>,
-        released: &mut impl Extend<u64>,
+        record: PlaneRecordRef<'_>,
     ) -> Result<(), OpRefused> {
-        let items: Vec<(u64, u64)> = items.collect();
-        let back = block_on(StoreCalls::slice_release(&self.store, op, epoch, &items))
-            .map_err(op_refused)?;
-        released.extend(back);
-        Ok(())
-    }
-
-    pub(crate) fn window_caps(&self, op: OpId, caps: &[Cap<'_>]) -> Result<(), CapsRefused> {
-        block_on(StoreCalls::window_caps(&self.store, op, caps)).map_err(|f| match f {
-            StoreFailure::CapConflict(index) => CapsRefused::CapConflict { index },
-            StoreFailure::Conflict => CapsRefused::Conflict,
-            other => CapsRefused::Failed(text(other)),
-        })
-    }
-
-    pub(crate) fn append_batch(
-        &self,
-        op: OpId,
-        stream: &str,
-        records: &[RecordBytes],
-    ) -> Result<Head, OpRefused> {
-        block_on(StoreCalls::append_batch(&self.store, op, stream, records)).map_err(op_refused)
-    }
-
-    pub(crate) fn heads(&self) -> Result<Vec<(String, Head)>, String> {
-        block_on(StoreCalls::heads(&self.store)).map_err(text)
-    }
-
-    pub(crate) fn session_put(
-        &self,
-        session: u64,
-        node: &str,
-        principal: &str,
-    ) -> Result<(), String> {
-        block_on(StoreCalls::session_put(
-            &self.store,
-            session,
-            node,
-            principal,
-        ))
-        .map_err(text)
-    }
-
-    pub(crate) fn session_remove(&self, session: u64) -> Result<(), String> {
-        block_on(StoreCalls::session_remove(&self.store, session)).map_err(text)
-    }
-
-    pub(crate) fn sessions_for(&self, principal: &str) -> Result<Vec<(u64, String)>, String> {
-        block_on(StoreCalls::sessions_for(&self.store, principal)).map_err(text)
+        block_on(StoreCalls::append_plane_record(&self.store, op, record)).map_err(op_refused)
     }
 
     pub(crate) fn record_put(&self, schema: &str, key: &[u8], value: &[u8]) -> Result<(), String> {
