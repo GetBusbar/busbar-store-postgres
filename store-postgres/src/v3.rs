@@ -610,11 +610,9 @@ impl StoreSlots for PostgresStore {
         before: u64,
         retention: busbar_contract::records::Retention,
     ) -> Step<RecordStoreResult<u64>> {
-        match retention {
-            busbar_contract::records::Retention::Age => {
-                StoreSlots::purge_plane_records_before(self, cx, kind, before)
-            }
-            busbar_contract::records::Retention::TerminalOnly => Step::Ready(Ok(0)),
-        }
+        let kind = kind.to_owned();
+        on_conn!(self, cx, RecordStoreError, |s| s
+            .purge_plane_records(&kind, before, retention)
+            .await)
     }
 }

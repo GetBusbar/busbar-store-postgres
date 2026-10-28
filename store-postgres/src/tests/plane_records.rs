@@ -655,7 +655,11 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
 
     assert_eq!(
         store
-            .purge_plane_records_before("task", 1_000_000_200)
+            .purge_plane_records(
+                "task",
+                1_000_000_200,
+                busbar_contract::records::Retention::TerminalOnly
+            )
             .unwrap(),
         4,
         "only the four TERMINAL rows strictly older than the cutoff go, and the count must be one \
@@ -682,7 +686,11 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     );
     assert_eq!(
         store
-            .purge_plane_records_before("task", 1_000_000_200)
+            .purge_plane_records(
+                "task",
+                1_000_000_200,
+                busbar_contract::records::Retention::TerminalOnly
+            )
             .unwrap(),
         0,
         "re-running the same purge removes nothing"
@@ -722,7 +730,11 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
 
     assert_eq!(
         store
-            .purge_plane_records_before("task", 1_000_000_200)
+            .purge_plane_records(
+                "task",
+                1_000_000_200,
+                busbar_contract::records::Retention::TerminalOnly
+            )
             .unwrap(),
         1,
         "exactly the one terminal task in this band is swept"

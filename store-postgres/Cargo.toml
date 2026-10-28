@@ -41,7 +41,8 @@ tracing-subscriber = { workspace = true }
 # The live tests open the store through the REAL loader on a dispatcher, its connections over the
 # loader's test connection table (`tcp_conns`, `test-support`), and verify on an independent
 # connection of the `postgres` driver's own.
-busbar-plugin-loader = { workspace = true, features = ["test-support"] }
+busbar-plugin-loader = { workspace = true }
+busbar-test-kit = { workspace = true }
 postgres = { workspace = true }
 # The TLS test (`src/tests/tls.rs`): an in-test TLS proxy in front of the live server, its CA minted
 # per run; the store's side is the loader's test table trusting that CA. Test-only.

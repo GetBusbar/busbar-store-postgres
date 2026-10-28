@@ -19,7 +19,7 @@ use busbar_plugin_loader::dispatch::{
     LinkedRow, NoSink,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
-use busbar_plugin_loader::tcp_conns::TcpConns;
+use busbar_test_kit::tcp_conns::TcpConns;
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
 /// failure, never a skip: the dropped-in door is what these tests prove.
@@ -247,8 +247,10 @@ pub fn build_real_binaries() -> (PathBuf, PathBuf) {
             "build",
             "--release",
             "--locked",
-            "-p",
-            "busbar",
+            "--manifest-path",
+            "dist/default/Cargo.toml",
+            "--target-dir",
+            "target",
             "--bin",
             "busbar",
         ][..],
@@ -267,6 +269,8 @@ pub fn build_real_binaries() -> (PathBuf, PathBuf) {
         let status = Command::new("cargo")
             .args(args)
             .env("BUSBAR_RELEASE_PUBKEY", E2E_RELEASE_PUBKEY)
+            // Both binaries are read back from `<checkout>/target/release` below.
+            .env_remove("CARGO_TARGET_DIR")
             .current_dir(&root)
             .status()
             .expect("run cargo build for busbar + busbar-plugin-pack");
@@ -275,12 +279,7 @@ pub fn build_real_binaries() -> (PathBuf, PathBuf) {
             "building the real busbar + busbar-plugin-pack binaries must succeed ({args:?})"
         );
     }
-    // The nested `cargo build` inherits this process's environment, so a CARGO_TARGET_DIR set for
-    // the test run redirects THAT build too; look where it actually put the binaries.
-    let release = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("target"))
-        .join("release");
+    let release = root.join("target").join("release");
     (release.join("busbar"), release.join("busbar-plugin-pack"))
 }
 
