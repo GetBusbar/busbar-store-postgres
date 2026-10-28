@@ -319,3 +319,17 @@ fn the_postgres_store_library_loaded_as_another_kind_is_refused() {
         "a store library loaded as kind secret"
     );
 }
+
+/// The store's Statement declares exactly its secret fields (`secret_refs`): `url`, the one
+/// setting that carries the connection's credentials (`user:password@host`). busbar resolves
+/// a secret reference only at a position the Statement declares secret and refuses one anywhere
+/// else (busbar #1699, ORACLE-SIGNOFF G14), so a 1.5.5 config's `url: {env: …}` keeps booting.
+#[test]
+fn the_statement_declares_exactly_its_secret_fields() {
+    let stated = busbar_contract::abi::mechanism::rendering::read(
+        &busbar_plugin_loader::dispatch::rendering_of(busbar_store_postgres::door)
+            .expect("the door renders"),
+    )
+    .expect("the rendering reads back");
+    assert_eq!(stated.secret_refs, ["url".to_string()]);
+}
