@@ -284,6 +284,18 @@ impl Session {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), String> {
+        // AN EMPTY VALUE REMOVES THE ROW (abi/store slot 26 `record_put`).
+        if value.is_empty() {
+            return self
+                .lock()
+                .execute(
+                    "DELETE FROM store_records WHERE schema_id = $1 AND key = $2",
+                    &[&schema, &key],
+                )
+                .await
+                .map(drop)
+                .map_err(pg);
+        }
         self.lock()
             .execute(
                 "INSERT INTO store_records (schema_id, key, value) VALUES ($1, $2, $3)
