@@ -1,31 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! The store v3 slots this backend answers beyond the 1.5.5 op set ([`StoreSlots`]): the
+//! The store v3 slots this backend answers beyond the base op set ([`StoreSlots`]): the
 //! `op_id`-carrying writes (the usage and metering batches and the plane-record append), the
 //! kernel-held records, and the door (`store_door!`) over all of it. The store keeps ledger counts
-//! and records only: no money state (busbar 1.6.0: money is a view on ledger x rate card).
+//! and records only; money is a view on ledger x rate card.
 //!
-//! DEDUPE (`abi::store` S1-S4), DURABLE: every `op_id` this store APPLIED is a row of `store_ops`
-//! holding the op's value fields and its answer. The row is inserted FIRST in the op's own
-//! transaction, the op's effect runs in the same transaction, and the answer is written before the
-//! commit: a racing call with the same `op_id` (on this node or another) waits on the primary key,
-//! then reads the committed row and replays it (same value fields) or is refused (different ones).
-//! A failed op rolls its row back with its effect, so only an op that applied is remembered. Rows
-//! are kept [`OP_ID_RETENTION_SECS`] and swept at most once a minute per instance.
+//! DEDUPE (`abi::store` S1-S4), DURABLE: every `op_id` this store APPLIED is a `store_ops` row
+//! holding the op's value fields and answer. The row is inserted FIRST in the op's own transaction
+//! with the op's effect: a racing call with the same `op_id` (on this node or another) waits on the
+//! primary key, then reads the committed row and replays it (same value fields) or is refused
+//! (different ones). A failed op rolls its row back with its effect. Rows are kept
+//! [`OP_ID_RETENTION_SECS`] and swept at most once a minute per instance.
 //!
-//! CONNECTIONS: every slot runs on the instance's ONE kept connection over the host's connector
-//! (1.5.5's one mutex-guarded connection; STORE-KEEP), as straight-line async code by the store
-//! SDK's `wire::drive_kept` (busbar THE DESIGN: every call Ready or Pending(wake), no
-//! socket of the plugin's own; ARCHITECT rulings 2026-10-03 on Q-L14-1 and Q-L16-2). The door
-//! declares one outbound `tcp` need (`NEEDS`, `operator-infrastructure`); `open` parses the
-//! settings, and its connect step reaches the server and ensures the schema, so an unreachable or
-//! refusing server still fails the load at open, in the driver's words.
+//! CONNECTIONS: every slot runs on the instance's ONE kept connection over the host's connector, as
+//! straight-line async code by the store SDK's `wire::drive_kept`. The door declares one outbound
+//! `tcp` need (`NEEDS`); `open` parses the settings and its connect step reaches the server and
+//! ensures the schema, so an unreachable or refusing server fails the load.
 //!
-//! Every `u64` the ABI hands this module's own record and dedupe columns is stored BIT-FOR-BIT in a
-//! BIGINT (`as i64`), so none of them is clamped or wrapped. The ops this module delegates to the
-//! 1.5.5 code (`add_usage_in`, `add_metering_in` and the plane-record append) keep that code's own
-//! rules: usage and metering totals clamp, and appends refuse a value outside their column.
+//! Every `u64` this module's own record and dedupe columns take is stored BIT-FOR-BIT in a BIGINT
+//! (`as i64`). The ops delegated to the base code keep that code's rules: usage and metering totals
+//! clamp, and appends refuse a value outside their column.
 
 use std::sync::atomic::Ordering;
 
@@ -52,9 +47,8 @@ const NO_TEXT: AbiStr = AbiStr {
     len: 0,
 };
 
-/// THE STORE'S ONE NEED: the server, dialled over `tcp` at the DSN's `host:port` (the store names
-/// the target per connection), in the `operator-infrastructure` egress class (private, loopback and
-/// plaintext allowed; pinned; cloud metadata hosts refused).
+/// The store's one need: the server, dialled over `tcp` at the DSN's `host:port`, in the
+/// `operator-infrastructure` egress class.
 pub const NEEDS: &[Need] = &[Need {
     direction: DIRECTION_OUTBOUND,
     egress_class: EGRESS_OPERATOR_INFRASTRUCTURE,
@@ -85,10 +79,9 @@ busbar_contract::store_door!(
     needs: NEEDS
 );
 
-/// RUN ONE OP on the instance's kept connection (a fresh one when none is kept): open the session
+/// Run one op on the instance's kept connection (a fresh one when none is kept): open the session
 /// (a failure is `$fail` of the driver's words), run `$body` on it `$s`, and keep the connection if
-/// the session is idle. Every argument the body names is owned (the body runs
-/// across the op's entries).
+/// the session is idle. Every argument the body names is owned.
 macro_rules! on_conn {
     ($self:ident, $cx:ident, $fail:expr, |$s:ident| $body:expr) => {{
         let shared = $self.shared();
@@ -278,13 +271,15 @@ impl Session {
         Ok(())
     }
 
+    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row: it is
+    /// the host's strike, so `record_get` then answers `None` and
+    /// `record_scan` never returns it. Removing a row that is not there is `Ok`.
     async fn v3_record_put(
         &mut self,
         schema: &str,
         key: &[u8],
         value: &[u8],
     ) -> Result<(), String> {
-        // AN EMPTY VALUE REMOVES THE ROW (abi/store slot 26 `record_put`).
         if value.is_empty() {
             return self
                 .lock()
@@ -430,6 +425,27 @@ fn settings_url(settings: &[u8]) -> Result<String, String> {
         })
 }
 
+/// One argument as the slot's body takes it: `:` borrows the owned copy, `=` passes it by value.
+macro_rules! pass {
+    (: $a:ident) => {
+        &$a
+    };
+    (= $a:ident) => {
+        $a
+    };
+}
+
+/// Each listed base slot: copy its arguments (the body runs across the op's entries) and run the
+/// `Session` method of the same name on the op's connection.
+macro_rules! legacy_slots {
+    ($($name:ident($($arg:ident $sep:tt $ty:ty),*) -> $ret:ty;)*) => {$(
+        fn $name(&self, cx: &mut Op<'_>, $($arg: $ty),*) -> Step<RecordStoreResult<$ret>> {
+            $(let $arg = $arg.to_owned();)*
+            on_conn!(self, cx, RecordStoreError, |s| s.$name($(pass!($sep $arg)),*).await)
+        }
+    )*};
+}
+
 impl StoreSlots for PostgresStore {
     const TAIL: Tail = Tail {
         ephemeral: false,
@@ -453,8 +469,8 @@ impl StoreSlots for PostgresStore {
         PostgresStore::new(&url).map_err(|e| e.0)
     }
 
-    /// Reach the server and ensure the schema (1.5.5's connect + migrate, at the same moment: the
-    /// load), in the driver's words when it cannot.
+    /// Reach the server and ensure the schema (connect + migrate, at the same moment: the load),
+    /// in the driver's words when it cannot.
     fn connect(&self, cx: &mut Op<'_>) -> Step<Result<(), String>> {
         on_conn!(self, cx, |e| e, |s| s.migrate().await.map_err(|e| e.0))
     }
@@ -535,156 +551,32 @@ impl StoreSlots for PostgresStore {
             .await)
     }
 
-    // ── the 1.5.5 op set (slots 0-32): each the 1.5.5 body, on the op's connection ──────────
-
-    fn put_key(&self, cx: &mut Op<'_>, key: &VirtualKey) -> Step<RecordStoreResult<()>> {
-        let key = key.clone();
-        on_conn!(self, cx, RecordStoreError, |s| s.put_key(&key).await)
-    }
-
-    fn get_key(&self, cx: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<Option<VirtualKey>>> {
-        let id = id.to_owned();
-        on_conn!(self, cx, RecordStoreError, |s| s.get_key(&id).await)
-    }
-
-    fn list_keys(&self, cx: &mut Op<'_>) -> Step<RecordStoreResult<Vec<VirtualKey>>> {
-        on_conn!(self, cx, RecordStoreError, |s| s.list_keys().await)
-    }
-
-    fn delete_key(&self, cx: &mut Op<'_>, id: &str) -> Step<RecordStoreResult<()>> {
-        let id = id.to_owned();
-        on_conn!(self, cx, RecordStoreError, |s| s.delete_key(&id).await)
-    }
-
-    fn list_keys_since(
-        &self,
-        cx: &mut Op<'_>,
-        since: u64,
-    ) -> Step<RecordStoreResult<Vec<VirtualKey>>> {
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .list_keys_since(since)
-            .await)
-    }
-
-    fn get_usage(
-        &self,
-        cx: &mut Op<'_>,
-        bucket_id: &str,
-        window_start: u64,
-    ) -> Step<RecordStoreResult<UsageLedger>> {
-        let bucket_id = bucket_id.to_owned();
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .get_usage(&bucket_id, window_start)
-            .await)
-    }
-
-    fn put_usage(
-        &self,
-        cx: &mut Op<'_>,
-        bucket_id: &str,
-        window_start: u64,
-        ledger: &UsageLedger,
-    ) -> Step<RecordStoreResult<()>> {
-        let (bucket_id, ledger) = (bucket_id.to_owned(), ledger.clone());
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .put_usage(&bucket_id, window_start, &ledger)
-            .await)
-    }
-
-    fn list_metering(
-        &self,
-        cx: &mut Op<'_>,
-        bucket: u64,
-    ) -> Step<RecordStoreResult<Vec<MeteringRow>>> {
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .list_metering(bucket)
-            .await)
-    }
-
-    fn put_credential(
-        &self,
-        cx: &mut Op<'_>,
-        secret: &CredentialSecret,
-    ) -> Step<RecordStoreResult<()>> {
-        let secret = secret.clone();
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .put_credential(&secret)
-            .await)
-    }
-
-    fn put_key_with_credential(
-        &self,
-        cx: &mut Op<'_>,
-        key: &VirtualKey,
-        secret: &CredentialSecret,
-    ) -> Step<RecordStoreResult<()>> {
-        let (key, secret) = (key.clone(), secret.clone());
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .put_key_with_credential(&key, &secret)
-            .await)
-    }
-
-    fn list_credentials(
-        &self,
-        cx: &mut Op<'_>,
-        key_id: &str,
-    ) -> Step<RecordStoreResult<Vec<CredentialMeta>>> {
-        let key_id = key_id.to_owned();
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .list_credentials(&key_id)
-            .await)
-    }
-
-    fn revoke_credential(
-        &self,
-        cx: &mut Op<'_>,
-        id: &str,
-        reason: &str,
-    ) -> Step<RecordStoreResult<()>> {
-        let (id, reason) = (id.to_owned(), reason.to_owned());
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .revoke_credential(&id, &reason)
-            .await)
-    }
-
-    fn list_credentials_since(
-        &self,
-        cx: &mut Op<'_>,
-        since: u64,
-    ) -> Step<RecordStoreResult<Vec<CredentialSecret>>> {
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .list_credentials_since(since)
-            .await)
-    }
-
-    fn list_audit(&self, cx: &mut Op<'_>) -> Step<RecordStoreResult<Vec<AuditRecord>>> {
-        on_conn!(self, cx, RecordStoreError, |s| s.list_audit().await)
-    }
-
-    fn add_denylist(
-        &self,
-        cx: &mut Op<'_>,
-        sub: &str,
-        reason: &str,
-    ) -> Step<RecordStoreResult<()>> {
-        let (sub, reason) = (sub.to_owned(), reason.to_owned());
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .add_denylist(&sub, &reason)
-            .await)
-    }
-
-    fn list_denylist(&self, cx: &mut Op<'_>) -> Step<RecordStoreResult<Vec<String>>> {
-        on_conn!(self, cx, RecordStoreError, |s| s.list_denylist().await)
-    }
-
-    fn list_audit_tail(
-        &self,
-        cx: &mut Op<'_>,
-        limit: u64,
-    ) -> Step<RecordStoreResult<Vec<AuditRecord>>> {
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .list_audit_tail(limit)
-            .await)
+    // The base op set: each the store's own body, on the op's connection, over owned copies of its
+    // arguments (`:` marks a borrowed argument, `=` one passed by value).
+    legacy_slots! {
+        put_key(key: &VirtualKey) -> ();
+        get_key(id: &str) -> Option<VirtualKey>;
+        list_keys() -> Vec<VirtualKey>;
+        delete_key(id: &str) -> ();
+        list_keys_since(since = u64) -> Vec<VirtualKey>;
+        get_usage(bucket_id: &str, window_start = u64) -> UsageLedger;
+        put_usage(bucket_id: &str, window_start = u64, ledger: &UsageLedger) -> ();
+        list_metering(bucket = u64) -> Vec<MeteringRow>;
+        put_credential(secret: &CredentialSecret) -> ();
+        put_key_with_credential(key: &VirtualKey, secret: &CredentialSecret) -> ();
+        list_credentials(key_id: &str) -> Vec<CredentialMeta>;
+        revoke_credential(id: &str, reason: &str) -> ();
+        list_credentials_since(since = u64) -> Vec<CredentialSecret>;
+        list_audit() -> Vec<AuditRecord>;
+        add_denylist(sub: &str, reason: &str) -> ();
+        list_denylist() -> Vec<String>;
+        list_audit_tail(limit = u64) -> Vec<AuditRecord>;
+        get_plane_record(kind: &str, id: &str) -> Option<Vec<u8>>;
+        list_plane_record_parents(kind: &str) -> Vec<String>;
+        purge_plane_records_before(kind: &str, before = u64) -> u64;
+        delete_plane_record(kind: &str, id: &str) -> ();
+        redeem_plane_token(kind: &str, token: &str, expires_at = u64, now = u64) -> bool;
+        plane_token_live(kind: &str, token: &str, expires_at = u64, now = u64) -> bool;
     }
 
     fn upsert_plane_record(
@@ -695,18 +587,6 @@ impl StoreSlots for PostgresStore {
         let record = record.to_record();
         on_conn!(self, cx, RecordStoreError, |s| s
             .upsert_plane_record(record.view())
-            .await)
-    }
-
-    fn get_plane_record(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-        id: &str,
-    ) -> Step<RecordStoreResult<Option<Vec<u8>>>> {
-        let (kind, id) = (kind.to_owned(), id.to_owned());
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .get_plane_record(&kind, &id)
             .await)
     }
 
@@ -723,17 +603,6 @@ impl StoreSlots for PostgresStore {
             .await)
     }
 
-    fn list_plane_record_parents(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-    ) -> Step<RecordStoreResult<Vec<String>>> {
-        let kind = kind.to_owned();
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .list_plane_record_parents(&kind)
-            .await)
-    }
-
     fn purge_plane_records(
         &self,
         cx: &mut Op<'_>,
@@ -744,58 +613,6 @@ impl StoreSlots for PostgresStore {
         let kind = kind.to_owned();
         on_conn!(self, cx, RecordStoreError, |s| s
             .purge_plane_records(&kind, before, retention)
-            .await)
-    }
-
-    fn purge_plane_records_before(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-        before: u64,
-    ) -> Step<RecordStoreResult<u64>> {
-        let kind = kind.to_owned();
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .purge_plane_records_before(&kind, before)
-            .await)
-    }
-
-    fn delete_plane_record(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-        id: &str,
-    ) -> Step<RecordStoreResult<()>> {
-        let (kind, id) = (kind.to_owned(), id.to_owned());
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .delete_plane_record(&kind, &id)
-            .await)
-    }
-
-    fn redeem_plane_token(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-        token: &str,
-        expires_at: u64,
-        now: u64,
-    ) -> Step<RecordStoreResult<bool>> {
-        let (kind, token) = (kind.to_owned(), token.to_owned());
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .redeem_plane_token(&kind, &token, expires_at, now)
-            .await)
-    }
-
-    fn plane_token_live(
-        &self,
-        cx: &mut Op<'_>,
-        kind: &str,
-        token: &str,
-        expires_at: u64,
-        now: u64,
-    ) -> Step<RecordStoreResult<bool>> {
-        let (kind, token) = (kind.to_owned(), token.to_owned());
-        on_conn!(self, cx, RecordStoreError, |s| s
-            .plane_token_live(&kind, &token, expires_at, now)
             .await)
     }
 }
