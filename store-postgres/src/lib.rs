@@ -11,8 +11,7 @@
 //!
 //! ## Connections
 //!
-//! One kept connection ([`KEPT_CONNECTIONS`] = 1), so ops take turns on it as they took 1.5.x's
-//! mutex. `open`'s connect step dials through the host (one declared `tcp` need), authenticates
+//! One kept connection ([`KEPT_CONNECTIONS`] = 1), so ops take turns on it. `open`'s connect step dials through the host (one declared `tcp` need), authenticates
 //! (SCRAM-SHA-256, md5 or cleartext) and ensures the schema, so an unreachable or refusing server
 //! fails the load. A connection is kept only while its session is idle; one that failed or was left
 //! mid-transaction is closed and the next op connects afresh.
@@ -22,7 +21,7 @@
 //! - `sslmode=require` / `verify-ca` / `verify-full` secure the connection through the host's
 //!   connector and ALWAYS verify the certificate and name (libpq's `require` would not); a server
 //!   answering the `SSLRequest` with `N` fails the load. `disable`, `allow` and `prefer` connect in
-//!   plaintext, as 1.5.x did.
+//!   plaintext.
 //! - No partitioning, LISTEN/NOTIFY-accelerated hydration or column-level secret grants: all three
 //!   are internal and can be added without a schema bump.
 
@@ -194,9 +193,9 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
     out
 }
 
-/// Store schema version. The last release (1.5.x) is v6, and a database older than v6 is refused:
-/// no release ever wrote one. v6 -> v13 upgrades in place:
-/// - v10 (1.6.0): `keys` gains `idp_subject`/`binding_mode`/`minted_by`/`idp_provider`/
+/// Store schema version. A database older than v6 is refused: no release ever wrote one. v6 -> v13
+/// upgrades in place:
+/// - v10: `keys` gains `idp_subject`/`binding_mode`/`minted_by`/`idp_provider`/
 ///   `allowed_scopes_by_kind`; open usage units get `usage_ledger_units` and `usage_metering_units`;
 ///   `usage_metering.priced_from_ms` joins its key; the kind-tagged `plane_records`, `plane_chain`
 ///   and `plane_tokens`.
@@ -402,7 +401,7 @@ CREATE TABLE IF NOT EXISTS store_records (
 );
 ";
 
-/// The v10 column additions on tables a 1.5.x database already has (idempotent).
+/// The v10 column additions on tables an older database already has (idempotent).
 const MIGRATE_V10_COLUMNS: &str = "
 ALTER TABLE keys ADD COLUMN IF NOT EXISTS idp_subject TEXT;
 ALTER TABLE keys ADD COLUMN IF NOT EXISTS binding_mode TEXT;
@@ -419,7 +418,7 @@ pub struct PostgresStore {
     shared: std::sync::Arc<Shared>,
 }
 
-/// How many connections an instance keeps: the 1.5.5 store held exactly one.
+/// How many connections an instance keeps: exactly one.
 pub const KEPT_CONNECTIONS: usize = 1;
 
 /// What every op of one instance shares.
@@ -430,16 +429,15 @@ pub(crate) struct Shared {
     pub(crate) secret: Option<String>,
     /// When this instance last swept `store_ops` past its retention (`v3`).
     pub(crate) ops_swept_at: AtomicU64,
-    /// The instance's KEPT connections (ARCHITECT ruling 2026-10-03, STORE-KEEP): bounded at ONE,
-    /// the 1.5.5 store's one mutex-guarded connection (it had no pool setting). An op waits for it
-    /// while another holds it, as 1.5.5's ops waited on the mutex.
+    /// The instance's kept connections: bounded at ONE (there is no pool setting). An op waits
+    /// for it while another holds it.
     pub(crate) pool: std::sync::Arc<busbar_contract::abi::sdk::store::wire::Pool>,
     /// The endpoint (an index into the DSN's list) that last connected: the next connect tries it
     /// first, so a failover DSN keeps asking for the kept connection's own endpoint.
     pub(crate) endpoint: std::sync::atomic::AtomicUsize,
 }
 
-/// ONE OP'S CONNECTION: the 1.5.5 bodies run on it, as they ran on the mutex-guarded client.
+/// One op's connection: the store's bodies run on it.
 pub(crate) struct Session {
     client: Client,
     shared: std::sync::Arc<Shared>,
@@ -657,7 +655,7 @@ fn labels_from_storage(stored: &str) -> std::collections::BTreeMap<String, Strin
 
 // SCOPE STORAGE. `allowed_pools` holds the `pool` grants as a JSON array of names, or NULL; the v10
 // `allowed_scopes_by_kind` holds every NON-pool grant as `{kind: [value, ...]}`, NULL when none, so a
-// pool-only key is stored as 1.5.x wrote it. `None` (grant omitted = all) -> both NULL; `Some(list)`
+// pool-only key is stored as before. `None` (grant omitted = all) -> both NULL; `Some(list)`
 // -> `allowed_pools` is ALWAYS an array (possibly `[]`), so `Some([])` never collapses into `None`
 // and a non-pool-only grant never reads back as "every pool".
 type ScopeColumns = (Option<String>, Option<String>);
@@ -1060,7 +1058,7 @@ impl Session {
                 }
                 // Two ModelTokens entries for one model never reach this statement: the
                 // reserved-column INSERT above has no ON CONFLICT, so it refuses them (23505)
-                // first, as 1.5.5's put_usage did.
+                // first.
                 sql.push_str(
                     " ON CONFLICT (bucket_id, window_start, model, unit) DO UPDATE SET \
                      count = usage_ledger_units.count + EXCLUDED.count",
@@ -1333,9 +1331,7 @@ impl Session {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    // ── THE KIND-TAGGED PLANE-RECORD VERBS (busbar 1.6.0) ──
-    //
-    // Generic over `kind`: an UPSERTED record lives in `plane_records` keyed `(kind, id)`, an
+    // The kind-tagged plane-record verbs. Generic over `kind`: an UPSERTED record lives in `plane_records` keyed `(kind, id)`, an
     // APPENDED one in `plane_chain` keyed `(kind, parent, seq)`. Identity, ordering and retention
     // read only the typed sidecar columns, never the body.
 
@@ -1896,7 +1892,7 @@ impl Session {
         let requests = clamp(d.requests);
         let brequests = clamp(d.billable_requests);
         let priced_from = clamp(d.priced_from_ms);
-        // `priced_from_ms` is part of the accrual key (DECISION #79): a rate-card edit inside the
+        // `priced_from_ms` is part of the accrual key: a rate-card edit inside the
         // UTC day opens a SECOND row for that day so each half keeps the card it was earned under,
         // rather than folding counts earned under two prices into one row readable against one.
         tx.execute(
@@ -2022,8 +2018,7 @@ impl Session {
     }
 }
 
-// ── THE PLUGIN DOOR ──
-// `v3` invokes `store_door!` over this store, which expands to `door`: a build that links this crate
+// The plugin door: `v3` invokes `store_door!` over this store, which expands to `door`: a build that links this crate
 // registers it, and the sibling `busbar-store-postgres-plugin` cdylib exports it.
 
 mod v3;

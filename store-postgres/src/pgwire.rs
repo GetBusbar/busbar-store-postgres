@@ -1,20 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE POSTGRES FRONTEND PROTOCOL OVER THE HOST'S CONNECTOR: a small async client whose every byte
+//! The Postgres frontend protocol over the host's connector: a small async client whose every byte
 //! goes through the op's one connection ([`Wire`], the store SDK's `wire`), so this store opens no
-//! socket of its own (busbar THE DESIGN, the connections section). The codec is
-//! `postgres-protocol` (the messages, SCRAM-SHA-256 and md5) and the value encodings are
-//! `postgres-types` (the same binary `ToSql`/`FromSql` the `postgres` crate uses), so a parameter
-//! or a column reads exactly as it did over the 1.5.5 driver.
+//! socket of its own. The codec is `postgres-protocol` (the messages, SCRAM-SHA-256 and md5) and
+//! the value encodings are `postgres-types` (the same binary `ToSql`/`FromSql` the `postgres` crate
+//! uses).
 //!
 //! The surface mirrors the `postgres` crate's (`Client`, `Transaction`, `Row`, `Error`) with every
-//! call `async`, so the store's SQL bodies are the 1.5.5 bodies with `.await`. A statement is
-//! prepared under a name the first time its connection runs its text (Parse/Describe/Sync for the
-//! parameter and column types, as the driver prepared every query under a name) and kept with the
-//! connection (the wire's session), so every later run of the same text is ONE round trip
-//! (Bind/Execute/Sync), every parameter and column in the binary format. A `Transaction` dropped
-//! without `commit` is rolled back before the connection's next statement, as the driver's was.
+//! call `async`. A statement is prepared under a name the first time its connection runs its text
+//! (Parse/Describe/Sync for the parameter and column types) and kept with the connection (the
+//! wire's session), so every later run of the same text is ONE round trip (Bind/Execute/Sync),
+//! every parameter and column in the binary format. A `Transaction` dropped without `commit` is
+//! rolled back before the connection's next statement.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -31,10 +29,8 @@ use postgres_types::{FromSql, Kind, ToSql, Type};
 
 use busbar_contract::abi::sdk::store::wire::Wire;
 
-// ── configuration ───────────────────────────────────────────────────────────────────────────
-
 /// Whether the connection is secured (libpq's `sslmode`). `disable`, `allow` and `prefer` connect
-/// in plaintext, as the 1.5.5 build (`NoTls`) did for every mode it accepted; `require`,
+/// in plaintext; `require`,
 /// `verify-ca` and `verify-full` ask the server for TLS and secure the connection through the host
 /// (its trust anchors), refusing a server that declines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,8 +41,8 @@ pub enum SslMode {
     Require,
 }
 
-/// Which kind of session a connect accepts (libpq's `target_session_attrs`, the 1.5.5 driver's
-/// set): the others libpq has (`primary`, `standby`, `prefer-standby`) the driver refused too.
+/// Which kind of session a connect accepts (libpq's `target_session_attrs`): the others libpq has
+/// (`primary`, `standby`, `prefer-standby`) are refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAttrs {
     /// Any server.
@@ -220,7 +216,7 @@ impl Config {
                         }
                     }
                 }
-                // Whole seconds, as the 1.5.5 driver read them: more than zero bounds the dial and
+                // Whole seconds: more than zero bounds the dial and
                 // the handshake of a new connection, zero or less is no bound.
                 "connect_timeout" => {
                     let secs: i64 = v.parse().map_err(|_| {
@@ -245,9 +241,9 @@ impl Config {
                         }
                     }
                 }
-                // Refused rather than ignored: the 1.5.5 driver (no TLS client of its own, so no
-                // channel binding) refused `require`, and a server that gets no binding could not
-                // be the one the operator required.
+                // Refused rather than ignored: the store has no TLS client of its own, so no channel
+                // binding, and a server that gets no binding could not be the one the operator
+                // required.
                 "channel_binding" => match v.as_str() {
                     "disable" | "prefer" => {}
                     "require" => {
@@ -478,8 +474,6 @@ fn keywords(s: &str) -> Result<Vec<(String, String)>, Error> {
     }
 }
 
-// ── errors ──────────────────────────────────────────────────────────────────────────────────
-
 /// A SQLSTATE.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlState(String);
@@ -633,8 +627,6 @@ fn parse_err(e: impl fmt::Display) -> Error {
     Error::new(Kind_::Parse(e.to_string()))
 }
 
-// ── rows ────────────────────────────────────────────────────────────────────────────────────
-
 /// A result column.
 #[derive(Debug, Clone)]
 pub struct Column {
@@ -716,8 +708,6 @@ impl Row {
     }
 }
 
-// ── the connection's prepared statements ────────────────────────────────────────────────────
-
 /// A statement prepared on the connection: its name there, and what its Describe answered.
 struct Statement {
     name: String,
@@ -729,7 +719,7 @@ struct Statement {
 /// (the store's variable-arity batches would otherwise prepare one per batch size, without end).
 const STATEMENTS_KEPT: usize = 256;
 
-/// THE CONNECTION'S PREPARED STATEMENTS, by SQL text. Kept WITH the connection (the wire's session:
+/// The connection's prepared statements, by SQL text. Kept WITH the connection (the wire's session:
 /// a kept connection hands it to the next op, a new connection starts empty and a closed one takes
 /// it along), so an entry names a statement that exists on exactly that server session. An entry
 /// goes in only once the server answered its Parse (a failed Parse prepares nothing), and stays
@@ -789,8 +779,6 @@ impl Cache {
 fn is_stale_statement(e: &Error) -> bool {
     matches!(e.code().map(SqlState::code), Some("26000" | "0A000"))
 }
-
-// ── the client ──────────────────────────────────────────────────────────────────────────────
 
 /// One connection to the server, over the op's wire. The connection is KEPT for the instance's
 /// next op (the store SDK's kept set) only when [`Client::release`] finds the session idle: the
