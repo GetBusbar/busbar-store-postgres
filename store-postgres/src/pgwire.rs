@@ -1,23 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE POSTGRES FRONTEND PROTOCOL OVER THE HOST'S CONNECTOR: a small async client whose every byte
+//! The Postgres frontend protocol over the host's connector: a small async client whose every byte
 //! goes through the op's one connection ([`Wire`], the store SDK's `wire`), so this store opens no
-//! socket of its own (busbar THE DESIGN, the connections section). The codec is
-//! `postgres-protocol` (the messages, SCRAM-SHA-256 and md5) and the value encodings are
-//! `postgres-types` (the same binary `ToSql`/`FromSql` the `postgres` crate uses), so a parameter
-//! or a column reads exactly as it did over the 1.5.5 driver.
+//! socket of its own. The codec is `postgres-protocol` (the messages, SCRAM-SHA-256 and md5) and
+//! the value encodings are `postgres-types` (the same binary `ToSql`/`FromSql` the `postgres` crate
+//! uses).
 //!
 //! The surface mirrors the `postgres` crate's (`Client`, `Transaction`, `Row`, `Error`) with every
-//! call `async`, so the store's SQL bodies are the 1.5.5 bodies with `.await`. A query is two round
-//! trips (Parse/Describe/Sync for the parameter and column types, then Bind/Execute/Sync), every
-//! parameter and column in the binary format. A `Transaction` dropped without `commit` is rolled
-//! back before the connection's next statement, as the driver's was.
+//! call `async`. A statement is prepared under a name the first time its connection runs its text
+//! (Parse/Describe/Sync for the parameter and column types) and kept with the connection (the
+//! wire's session), so every later run of the same text is ONE round trip (Bind/Execute/Sync),
+//! every parameter and column in the binary format. A `Transaction` dropped without `commit` is
+//! rolled back before the connection's next statement.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
@@ -28,10 +29,8 @@ use postgres_types::{FromSql, Kind, ToSql, Type};
 
 use busbar_contract::abi::sdk::store::wire::Wire;
 
-// ── configuration ───────────────────────────────────────────────────────────────────────────
-
 /// Whether the connection is secured (libpq's `sslmode`). `disable`, `allow` and `prefer` connect
-/// in plaintext, as the 1.5.5 build (`NoTls`) did for every mode it accepted; `require`,
+/// in plaintext; `require`,
 /// `verify-ca` and `verify-full` ask the server for TLS and secure the connection through the host
 /// (its trust anchors), refusing a server that declines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,8 +41,8 @@ pub enum SslMode {
     Require,
 }
 
-/// Which kind of session a connect accepts (libpq's `target_session_attrs`, the 1.5.5 driver's
-/// set): the others libpq has (`primary`, `standby`, `prefer-standby`) the driver refused too.
+/// Which kind of session a connect accepts (libpq's `target_session_attrs`): the others libpq has
+/// (`primary`, `standby`, `prefer-standby`) are refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAttrs {
     /// Any server.
@@ -217,7 +216,7 @@ impl Config {
                         }
                     }
                 }
-                // Whole seconds, as the 1.5.5 driver read them: more than zero bounds the dial and
+                // Whole seconds: more than zero bounds the dial and
                 // the handshake of a new connection, zero or less is no bound.
                 "connect_timeout" => {
                     let secs: i64 = v.parse().map_err(|_| {
@@ -242,9 +241,9 @@ impl Config {
                         }
                     }
                 }
-                // Refused rather than ignored: the 1.5.5 driver (no TLS client of its own, so no
-                // channel binding) refused `require`, and a server that gets no binding could not
-                // be the one the operator required.
+                // Refused rather than ignored: the store has no TLS client of its own, so no channel
+                // binding, and a server that gets no binding could not be the one the operator
+                // required.
                 "channel_binding" => match v.as_str() {
                     "disable" | "prefer" => {}
                     "require" => {
@@ -475,8 +474,6 @@ fn keywords(s: &str) -> Result<Vec<(String, String)>, Error> {
     }
 }
 
-// ── errors ──────────────────────────────────────────────────────────────────────────────────
-
 /// A SQLSTATE.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlState(String);
@@ -630,8 +627,6 @@ fn parse_err(e: impl fmt::Display) -> Error {
     Error::new(Kind_::Parse(e.to_string()))
 }
 
-// ── rows ────────────────────────────────────────────────────────────────────────────────────
-
 /// A result column.
 #[derive(Debug, Clone)]
 pub struct Column {
@@ -713,7 +708,77 @@ impl Row {
     }
 }
 
-// ── the client ──────────────────────────────────────────────────────────────────────────────
+/// A statement prepared on the connection: its name there, and what its Describe answered.
+struct Statement {
+    name: String,
+    types: Vec<Type>,
+    columns: Arc<[Column]>,
+}
+
+/// How many statements a connection keeps prepared: past it, the least recently run is closed
+/// (the store's variable-arity batches would otherwise prepare one per batch size, without end).
+const STATEMENTS_KEPT: usize = 256;
+
+/// The connection's prepared statements, by SQL text. Kept WITH the connection (the wire's session:
+/// a kept connection hands it to the next op, a new connection starts empty and a closed one takes
+/// it along), so an entry names a statement that exists on exactly that server session. An entry
+/// goes in only once the server answered its Parse (a failed Parse prepares nothing), and stays
+/// across a rolled-back transaction (a prepared statement is not transactional).
+#[derive(Default)]
+struct Cache {
+    by_sql: HashMap<String, (Arc<Statement>, u64)>,
+    /// The use clock (least recently run goes first) and the next statement's number.
+    tick: u64,
+    next: u64,
+    /// Statements dropped from the cache whose Close goes out ahead of the next Parse.
+    closing: Vec<String>,
+}
+
+/// [`Cache`], shared with the wire's session.
+type Statements = Arc<Mutex<Cache>>;
+
+impl Cache {
+    fn get(&mut self, sql: &str) -> Option<Arc<Statement>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.by_sql.get_mut(sql).map(|(s, used)| {
+            *used = tick;
+            s.clone()
+        })
+    }
+
+    fn insert(&mut self, sql: &str, stmt: Arc<Statement>) {
+        if self.by_sql.len() >= STATEMENTS_KEPT {
+            let oldest = self
+                .by_sql
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                self.forget(&k);
+            }
+        }
+        self.by_sql.insert(sql.to_owned(), (stmt, self.tick));
+    }
+
+    fn forget(&mut self, sql: &str) {
+        if let Some((s, _)) = self.by_sql.remove(sql) {
+            self.closing.push(s.name.clone());
+        }
+    }
+
+    fn forget_all(&mut self) {
+        let names = self.by_sql.drain().map(|(_, (s, _))| s.name.clone());
+        self.closing.extend(names);
+    }
+}
+
+/// A cached statement's run failed because the server no longer has it as prepared: `26000`
+/// (`invalid_sql_statement_name`, the session's statements were deallocated) or `0A000` (a schema
+/// change altered its result type, "cached plan must not change result type").
+fn is_stale_statement(e: &Error) -> bool {
+    matches!(e.code().map(SqlState::code), Some("26000" | "0A000"))
+}
 
 /// One connection to the server, over the op's wire. The connection is KEPT for the instance's
 /// next op (the store SDK's kept set) only when [`Client::release`] finds the session idle: the
@@ -732,6 +797,8 @@ pub struct Client {
     at_ready: bool,
     /// [`Client::release`] found the session idle: keep the connection.
     keep: bool,
+    /// The statements prepared on this connection (the wire's session).
+    statements: Statements,
 }
 
 impl Drop for Client {
@@ -798,6 +865,17 @@ impl Client {
         wire.connect_timed(0, Some(&target(&endpoint.dial, endpoint.port)), ms)
             .await
             .map_err(Error::connect)?;
+        let reused = wire.reused();
+        // A kept connection's statements come with it; a new connection's start empty and ride
+        // with it from here on.
+        let statements = match wire.session::<Statements>() {
+            Some(s) if reused => s,
+            _ => {
+                let s = Statements::default();
+                wire.set_session(s.clone());
+                s
+            }
+        };
         let mut c = Client {
             wire: wire.clone(),
             buf: BytesMut::new(),
@@ -805,8 +883,9 @@ impl Client {
             status: b'I',
             at_ready: true,
             keep: false,
+            statements,
         };
-        if wire.reused() {
+        if reused {
             // A kept connection: secured and authenticated by the op that established it, and
             // idle when it was kept.
             return Ok(c);
@@ -1082,20 +1161,63 @@ impl Client {
         self.simple(sql).await
     }
 
-    /// Run one statement with `params`: its rows and the rows it affected.
+    fn cache(&self) -> MutexGuard<'_, Cache> {
+        self.statements
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Run one statement with `params`: its rows and the rows it affected. A statement the
+    /// connection has prepared runs in one round trip; one it has not is prepared first. A cached
+    /// statement the server no longer has ([`is_stale_statement`]) is dropped and, outside a
+    /// transaction (nothing was aborted), prepared afresh and run once more.
     async fn run(&mut self, sql: &str, params: &[Param<'_>]) -> Result<(Vec<Row>, u64), Error> {
         self.settle().await?;
-        // Round trip 1: the parameter and column types.
+        let cached = self.cache().get(sql);
+        let Some(stmt) = cached else {
+            let stmt = self.prepare(sql).await?;
+            return self.bind_execute(&stmt, params).await;
+        };
+        match self.bind_execute(&stmt, params).await {
+            Err(e) if is_stale_statement(&e) => {
+                if e.code().map(SqlState::code) == Some("26000") {
+                    self.cache().forget_all();
+                } else {
+                    self.cache().forget(sql);
+                }
+                if !(self.at_ready && self.status == b'I') {
+                    return Err(e);
+                }
+                let stmt = self.prepare(sql).await?;
+                self.bind_execute(&stmt, params).await
+            }
+            r => r,
+        }
+    }
+
+    /// Prepare `sql` under a new name (the parameter and column types: one round trip, which also
+    /// closes the statements the cache dropped) and cache it.
+    async fn prepare(&mut self, sql: &str) -> Result<Arc<Statement>, Error> {
+        let name = {
+            let mut c = self.cache();
+            c.next += 1;
+            format!("s{}", c.next)
+        };
+        let mut tail = BytesMut::new();
+        frontend::parse(&name, sql, std::iter::empty(), &mut tail).map_err(parse_err)?;
+        frontend::describe(b'S', &name, &mut tail).map_err(parse_err)?;
+        frontend::sync(&mut tail);
         let mut out = BytesMut::new();
-        frontend::parse("", sql, std::iter::empty(), &mut out).map_err(parse_err)?;
-        frontend::describe(b'S', "", &mut out).map_err(parse_err)?;
-        frontend::sync(&mut out);
+        for old in std::mem::take(&mut self.cache().closing) {
+            frontend::close(b'S', &old, &mut out).map_err(parse_err)?;
+        }
+        out.extend_from_slice(&tail);
         self.send(&out).await?;
         let mut types: Vec<Type> = Vec::new();
         let mut columns: Vec<Column> = Vec::new();
         loop {
             match self.read().await? {
-                Message::ParseComplete | Message::NoData => {}
+                Message::CloseComplete | Message::ParseComplete | Message::NoData => {}
                 Message::ParameterDescription(p) => {
                     let mut it = p.parameters();
                     while let Some(oid) = it.next().map_err(parse_err)? {
@@ -1122,16 +1244,31 @@ impl Client {
                 _ => return Err(parse_err("unexpected message")),
             }
         }
+        let stmt = Arc::new(Statement {
+            name,
+            types,
+            columns: columns.into(),
+        });
+        self.cache().insert(sql, stmt.clone());
+        Ok(stmt)
+    }
+
+    /// Run the prepared `stmt` with `params` (one round trip): its rows and the rows it affected.
+    async fn bind_execute(
+        &mut self,
+        stmt: &Statement,
+        params: &[Param<'_>],
+    ) -> Result<(Vec<Row>, u64), Error> {
+        let types = &stmt.types;
         if types.len() != params.len() {
             return Err(Error::new(Kind_::Parameters(types.len(), params.len())));
         }
-        // Round trip 2: bind, execute.
         let mut out = BytesMut::new();
         let mut failed: Option<(usize, String)> = None;
         let mut index = 0;
         let bound = frontend::bind(
             "",
-            "",
+            &stmt.name,
             std::iter::repeat_n(1_i16, params.len()),
             params.iter().zip(types.iter()),
             |(p, ty), buf| {
@@ -1163,7 +1300,7 @@ impl Client {
         frontend::execute("", 0, &mut out).map_err(parse_err)?;
         frontend::sync(&mut out);
         self.send(&out).await?;
-        let columns: Arc<[Column]> = columns.into();
+        let columns = &stmt.columns;
         let mut rows = Vec::new();
         let mut affected = 0;
         let mut failed = None;
@@ -1392,298 +1529,5 @@ impl Transaction<'_> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{begin_sql, Config, IsolationLevel, SslMode};
-
-    #[test]
-    fn a_url_parses_into_its_parts() {
-        let c = Config::parse(
-            "postgres://u%40x:p%3Ass@db.internal:6543/busbar?sslmode=require&application_name=bb",
-        )
-        .unwrap();
-        assert_eq!(c.user, "u@x");
-        assert_eq!(c.password.as_deref(), Some("p:ss"));
-        assert_eq!(c.targets()[0].1, "db.internal:6543");
-        assert_eq!(c.dbname.as_deref(), Some("busbar"));
-        assert_eq!(c.ssl, SslMode::Require);
-        assert_eq!(c.application_name.as_deref(), Some("bb"));
-        let c = Config::parse("postgresql://u@[::1]/d").unwrap();
-        assert_eq!(c.targets()[0].1, "[::1]:5432");
-        assert_eq!(c.password, None);
-    }
-
-    #[test]
-    fn the_keyword_form_parses_with_spaces_and_quotes() {
-        let c =
-            Config::parse("host = db port=5433 user=u password='se cret' dbname=x sslmode=require")
-                .unwrap();
-        assert_eq!(c.targets()[0].1, "db:5433");
-        assert_eq!(c.password.as_deref(), Some("se cret"));
-        assert_eq!(c.ssl, SslMode::Require);
-    }
-
-    #[test]
-    fn what_the_host_cannot_dial_is_refused() {
-        assert!(Config::parse("host=/var/run/postgresql user=u").is_err());
-        assert!(Config::parse("host=db").is_err(), "no user");
-        assert!(Config::parse("host=db user=u bogus=1").is_err());
-        assert!(Config::parse("host=db user=u sslmode=sometimes").is_err());
-        assert!(Config::parse("host=a,b port=1,2,3 user=u").is_err());
-    }
-
-    /// libpq's MULTI-HOST list (busbar oracle store.boot|postgres|multi-host): every endpoint, in
-    /// order, each with its own port or the one shared; a connect the first refuses tries the next.
-    /// RED before: "multiple hosts are not supported".
-    #[test]
-    fn a_multi_host_list_names_every_endpoint_in_order() {
-        let c = Config::parse("postgres://u:p@127.0.0.1:1,db:5433,[::1]/d").unwrap();
-        let t: Vec<String> = c.targets().into_iter().map(|(_, t)| t).collect();
-        assert_eq!(t, ["127.0.0.1:1", "db:5433", "[::1]:5432"]);
-        let c = Config::parse("host=a,b port=6000 user=u").unwrap();
-        let t: Vec<String> = c.targets().into_iter().map(|(_, t)| t).collect();
-        assert_eq!(t, ["a:6000", "b:6000"]);
-        let c = Config::parse("host=a,b port=1,2 user=u").unwrap();
-        assert_eq!(c.targets()[1], ("b", "b:2".to_string()));
-    }
-
-    /// D11 (RED before: `host` and `hostaddr` shared one slot, the last won): `hostaddr` is the
-    /// address that is dialled and `host` the name the TLS check and the errors use (libpq, and the
-    /// 1.5.5 driver), paired by position; a hostaddr that is no IP, or a list of another length, is
-    /// refused.
-    #[test]
-    fn hostaddr_is_dialled_and_host_is_the_name() {
-        let c = Config::parse("host=db.internal hostaddr=10.1.2.3 port=6000 user=u").unwrap();
-        assert_eq!(c.targets(), [("db.internal", "10.1.2.3:6000".to_string())]);
-        let c = Config::parse("host=a,b hostaddr=10.0.0.1,::1 user=u").unwrap();
-        assert_eq!(
-            c.targets(),
-            [
-                ("a", "10.0.0.1:5432".to_string()),
-                ("b", "[::1]:5432".to_string())
-            ]
-        );
-        let c = Config::parse("hostaddr=10.1.2.3 user=u").unwrap();
-        assert_eq!(c.targets(), [("10.1.2.3", "10.1.2.3:5432".to_string())]);
-        let e = Config::parse("host=db hostaddr=not-an-ip user=u").unwrap_err();
-        assert!(e.to_string().contains("hostaddr"), "{e}");
-        assert!(Config::parse("host=a,b hostaddr=10.0.0.1 user=u").is_err());
-        // The port list matches the longer of the two lists.
-        let c = Config::parse("hostaddr=10.0.0.1,10.0.0.2 port=1,2 user=u").unwrap();
-        assert_eq!(c.targets()[1].1, "10.0.0.2:2");
-    }
-
-    /// D10 (RED before: any value was accepted and ignored): `target_session_attrs` is `any`,
-    /// `read-write` or `read-only` (the 1.5.5 driver's set); anything else is refused naming them.
-    #[test]
-    fn target_session_attrs_takes_the_drivers_values_only() {
-        for ok in ["any", "read-write", "read-only"] {
-            Config::parse(&format!("host=db user=u target_session_attrs={ok}")).unwrap();
-        }
-        let e = Config::parse("host=db user=u target_session_attrs=primary").unwrap_err();
-        assert!(e.to_string().contains("target_session_attrs"), "{e}");
-        assert!(
-            e.to_string().contains("read-write"),
-            "names the accepted values: {e}"
-        );
-    }
-
-    /// D9 (RED before: both were accepted and silently ignored): this client has no SCRAM-PLUS, so
-    /// `channel_binding=require` could not be honoured, and the connection is verified against
-    /// busbar's trust anchors, so a per-store `sslrootcert` could not be. 1.5.5 refused both.
-    #[test]
-    fn what_this_client_cannot_honour_is_refused_not_ignored() {
-        let e = Config::parse("host=db user=u channel_binding=require").unwrap_err();
-        assert!(e.to_string().contains("channel_binding"), "{e}");
-        Config::parse("host=db user=u channel_binding=prefer").unwrap();
-        Config::parse("host=db user=u channel_binding=disable").unwrap();
-        assert!(Config::parse("host=db user=u channel_binding=sometimes").is_err());
-        let e = Config::parse("host=db user=u sslrootcert=/etc/ca.pem").unwrap_err();
-        assert!(e.to_string().contains("sslrootcert"), "{e}");
-        let e =
-            Config::parse("postgres://u@db/d?sslmode=verify-full&sslrootcert=/ca.pem").unwrap_err();
-        assert!(e.to_string().contains("sslrootcert"), "{e}");
-    }
-
-    /// A downgrade nobody asked for is refused: `prefer` and `allow` would fall back to plaintext
-    /// silently, so they are errors that say what to use; `disable` is plaintext on request, and
-    /// an ABSENT `sslmode` is plaintext too (documented in the README), not a refused request.
-    /// The message never echoes the password.
-    #[test]
-    fn sslmode_prefer_and_allow_are_refused_not_downgraded() {
-        for mode in ["prefer", "allow"] {
-            for dsn in [
-                format!("host=db user=u password=zq9pw sslmode={mode}"),
-                format!("postgres://u:zq9pw@db/d?sslmode={mode}"),
-            ] {
-                let e = Config::parse(&dsn).unwrap_err().to_string();
-                assert!(
-                    e.contains(&format!("sslmode={mode} is not supported"))
-                        && e.contains("never falls back silently")
-                        && e.contains("verify-full")
-                        && !e.contains("zq9pw"),
-                    "{dsn}: {e}"
-                );
-            }
-        }
-        assert_eq!(
-            Config::parse("host=db user=u sslmode=disable").unwrap().ssl,
-            SslMode::Plain
-        );
-        assert_eq!(Config::parse("host=db user=u").unwrap().ssl, SslMode::Plain);
-        for mode in ["require", "verify-ca", "verify-full"] {
-            let c = Config::parse(&format!("host=db user=u sslmode={mode}")).unwrap();
-            assert_eq!(c.ssl, SslMode::Require, "{mode}");
-        }
-    }
-
-    /// Connect options this store neither applies nor can apply (the host's connector owns the
-    /// sockets) are refused with an explanation, not accepted and ignored; the message never
-    /// echoes the password.
-    #[test]
-    fn connect_options_the_store_cannot_apply_are_refused_not_ignored() {
-        for opt in [
-            "keepalives=1",
-            "keepalives_idle=30",
-            "keepalives_interval=10",
-            "keepalives_count=3",
-            "keepalives_retries=3",
-            "load_balance_hosts=random",
-            "tcp_user_timeout=5000",
-            "sslnegotiation=direct",
-        ] {
-            let name = opt.split('=').next().unwrap();
-            for dsn in [
-                format!("host=db user=u password=zq9pw {opt}"),
-                format!("postgres://u:zq9pw@db/d?{opt}"),
-            ] {
-                let e = Config::parse(&dsn).unwrap_err().to_string();
-                assert!(
-                    e.contains(&format!("{name} is not supported by this store"))
-                        && !e.contains("zq9pw"),
-                    "{dsn}: {e}"
-                );
-            }
-        }
-    }
-
-    /// D37 (RED before: accepted and ignored): `connect_timeout` is whole seconds as the driver
-    /// reads it, a number that is not one is refused.
-    #[test]
-    fn connect_timeout_is_whole_seconds() {
-        for ok in ["5", "0", "-1"] {
-            Config::parse(&format!("host=db user=u connect_timeout={ok}")).unwrap();
-        }
-        let e = Config::parse("host=db user=u connect_timeout=soon").unwrap_err();
-        assert!(e.to_string().contains("connect_timeout"), "{e}");
-        assert!(Config::parse("postgres://u@db/d?connect_timeout=2.5").is_err());
-        // Zero or less is no bound (libpq's reading); more than zero is whole seconds.
-        let ms = |v: &str| {
-            Config::parse(&format!("host=db user=u connect_timeout={v}"))
-                .unwrap()
-                .connect_timeout_ms
-        };
-        assert_eq!((ms("5"), ms("0"), ms("-1")), (Some(5000), None, None));
-        let e = Config::parse("host=db user=u connect_timeout=soon").unwrap_err();
-        assert!(e.to_string().contains("whole number of seconds"), "{e}");
-    }
-
-    /// D26 (RED before: the unparsed fragment was echoed): a configuration error never repeats a
-    /// token of the string that is not a well-formed `key=`, because a password with a space, a `?`
-    /// or a missing `user:` prefix splits there and its tail would be echoed; an unknown option's
-    /// key is named only when the string carries no password.
-    #[test]
-    fn a_config_error_never_echoes_a_password_tail() {
-        for dsn in [
-            "host=db user=u password=pa zq9tail",
-            "postgres://u:pa?zq9tail@h/db",
-            "u:zq9tail@h/db",
-            "host=db user=u password='pa zq9tail' zq9tail",
-        ] {
-            let e = Config::parse(dsn).unwrap_err().to_string();
-            assert!(
-                !e.contains("zq9tail"),
-                "{dsn}: the error echoed a fragment: {e}"
-            );
-        }
-        // The key of an unknown option is the operator's, when no password rides along.
-        let e = Config::parse("host=db user=u zq9key=1")
-            .unwrap_err()
-            .to_string();
-        assert!(e.contains("zq9key"), "{e}");
-        let e = Config::parse("host=db user=u password=s3 zq9key=1")
-            .unwrap_err()
-            .to_string();
-        assert!(!e.contains("zq9key") && e.contains("unknown option"), "{e}");
-        let e = Config::parse("postgres://u:s3@db/d?zq9key=1")
-            .unwrap_err()
-            .to_string();
-        assert!(!e.contains("zq9key") && e.contains("unknown option"), "{e}");
-    }
-
-    /// B9: the store reaches its server over TCP, so a Unix-socket host is refused in the URL
-    /// forms too (RED by mutation: drop the `starts_with('/')` refusal).
-    #[test]
-    fn a_unix_socket_host_is_refused_in_every_url_form() {
-        let e = Config::parse("postgres://u@%2Fvar%2Frun%2Fpostgresql/d").unwrap_err();
-        assert!(e.to_string().contains("Unix-socket"), "{e}");
-        let e = Config::parse("postgres://u@/d?host=/tmp").unwrap_err();
-        assert!(e.to_string().contains("Unix-socket"), "{e}");
-        let e = Config::parse("postgres://u@db1,%2Ftmp/d").unwrap_err();
-        assert!(e.to_string().contains("Unix-socket"), "{e}");
-    }
-
-    /// 1.5.5 dialled `hostaddr` and used `host` only as a name, so a socket-path host beside a
-    /// hostaddr worked; the Unix-socket refusal is of what is DIALLED (RED before: refused).
-    #[test]
-    fn a_socket_path_host_beside_a_hostaddr_is_dialled_by_address() {
-        let c = Config::parse("host=/tmp hostaddr=127.0.0.1 user=u").unwrap();
-        assert_eq!(c.targets(), [("127.0.0.1", "127.0.0.1:5432".to_string())]);
-        let c = Config::parse("postgres://u@%2Ftmp/d?hostaddr=127.0.0.1").unwrap();
-        assert_eq!(c.targets(), [("127.0.0.1", "127.0.0.1:5432".to_string())]);
-        assert!(Config::parse("host=/tmp user=u").is_err());
-    }
-
-    /// D28 (RED before: `ranges[i]` indexed out of bounds, a panic): a DataRow with fewer fields
-    /// than the RowDescription named columns is an error on the missing column, not a panic.
-    #[test]
-    fn a_data_row_short_of_its_columns_is_an_error_not_a_panic() {
-        use bytes::BytesMut;
-        use fallible_iterator::FallibleIterator;
-        use postgres_protocol::message::backend::Message;
-        use postgres_types::Type;
-        use std::sync::Arc;
-
-        // A DataRow of ONE field ("ab") against a RowDescription of two columns.
-        let mut raw = BytesMut::from(&b"D\0\0\0\x0c\0\x01\0\0\0\x02ab"[..]);
-        let Some(Message::DataRow(body)) = Message::parse(&mut raw).unwrap() else {
-            panic!("a data row");
-        };
-        let column = |name: &str| super::Column {
-            name: name.to_string(),
-            type_: Type::TEXT,
-        };
-        let columns: Arc<[super::Column]> = vec![column("a"), column("b")].into();
-        let mut ranges = Vec::new();
-        let mut it = body.ranges();
-        while let Some(r) = it.next().unwrap() {
-            ranges.push(r);
-        }
-        let row = super::Row {
-            columns,
-            body,
-            ranges,
-        };
-        assert_eq!(row.try_get::<_, &str>(0).unwrap(), "ab");
-        let e = row.try_get::<_, &str>(1).unwrap_err();
-        assert!(e.to_string().contains("column 1"), "{e}");
-    }
-
-    #[test]
-    fn a_snapshot_transaction_begins_repeatable_read() {
-        assert_eq!(
-            begin_sql(Some(IsolationLevel::RepeatableRead)),
-            "BEGIN ISOLATION LEVEL REPEATABLE READ"
-        );
-        assert_eq!(begin_sql(None), "BEGIN");
-    }
-}
+#[path = "tests/pgwire.rs"]
+mod tests;
