@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use busbar_contract::records::RecordStore;
-use busbar_plugin_loader::tcp_conns::{SecureDial, SecuredSock, TcpConns};
+use busbar_test_kit::tcp_conns::{SecureDial, SecuredSock, TcpConns};
 
 use super::harness::open_loaded_over;
 use super::live_url;

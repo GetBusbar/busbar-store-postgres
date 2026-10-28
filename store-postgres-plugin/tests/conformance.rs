@@ -40,7 +40,7 @@ mod common;
 #[path = "support/conformance_host.rs"]
 mod conformance_host;
 
-busbar_plugin_loader::conformance_suite! {
+busbar_test_kit::conformance_suite! {
     door: busbar_store_postgres::door,
     cdylib: "busbar_store_postgres_plugin",
     inputs: include_str!("conformance.json"),
