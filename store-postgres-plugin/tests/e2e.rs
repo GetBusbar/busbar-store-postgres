@@ -839,7 +839,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // Retention crosses the ABI too, COUNT AND ALL.
     assert_eq!(
         store
-            .purge_plane_records_before("task", BASE_TS + 100)
+            .purge_plane_records("task", BASE_TS + 100, busbar_contract::records::Retention::TerminalOnly)
             .expect("purge_plane_records_before"),
         1,
         "only the TERMINAL row older than the cutoff goes; an active task is never swept no matter \
