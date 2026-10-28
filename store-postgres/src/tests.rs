@@ -12,7 +12,31 @@ use busbar_contract::records::{
 };
 
 mod harness;
+
 pub(crate) use harness::TestStore;
+
+/// The verify path's read, which is no longer a store op: a credential's secret by `(kind,
+/// public_id)`, read back through the revision delta (which carries every row, revoked or not).
+trait Lookup {
+    fn lookup_credential_secret(
+        &self,
+        kind: &str,
+        public_id: &str,
+    ) -> RecordStoreResult<Option<CredentialSecret>>;
+}
+
+impl Lookup for TestStore {
+    fn lookup_credential_secret(
+        &self,
+        kind: &str,
+        public_id: &str,
+    ) -> RecordStoreResult<Option<CredentialSecret>> {
+        Ok(self
+            .list_credentials_since(0)?
+            .into_iter()
+            .find(|c| c.meta.kind == kind && c.meta.public_id == public_id))
+    }
+}
 
 /// One model's ledger row from the four RESERVED token classes (zero classes left out, the way the
 /// store reads them back).
@@ -206,19 +230,6 @@ fn hard_reset(store: &TestStore, id: &str) {
     let _ = client.execute("DELETE FROM usage_ledger WHERE bucket_id=$1", &[&id]);
     let _ = client.execute("DELETE FROM usage_ledger_units WHERE bucket_id=$1", &[&id]);
     let _ = client.execute("DELETE FROM usage_metering_units WHERE key_id=$1", &[&id]);
-}
-
-/// Serialises the tests that write to the SHARED `audit_log` table.
-///
-/// `append_audit_never_reports_success_for_a_record_it_did_not_store` arms a STATEMENT-level trigger
-/// on that table, which by construction fires on everyone's inserts. It cannot be narrowed without
-/// making that test vacuous (see its own comment), so instead nothing else writes audit rows while
-/// it is armed. Held only by the handful of tests that touch `audit_log`, so the rest of the suite
-/// stays parallel -- the same shape as store-mysql's `USAGE_WINDOWS_LOCK`.
-static AUDIT_TRIGGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn lock_audit_table() -> std::sync::MutexGuard<'static, ()> {
-    AUDIT_TRIGGER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn sample_key(id: &str) -> VirtualKey {
@@ -443,33 +454,6 @@ fn put_key_with_credential_refuses_to_remint_over_a_tombstone() {
         store.list_credentials(id).unwrap().is_empty(),
         "a refused re-mint must not write the paired credential"
     );
-}
-
-/// scrub_key: PII-erasure only, requires the key to already be tombstoned.
-#[test]
-fn scrub_key_requires_tombstone_first() {
-    let Some(url) = live_url() else { return };
-    let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_scrub1";
-    hard_reset(&store, id);
-
-    let mut key = sample_key(id);
-    key.name = "Real Name".into();
-    key.labels.insert("team".into(), "growth".into());
-    store.put_key(&key).unwrap();
-
-    // Scrubbing a LIVE key must fail.
-    assert!(
-        store.scrub_key(id).is_err(),
-        "scrubbing a live key must be rejected"
-    );
-
-    store.delete_key(id).unwrap();
-    store.scrub_key(id).unwrap();
-    let scrubbed = store.get_key(id).unwrap().unwrap();
-    assert_eq!(scrubbed.name, "");
-    assert!(scrubbed.labels.is_empty());
-    assert!(!scrubbed.is_live(), "scrub must not resurrect the key");
 }
 
 /// Credential minting is slot-safe: minting into a slot holding a LIVE credential must fail, not
@@ -760,18 +744,26 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
     let Some(url) = live_url() else { return };
     let store_a = connect_store_with_retry(&url).expect("connect a");
     let store_b = connect_store_with_retry(&url).expect("connect b");
+    // Connected BEFORE the race starts: connecting inside the racing thread costs milliseconds the
+    // other delete does not pay, so the two deletes ran one after the other and the race this test
+    // names never happened.
+    let store_c = connect_store_with_retry(&url).expect("connect c");
     let id = "vk_concurrent_del1";
     hard_reset(&store_a, id);
     store_a.put_key(&sample_key(id)).unwrap();
     let cred = sample_cred(id, 0, "AKIA_CONCURRENT1");
     store_a.put_credential(&cred).unwrap();
 
-    let url_b = url.clone();
-    let id_b = id.to_string();
-    let handle = std::thread::spawn(move || {
-        let store_b2 = connect_store_with_retry(&url_b).expect("connect b2");
-        store_b2.delete_key(&id_b)
-    });
+    let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handle = {
+        let start = start.clone();
+        let id_c = id.to_string();
+        std::thread::spawn(move || {
+            start.wait();
+            store_c.delete_key(&id_c)
+        })
+    };
+    start.wait();
     let r1 = store_b.delete_key(id);
     let r2 = handle.join().unwrap();
     assert!(
@@ -782,37 +774,6 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
     let after = store_a.get_key(id).unwrap().unwrap();
     assert!(!after.is_live());
     assert!(store_a.list_credentials(id).unwrap().is_empty());
-}
-
-/// get_usage's REPEATABLE READ helper must actually open that isolation level.
-#[test]
-fn get_usage_transaction_is_actually_repeatable_read() {
-    let Some(url) = live_url() else { return };
-    let store = connect_store_with_retry(&url).expect("connect");
-    // The store's connections are its ops' own (one per op, over the host's connector), so the
-    // isolation check runs the helper's exact statement (`pgwire::begin_sql`, the
-    // `IsolationLevel::RepeatableRead` arm `snapshot_consistent_tx` uses) on an independent driver
-    // connection and asks the server what it opened.
-    let level: String = {
-        let mut client = store.lock();
-        client
-            .batch_execute(crate::pgwire::begin_sql(Some(
-                crate::pgwire::IsolationLevel::RepeatableRead,
-            )))
-            .unwrap();
-        let level: String = client
-            .query_one("SHOW transaction_isolation", &[])
-            .unwrap()
-            .get(0);
-        client.batch_execute("COMMIT").unwrap();
-        level
-    };
-    assert_eq!(
-        level, "repeatable read",
-        "get_usage's helper must actually open REPEATABLE READ"
-    );
-    let got = store.get_usage("nonexistent_bucket", 0);
-    assert!(got.is_ok(), "get_usage must still be callable: {got:?}");
 }
 
 /// THE actual torn-read proof the previous test's docstring used to promise but never ran: a
@@ -1139,69 +1100,6 @@ fn put_usage_and_add_usage_batch_multiple_models_correctly() {
     assert_eq!(models2[1].tier(UNIT_OUTPUT), 11);
 }
 
-/// `append_audit`'s append-only contract: a seq collision must be rejected, never silently
-/// overwritten (the trait's own doc: "a store never rewrites or recomputes the digest"). Previously
-/// entirely untested -- `append_audit`/`AuditRecord` didn't appear anywhere in this file.
-#[test]
-fn append_audit_is_append_only_and_rejects_a_seq_collision() {
-    let _audit_guard = lock_audit_table();
-    let Some(url) = live_url() else { return };
-    let store = connect_store_with_retry(&url).expect("connect");
-    // Derived, not hardcoded: this writes into the SHARED, table-global `audit_log`, and a fixed
-    // seq means two concurrently running test binaries against the same database make each other's
-    // first insert the collision they are trying to detect.
-    let seq = 900_000_000u64 + (std::process::id() as u64 % 1_000_000);
-    let _ = store
-        .lock()
-        .execute("DELETE FROM audit_log WHERE seq=$1", &[&clamp(seq)]);
-
-    let entry = AuditRecord {
-        seq,
-        ts: 1_700_000_000,
-        action: "hook.register".into(),
-        resource: "hook:compress".into(),
-        outcome: "applied".into(),
-        principal: "vk_audit_test".into(),
-        prev_hash: String::new(),
-        hash: "hash-1".into(),
-    };
-    store.append_audit(&entry).unwrap();
-
-    let mut colliding = entry.clone();
-    colliding.hash = "hash-2-different".into();
-    colliding.outcome = "rejected".into();
-    let err = store
-        .append_audit(&colliding)
-        .expect_err("a seq collision must be rejected, never silently accepted as an overwrite");
-    assert!(
-        err.0.contains(&seq.to_string()),
-        "the collision error should name the colliding seq: {}",
-        err.0
-    );
-
-    // The original entry must survive UNCHANGED -- proof this was truly rejected, not partially
-    // applied. Queried directly by seq (never list_audit_tail), so this can't race a concurrent
-    // test's own unrelated audit_log rows.
-    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-    let row = client
-        .query_one(
-            "SELECT hash, outcome FROM audit_log WHERE seq=$1",
-            &[&clamp(seq)],
-        )
-        .unwrap();
-    let hash: String = row.get(0);
-    let outcome: String = row.get(1);
-    assert_eq!(
-        hash, "hash-1",
-        "the original entry's hash must not have been overwritten"
-    );
-    assert_eq!(outcome, "applied");
-
-    let _ = store
-        .lock()
-        .execute("DELETE FROM audit_log WHERE seq=$1", &[&clamp(seq)]);
-}
-
 /// The denylist pair, previously untested in either direction. `add_denylist` is an UPSERT whose
 /// `DO UPDATE SET reason` half is the part that can silently rot: downgrading it to `DO NOTHING`
 /// keeps every "is this subject denied" check passing while quietly pinning the reason to whatever
@@ -1216,8 +1114,19 @@ fn denylist_add_is_listed_and_a_repeat_add_updates_the_reason() {
         .lock()
         .execute("DELETE FROM denylist WHERE sub=$1", &[&sub]);
 
-    let before = now_secs();
+    // Bracketed with SystemTime DIRECTLY, never the crate's own `now_secs()` (see
+    // `delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision`): with the function
+    // under test as its own oracle, a `now_secs()` stubbed to a constant satisfies the lower bound
+    // trivially.
+    let wall = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let before = wall();
     store.add_denylist(&sub, "first reason").unwrap();
+    let after = wall();
     assert!(
         store.list_denylist().unwrap().contains(&sub),
         "an added subject must appear in list_denylist"
@@ -1234,9 +1143,9 @@ fn denylist_add_is_listed_and_a_repeat_add_updates_the_reason() {
         .unwrap()
         .get(0);
     assert!(
-        read_u64(created_at) >= before,
-        "denylist.created_at must be the wall-clock second the subject was denied (expected at \
-         least {before}), got {created_at}"
+        (before..=after).contains(&read_u64(created_at)),
+        "denylist.created_at must be the wall-clock second the subject was denied (expected \
+         {before}..={after}), got {created_at}"
     );
 
     store.add_denylist(&sub, "corrected reason").unwrap();
@@ -1283,18 +1192,22 @@ fn list_audit_tail_returns_the_newest_entries_oldest_first() {
     let tmp = TempDb::create(&url, "spg_audittail");
     let store = connect_store_with_retry(&tmp.url()).expect("connect");
 
-    for seq in 1..=4u64 {
+    // No store op appends a 1.5.5 audit row any more (1.6.0 writes its audit as plane records), so
+    // the rows a 1.5.5 node left are seeded as it left them.
+    for seq in 1..=4i64 {
         store
-            .append_audit(&AuditRecord {
-                seq,
-                ts: 1_700_000_000 + seq,
-                action: "key.mint".into(),
-                resource: format!("key:{seq}"),
-                outcome: "applied".into(),
-                principal: "vk_tail_test".into(),
-                prev_hash: format!("h{}", seq - 1),
-                hash: format!("h{seq}"),
-            })
+            .lock()
+            .execute(
+                "INSERT INTO audit_log (seq, ts, action, resource, outcome, principal, prev_hash, hash)
+                 VALUES ($1, $2, 'key.mint', $3, 'applied', 'vk_tail_test', $4, $5)",
+                &[
+                    &seq,
+                    &(1_700_000_000 + seq),
+                    &format!("key:{seq}"),
+                    &format!("h{}", seq - 1),
+                    &format!("h{seq}"),
+                ],
+            )
             .unwrap();
     }
 
@@ -1330,155 +1243,6 @@ fn list_audit_tail_returns_the_newest_entries_oldest_first() {
     );
     assert_eq!(full[0].hash, "h1", "the records themselves must round-trip");
     assert_eq!(full[3].prev_hash, "h3");
-}
-
-/// The two purge methods, previously untested, and they do NOT mean the same thing despite the
-/// symmetry of their names.
-///
-/// `purge_windows_before` is strictly-older: it must delete rows below the boundary and leave the
-/// boundary row itself alone, and it must take each window's per-model ledger rows with it, since
-/// ledger rows no window accounts for would grow forever.
-///
-/// `purge_metering_before` is NOT "before" at all despite the name: the trait defines it as "purge
-/// every row IN `bucket`", equality, because the metering table is durable billing evidence and the
-/// doc is explicit that this must never be wired to a sweeper. So this test seeds a SECOND, OLDER
-/// metering bucket that must SURVIVE. Without it, a single bucket makes `=`, `<` and `<=`
-/// indistinguishable, and widening the SQL to `<=` would silently destroy every older billing
-/// bucket on one operator purge with the test still green.
-#[test]
-fn purge_windows_and_metering_delete_only_what_is_older_than_the_boundary() {
-    let Some(url) = live_url() else { return };
-    let store = connect_store_with_retry(&url).expect("connect");
-    let bucket = format!("vk_purge_{}", unique_suffix());
-    let old_ws = 1_000u64;
-    let boundary = 2_000u64;
-
-    let ledger = |model: &str| UsageLedger {
-        requests: 1,
-        billable_requests: 1,
-        models: vec![mt(model, 1, 1, 0, 0)],
-    };
-    store
-        .put_usage(&bucket, old_ws, &ledger("old-model"))
-        .unwrap();
-    store
-        .put_usage(&bucket, boundary, &ledger("boundary-model"))
-        .unwrap();
-
-    let purged = store.purge_windows_before(boundary).unwrap();
-    assert!(
-        purged >= 1,
-        "the strictly-older window must be reported as purged, got {purged}"
-    );
-    assert_eq!(
-        store.get_usage(&bucket, old_ws).unwrap().requests,
-        0,
-        "a window older than the boundary must be gone"
-    );
-    let kept = store.get_usage(&bucket, boundary).unwrap();
-    assert_eq!(
-        kept.requests, 1,
-        "the boundary window itself must survive: the contract is strictly-before, not at-or-before"
-    );
-    assert_eq!(
-        kept.models.len(),
-        1,
-        "the boundary window's ledger rows must survive alongside it"
-    );
-    let orphaned: i64 = store
-        .lock()
-        .query_one(
-            "SELECT COUNT(*) FROM usage_ledger WHERE bucket_id=$1 AND window_start=$2",
-            &[&bucket, &clamp(old_ws)],
-        )
-        .unwrap()
-        .get(0);
-    assert_eq!(
-        orphaned, 0,
-        "purging a window must purge its per-model ledger rows too, or they orphan and grow forever"
-    );
-
-    // usage_metering, whose boundary parameter is a STRING on this trait method while every other
-    // metering method takes it as u64. The parse is the only caller-supplied parse in the crate.
-    let key_id = format!("vk_purge_meter_{}", unique_suffix());
-    let meter = |bucket: u64| busbar_contract::records::MeteringDelta {
-        key_id: key_id.clone(),
-        bucket,
-        model: "m".into(),
-        provider: "p".into(),
-        tokens_input: 1,
-        tokens_output: 1,
-        tokens_cache_read: 0,
-        tokens_cache_write: 0,
-        requests: 1,
-        billable_requests: 1,
-        key_group_at_use: String::new(),
-        pricing_version: String::new(),
-        priced_from_ms: 0,
-        usage_units: Default::default(),
-    };
-    let meter_bucket = 20_270_601u64;
-    let older_bucket = meter_bucket - 1;
-    store.add_metering(&meter(meter_bucket)).unwrap();
-    store.add_metering(&meter(older_bucket)).unwrap();
-    for b in [meter_bucket, older_bucket] {
-        assert!(
-            store
-                .list_metering(b)
-                .unwrap()
-                .iter()
-                .any(|r| r.key_id == key_id),
-            "precondition: both metering rows must exist before the purge"
-        );
-    }
-
-    let bad = store.purge_metering_before("not-a-number");
-    assert!(
-        bad.is_err(),
-        "a non-integer bucket must be a loud error, never a silent no-op reported as a purge"
-    );
-    assert!(
-        store
-            .list_metering(meter_bucket)
-            .unwrap()
-            .iter()
-            .any(|r| r.key_id == key_id),
-        "a rejected purge must not have deleted anything"
-    );
-
-    store
-        .purge_metering_before(&meter_bucket.to_string())
-        .unwrap();
-    assert!(
-        !store
-            .list_metering(meter_bucket)
-            .unwrap()
-            .iter()
-            .any(|r| r.key_id == key_id),
-        "the named metering bucket must be purged"
-    );
-    // The discriminating half: an OLDER bucket must survive. Billing evidence is purged only for
-    // the bucket the operator named, so a `<=` or `<` in place of the `=` is a silent mass deletion
-    // that a single-bucket test cannot see.
-    assert!(
-        store
-            .list_metering(older_bucket)
-            .unwrap()
-            .iter()
-            .any(|r| r.key_id == key_id),
-        "purge_metering_before must purge ONLY the named bucket; an older billing bucket must \
-         survive it"
-    );
-    store
-        .purge_metering_before(&older_bucket.to_string())
-        .unwrap();
-
-    let _ = store
-        .lock()
-        .execute("DELETE FROM usage_windows WHERE bucket_id=$1", &[&bucket]);
-    let _ = store
-        .lock()
-        .execute("DELETE FROM usage_ledger WHERE bucket_id=$1", &[&bucket]);
 }
 
 /// `list_keys` is deliberately UNFILTERED: it must include tombstoned rows, because
@@ -1782,6 +1546,36 @@ fn migrate_already_at_current_version_skips_the_legacy_check() {
     drop(check);
 }
 
+/// A database stamped ABOVE this build is refused at open, with the reason: an older binary would
+/// ignore newer rules (the epoch fence among them). An equal version still opens.
+#[test]
+fn migrate_refuses_a_database_stamped_newer_than_this_build() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_newer");
+    let iso_url = tmp.url();
+    {
+        let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+        c.batch_execute(&format!(
+            "CREATE TABLE busbar_schema (version BIGINT PRIMARY KEY);
+             INSERT INTO busbar_schema (version) VALUES ({});",
+            SCHEMA_VERSION + 1
+        ))
+        .unwrap();
+    }
+    let err = TestStore::open(&iso_url)
+        .err()
+        .expect("a newer schema is refused");
+    // The loader prefixes the plugin's name; the store's own words are the tail.
+    assert!(
+        err.ends_with(&format!(
+            "postgres store: database schema v{} is newer than this build (v{SCHEMA_VERSION}); \
+             refusing to open",
+            SCHEMA_VERSION + 1
+        )),
+        "{err}"
+    );
+}
+
 /// The v6 one-time backfill: a database sitting at v5 with a `usage_windows` row shaped
 /// `billable_requests=0, requests>0` (indistinguishable, by counter value alone, from a
 /// legitimately fully-refunded window OR a genuine pre-split legacy row) gets `billable_requests`
@@ -1945,10 +1739,66 @@ fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() 
         );
     }
 
+    // The failure must NAME the permission denial. `is_err()` alone is satisfied by ANY later,
+    // unrelated failure: a migrate that swallowed the 42501 and then tripped over something else
+    // (or a connect that failed for a reason that has nothing to do with this role's grants) would
+    // pass while the denial this test exists to propagate was lost.
+    let err = match TestStore::open(&limited_url) {
+        Ok(_) => panic!(
+            "migrate must never silently succeed against a role that can't actually read its own \
+             bookkeeping table"
+        ),
+        Err(e) => e,
+    };
     assert!(
-        TestStore::open(&limited_url).is_err(),
-        "migrate must never silently succeed against a role that can't actually read its own \
-         bookkeeping table"
+        err.contains("42501") || err.to_lowercase().contains("permission denied"),
+        "the refusal must carry the insufficient_privilege (42501) denial, got: {err}"
+    );
+}
+
+/// TWO NODES BOOTING AGAINST ONE FRESH DATABASE. Every node runs `migrate()` on connect, and a fleet
+/// restarted together does it at the same instant; `pg_advisory_lock` is what serialises them. Without
+/// it both run `CREATE TABLE IF NOT EXISTS` / the schema DDL concurrently, which is not safe in
+/// Postgres (concurrent creation of the same relation fails on the catalogue's unique index), so one
+/// node's connect would fail on a clean first boot. Both opens must succeed, and the version must be
+/// stamped exactly once.
+#[test]
+fn two_nodes_opening_a_fresh_database_together_both_migrate_cleanly() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_race");
+    let iso_url = tmp.url();
+
+    let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let nodes: Vec<_> = (0..2)
+        .map(|_| {
+            let (start, iso_url) = (start.clone(), iso_url.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                TestStore::open(&iso_url)
+            })
+        })
+        .collect();
+    let opened: Vec<_> = nodes.into_iter().map(|n| n.join().unwrap()).collect();
+    for (i, r) in opened.iter().enumerate() {
+        assert!(
+            r.is_ok(),
+            "node {i} failed to open a fresh database while another migrated it: {:?}",
+            r.as_ref().err()
+        );
+    }
+
+    let store = opened.into_iter().next().unwrap().unwrap();
+    let stamped: i64 = store
+        .lock()
+        .query_one(
+            "SELECT COUNT(*) FROM busbar_schema WHERE version=$1",
+            &[&SCHEMA_VERSION],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        stamped, 1,
+        "the schema version must be stamped exactly once"
     );
 }
 
@@ -1963,8 +1813,7 @@ mod store_conformance;
 /// offers: the key/credential/audit rulings the fleet used to settle differently per backend, and
 /// the 1.6.0 plane-record battery.
 ///
-/// Every fixture is namespaced by process id and the rows are hard-reset first, for the same reason
-/// `append_audit_is_append_only_and_rejects_a_seq_collision` derives its own seq: this suite runs
+/// Every fixture is namespaced by process id and the rows are hard-reset first: this suite runs
 /// against a SHARED live database that is not reset between tests, and CI can have more than one
 /// test binary pointed at it, so a fixed id would make two concurrent runs each other's failure.
 mod conformance {
@@ -2059,18 +1908,6 @@ mod conformance {
     }
 
     #[test]
-    fn append_audit_duplicate_seq_is_ok_when_identical_and_an_error_when_different() {
-        // Same derivation as the hand-written collision test above, offset so the two cannot pick
-        // the same seq within one process.
-        let seq = 910_000_000u64 + (std::process::id() as u64 % 1_000_000);
-        let Some((store, _ns)) = setup("aud", seq) else {
-            return;
-        };
-        let _audit_guard = super::lock_audit_table();
-        conf::assert_append_audit_duplicate_seq(&*store, seq);
-    }
-
-    #[test]
     fn plane_task_upsert_get_list() {
         let Some((store, ns)) = setup("ptask", 0) else {
             return;
@@ -2129,98 +1966,6 @@ mod conformance {
         };
         conf::assert_plane_token_is_single_use(&*store, &ns);
     }
-}
-
-/// `append_audit` must never report success for a record it did not store.
-///
-/// The duplicate-seq comparison added earlier read the stored row on a SEPARATE autocommit
-/// connection after the INSERT. If the conflicting row was deleted in between (an out-of-band
-/// retention job, operator SQL), the read found nothing, and the obvious-looking answer -- "no row,
-/// so no fork, so Ok" -- reported success while the seq held nothing and the incoming record had
-/// never been written. That is the same silent-loss shape the comparison exists to prevent, just
-/// inverted, and an audit entry is the last thing that should vanish quietly.
-///
-/// Simulated the way the audit that found it did: a statement-level AFTER INSERT trigger that
-/// deletes the conflicting row, so the read-back always loses the row. The append must then either
-/// succeed with the record actually present, or fail -- never Ok with nothing stored.
-#[test]
-fn append_audit_never_reports_success_for_a_record_it_did_not_store() {
-    let _audit_guard = lock_audit_table();
-    let Some(url) = live_url() else { return };
-    let store = connect_store_with_retry(&url).expect("connect");
-    let seq = 920_000_000u64 + (std::process::id() as u64 % 1_000_000);
-
-    let entry = AuditRecord {
-        seq,
-        ts: 1_700_000_000,
-        action: "hook.register".into(),
-        resource: "hook:vanish".into(),
-        outcome: "applied".into(),
-        principal: "admin".into(),
-        prev_hash: String::new(),
-        hash: "h-vanish".into(),
-    };
-
-    // Seed the row that will collide, then arm a trigger that deletes whatever occupies this seq
-    // after any insert -- reproducing "the conflicting row disappeared underneath the read-back".
-    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-    client
-        .execute("DELETE FROM audit_log WHERE seq=$1", &[&clamp(seq)])
-        .unwrap();
-    store.append_audit(&entry).expect("seed the colliding row");
-    let fn_name = format!("busbar_vanish_{}", std::process::id());
-    let trg_name = format!("busbar_vanish_trg_{}", std::process::id());
-    // FOR EACH STATEMENT, and that is load-bearing rather than incidental.
-    //
-    // The scenario under test is "the conflicting row vanished underneath the read-back", which is
-    // reached through `INSERT ... ON CONFLICT (seq) DO NOTHING` against an ALREADY-SEEDED seq. That
-    // insert affects ZERO rows, so a row-level trigger never fires at all. A previous attempt here
-    // scoped this to `FOR EACH ROW WHEN (NEW.seq = ...)` to stop it firing on sibling tests' inserts
-    // -- and made the test VACUOUS: the `None` arm was never entered, and reverting the product fix
-    // to the literal silent-loss bug left the suite green.
-    //
-    // The cross-test interference that motivated that change is real (8 failures in 22 runs), but a
-    // statement-level trigger is inherently global, so the isolation has to come from SERIALISING
-    // instead: `AUDIT_TRIGGER_LOCK` above keeps any other audit-writing test out for the window the
-    // trigger is armed.
-    client
-        .batch_execute(&format!(
-            "CREATE OR REPLACE FUNCTION {fn_name}() RETURNS trigger AS $$
-             BEGIN DELETE FROM audit_log WHERE seq = {seq_lit}; RETURN NULL; END; $$ LANGUAGE plpgsql;
-             CREATE TRIGGER {trg_name} AFTER INSERT ON audit_log
-             FOR EACH STATEMENT EXECUTE FUNCTION {fn_name}();",
-            seq_lit = clamp(seq)
-        ))
-        .unwrap();
-
-    let mut forked = entry.clone();
-    forked.action = "hook.remove".into();
-    forked.hash = "h-forked".into();
-    let result = store.append_audit(&forked);
-
-    // Disarm before asserting, so a failed assertion cannot leave the trigger behind for other
-    // concurrently running tests.
-    client
-        .batch_execute(&format!(
-            "DROP TRIGGER IF EXISTS {trg_name} ON audit_log; DROP FUNCTION IF EXISTS {fn_name}();"
-        ))
-        .unwrap();
-
-    if result.is_ok() {
-        // Ok is only honest if the record is actually there.
-        let present: i64 = client
-            .query_one(
-                "SELECT count(*) FROM audit_log WHERE seq=$1 AND action=$2",
-                &[&clamp(seq), &forked.action],
-            )
-            .unwrap()
-            .get(0);
-        assert_eq!(
-            present, 1,
-            "append_audit returned Ok but the record is not stored -- a silently lost audit entry"
-        );
-    }
-    let _ = client.execute("DELETE FROM audit_log WHERE seq=$1", &[&clamp(seq)]);
 }
 
 // ── THE KIND-TAGGED PLANE RECORDS (busbar 1.6.0) ────────────────────────────────────────────

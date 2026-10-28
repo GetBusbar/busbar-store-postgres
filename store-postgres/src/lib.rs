@@ -284,10 +284,16 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 ///     token ledger, keyed `(kind, token)`).
 ///
 /// v11 (busbar 1.6.0 store v3 table), ADDITIVE: the tables the store v3 slots beyond the 1.5.5 op
-/// set keep (`v3`): `store_ops` (the durable `op_id` dedupe log), `store_journal` (`append_batch`'s
-/// streams), `store_sessions`, `store_records` (`record_put`/`get`/`scan`), and `money_slots` /
-/// `money_slices` (`window_caps`, `reserve`, `slice_release`). Nothing existing changes.
-const SCHEMA_VERSION: i64 = 11;
+/// set keep (`v3`): `store_ops` (the durable `op_id` dedupe log) and `store_records`
+/// (`record_put`/`get`/`scan`). Nothing existing changes.
+///
+/// v13 (money is a view on ledger x rate card), SUBTRACTIVE: the store keeps only ledger counts
+/// (`usage_windows`, `usage_metering` and their unit tables) and the records the kernel puts. The
+/// tables of the deleted slots go: `money_slots`, `money_slices`, `money_epoch` (caps, slices and
+/// the fence epoch v11/v12 kept; neither shipped in a release), `store_journal` (`append_batch`)
+/// and `store_sessions`. The dedupe rows of the deleted slots go with them; a row of a kept slot is
+/// untouched, so a retry across the upgrade still answers its original.
+const SCHEMA_VERSION: i64 = 13;
 
 /// The plane-record kinds whose retention is TERMINAL-ONLY: `purge_plane_records_before` drops a row
 /// of one of these kinds only once its `disposition` sidecar says `Terminal`. An interrupted task
@@ -506,38 +512,12 @@ CREATE TABLE IF NOT EXISTS store_ops (
     recorded_at BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS store_ops_recorded_at_idx ON store_ops (recorded_at);
--- append_batch's streams; a stream's head is its highest seq.
-CREATE TABLE IF NOT EXISTS store_journal (
-    stream TEXT COLLATE \"C\" NOT NULL,
-    seq    BIGINT NOT NULL,
-    record BYTEA NOT NULL,
-    PRIMARY KEY (stream, seq)
-);
-CREATE TABLE IF NOT EXISTS store_sessions (
-    session   BIGINT PRIMARY KEY,
-    node      TEXT NOT NULL,
-    principal TEXT COLLATE \"C\" NOT NULL
-);
-CREATE INDEX IF NOT EXISTS store_sessions_principal_idx ON store_sessions (principal);
 -- A plane's kernel-held durable records, keyed (schema, key); scanned in key (byte) order.
 CREATE TABLE IF NOT EXISTS store_records (
     schema_id TEXT COLLATE \"C\" NOT NULL,
     key       BYTEA NOT NULL,
     value     BYTEA NOT NULL,
     PRIMARY KEY (schema_id, key)
-);
--- One money slot (bucket, pool, dimension, class_key, window_start), keyed by its rendering: the
--- cap window_caps pushed, its config generation, and what outstanding slices have drawn.
-CREATE TABLE IF NOT EXISTS money_slots (
-    slot       TEXT COLLATE \"C\" PRIMARY KEY,
-    cap        BIGINT NOT NULL,
-    config_gen BIGINT NOT NULL,
-    used       BIGINT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS money_slices (
-    slice_id  BIGSERIAL PRIMARY KEY,
-    slot      TEXT COLLATE \"C\" NOT NULL,
-    remaining BIGINT NOT NULL
 );
 ";
 
@@ -576,6 +556,9 @@ pub(crate) struct Shared {
     /// the 1.5.5 store's one mutex-guarded connection (it had no pool setting). An op waits for it
     /// while another holds it, as 1.5.5's ops waited on the mutex.
     pub(crate) pool: std::sync::Arc<busbar_contract::abi::sdk::store::wire::Pool>,
+    /// The endpoint (an index into the DSN's list) that last connected: the next connect tries it
+    /// first, so a failover DSN keeps asking for the kept connection's own endpoint.
+    pub(crate) endpoint: std::sync::atomic::AtomicUsize,
 }
 
 /// ONE OP'S CONNECTION: the 1.5.5 bodies run on it, as they ran on the mutex-guarded client.
@@ -640,6 +623,7 @@ impl PostgresStore {
                 secret,
                 ops_swept_at: AtomicU64::new(0),
                 pool: busbar_contract::abi::sdk::store::wire::Pool::new(KEPT_CONNECTIONS),
+                endpoint: std::sync::atomic::AtomicUsize::new(0),
             }),
         })
     }
@@ -657,7 +641,7 @@ impl Session {
         wire: busbar_contract::abi::sdk::store::wire::Wire,
         shared: std::sync::Arc<Shared>,
     ) -> Result<Self, String> {
-        match Client::connect(wire, &shared.config).await {
+        match Client::connect(wire, &shared.config, &shared.endpoint).await {
             Ok(client) => Ok(Self { client, shared }),
             Err(e) => Err(scrub(render_pg_error(&e), shared.secret.as_deref())),
         }
@@ -666,14 +650,10 @@ impl Session {
     /// The op is done: its connection is kept for the next op if the session is idle, else
     /// discarded ([`Client::release`]).
     pub(crate) async fn close(mut self) {
-        self.client.release();
+        self.client.release().await;
     }
 
     fn lock(&mut self) -> &mut Client {
-        &mut self.client
-    }
-
-    pub(crate) fn lock_client(&mut self) -> &mut Client {
         &mut self.client
     }
 
@@ -745,7 +725,15 @@ impl Session {
         // no-op DDL on a current database deadlocked a live key delete against a node merely
         // connecting (observed: `40P01` on `UPDATE keys ... deleted_at`). A database at (or past)
         // this build's version has every table and index this build creates.
-        if version >= SCHEMA_VERSION {
+        if version > SCHEMA_VERSION {
+            // A newer build owns this database: this one would ignore its newer rules (the epoch
+            // fence among them), so it must not serve it.
+            return Err(RecordStoreError(format!(
+                "postgres store: database schema v{version} is newer than this build \
+                 (v{SCHEMA_VERSION}); refusing to open"
+            )));
+        }
+        if version == SCHEMA_VERSION {
             return Ok(());
         }
         let mut tx = client.transaction().await.store()?;
@@ -812,6 +800,21 @@ impl Session {
                 "ALTER TABLE usage_metering DROP CONSTRAINT IF EXISTS usage_metering_pkey;
                  ALTER TABLE usage_metering ADD CONSTRAINT usage_metering_pkey
                      PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms);",
+            )
+            .await
+            .store()?;
+        }
+        // v13 — see SCHEMA_VERSION. The deleted slots' tables and dedupe rows go in the same
+        // transaction as the version stamp, so a crash part-way re-runs it whole.
+        if version < 13 {
+            tx.batch_execute(
+                "DROP TABLE IF EXISTS money_slices;
+                 DROP TABLE IF EXISTS money_slots;
+                 DROP TABLE IF EXISTS money_epoch;
+                 DROP TABLE IF EXISTS store_journal;
+                 DROP TABLE IF EXISTS store_sessions;
+                 DELETE FROM store_ops WHERE split_part(body, ':', 1) NOT IN
+                     ('append_plane_record', 'add_usage_batch', 'add_metering_batch');",
             )
             .await
             .store()?;
@@ -1112,69 +1115,15 @@ impl Session {
         // TOCTOU window the plain `SELECT` above cannot -- two concurrent delete_key calls on the
         // same id now genuinely serialize (the loser's UPDATE matches 0 rows) instead of both
         // unconditionally overwriting `deleted_at`/`revision` regardless of which committed first.
-        let changed = tx
-            .execute(
-                "UPDATE keys SET enabled=FALSE, deleted_at=$2, revision=$3 \
+        tx.execute(
+            "UPDATE keys SET enabled=FALSE, deleted_at=$2, revision=$3 \
                  WHERE id=$1 AND deleted_at IS NULL",
-                &[&id, &now, &rev],
-            )
-            .await
-            .store()?;
+            &[&id, &now, &rev],
+        )
+        .await
+        .store()?;
         // A concurrent delete_key committed between our SELECT and this UPDATE: idempotent no-op,
         // same as the `Some(true)` branch above -- not an error.
-        if changed == 0 {
-            tx.commit().await.store()?;
-            return Ok(());
-        }
-        tx.commit().await.store()?;
-        Ok(())
-    }
-
-    pub(crate) async fn scrub_key(&mut self, id: &str) -> RecordStoreResult<()> {
-        // PII-erasure only: null name/labels on an ALREADY-tombstoned key. Errors if unknown or
-        // still live -- scrubbing a live key would be silent, un-auditable data loss on an active
-        // principal (the trait doc's own guard: go through delete_key first).
-        let client = self.lock();
-        let mut tx = client.transaction().await.store()?;
-        let deleted: Option<bool> = tx
-            .query_opt(
-                "SELECT deleted_at IS NOT NULL FROM keys WHERE id=$1",
-                &[&id],
-            )
-            .await
-            .store()?
-            .map(|r| r.get(0));
-        match deleted {
-            None => return Err(RecordStoreError(format!("scrub_key: unknown key {id}"))),
-            Some(false) => {
-                return Err(RecordStoreError(format!(
-                    "scrub_key: key {id} is not tombstoned -- call delete_key first"
-                )))
-            }
-            Some(true) => {}
-        }
-        let rev = Self::next_revision(&mut tx).await?;
-        // `AND deleted_at IS NOT NULL` re-states the "must already be tombstoned" guard IN the
-        // UPDATE's own WHERE clause, closing the same TOCTOU class as delete_key above: the SELECT
-        // this function just ran is not atomic with this write, so without the re-check here a
-        // concurrent put_key/put_key_with_credential resurrecting the key between the SELECT and
-        // this UPDATE would let scrub_key silently erase name/labels on what is, by the time this
-        // statement lands, a LIVE key -- exactly the un-auditable-data-loss-on-an-active-principal
-        // this method's own doc comment says it must never do.
-        let changed = tx
-            .execute(
-                "UPDATE keys SET name='', labels='{}', revision=$2 \
-                 WHERE id=$1 AND deleted_at IS NOT NULL",
-                &[&id, &rev],
-            )
-            .await
-            .store()?;
-        if changed == 0 {
-            return Err(RecordStoreError(format!(
-                "scrub_key: key {id} was resurrected (deleted_at cleared) concurrently with this \
-                 call -- refusing to scrub a key that is live by the time the write landed"
-            )));
-        }
         tx.commit().await.store()?;
         Ok(())
     }
@@ -1339,8 +1288,9 @@ impl Session {
                     params.push(*unit);
                     params.push(count);
                 }
-                // Two ModelTokens entries for one model would name the same unit twice; summed,
-                // the same way `UsageLedger::apply_delta` folds them, rather than a key violation.
+                // Two ModelTokens entries for one model never reach this statement: the
+                // reserved-column INSERT above has no ON CONFLICT, so it refuses them (23505)
+                // first, as 1.5.5's put_usage did.
                 sql.push_str(
                     " ON CONFLICT (bucket_id, window_start, model, unit) DO UPDATE SET \
                      count = usage_ledger_units.count + EXCLUDED.count",
@@ -1417,49 +1367,6 @@ impl Session {
             .collect())
     }
 
-    pub(crate) async fn purge_windows_before(&mut self, before: u64) -> RecordStoreResult<u64> {
-        let b = clamp(before);
-        let client = self.lock();
-        let mut tx = client.transaction().await.store()?;
-        let n1 = tx
-            .execute("DELETE FROM usage_windows WHERE window_start < $1", &[&b])
-            .await
-            .store()?;
-        tx.execute("DELETE FROM usage_ledger WHERE window_start < $1", &[&b])
-            .await
-            .store()?;
-        tx.execute(
-            "DELETE FROM usage_ledger_units WHERE window_start < $1",
-            &[&b],
-        )
-        .await
-        .store()?;
-        tx.commit().await.store()?;
-        Ok(n1)
-    }
-
-    pub(crate) async fn purge_metering_before(&mut self, bucket: &str) -> RecordStoreResult<u64> {
-        // The trait's purge_metering_before takes `bucket: &str` while list_metering/add_metering
-        // use `bucket: u64` -- an inconsistency in the core trait itself, not introduced here.
-        // usage_metering.bucket is genuinely BIGINT, so this parses the string form.
-        let b: i64 = bucket.parse().map_err(|_| {
-            RecordStoreError(format!(
-                "purge_metering_before: invalid bucket {bucket:?}, expected an integer"
-            ))
-        })?;
-        let client = self.lock();
-        let mut tx = client.transaction().await.store()?;
-        let n = tx
-            .execute("DELETE FROM usage_metering WHERE bucket=$1", &[&b])
-            .await
-            .store()?;
-        tx.execute("DELETE FROM usage_metering_units WHERE bucket=$1", &[&b])
-            .await
-            .store()?;
-        tx.commit().await.store()?;
-        Ok(n)
-    }
-
     pub(crate) async fn put_credential(
         &mut self,
         secret: &CredentialSecret,
@@ -1533,27 +1440,6 @@ impl Session {
         let sql = format!("SELECT {CRED_META_COLUMNS} FROM credentials WHERE key_id=$1");
         let rows = self.lock().query(&sql, &[&key_id]).await.store()?;
         Ok(rows.iter().map(row_to_cred_meta).collect())
-    }
-
-    pub(crate) async fn lookup_credential_secret(
-        &mut self,
-        kind: &str,
-        public_id: &str,
-    ) -> RecordStoreResult<Option<CredentialSecret>> {
-        let sql = format!(
-            "SELECT {CRED_META_COLUMNS},secret FROM credentials WHERE kind=$1 AND public_id=$2"
-        );
-        let row = self
-            .lock()
-            .query_opt(&sql, &[&kind, &public_id])
-            .await
-            .store()?;
-        Ok(row.map(|r| CredentialSecret {
-            meta: row_to_cred_meta(&r),
-            secret: r
-                .get::<_, Option<String>>(CRED_SECRET_COLUMN_INDEX)
-                .unwrap_or_default(),
-        }))
     }
 
     pub(crate) async fn revoke_credential(
@@ -2136,7 +2022,24 @@ impl Session {
         )
         .await
         .store()?;
-        if !delta.models.is_empty() {
+        // `UsageDelta.models` is a plain Vec, so one model may be named twice; the contract's
+        // `UsageLedger::apply_delta` folds the entries sequentially, flooring each counter at 0
+        // after every entry. A single `UPDATE … FROM (VALUES …)` applies only ONE joined row per
+        // target row, so a second entry for the same model would be silently dropped. Apply the
+        // entries in ROUNDS instead: round k holds the k-th occurrence of each model, so no round
+        // names a model twice, and the rounds run in order to reproduce the sequential fold. A
+        // delta without duplicates is exactly one round, i.e. the statements it always issued.
+        let mut rounds: Vec<Vec<&busbar_contract::records::ModelTokensDelta>> = Vec::new();
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for m in &delta.models {
+            let n = seen.entry(m.model.as_str()).or_insert(0);
+            if rounds.len() <= *n {
+                rounds.push(Vec::new());
+            }
+            rounds[*n].push(m);
+            *n += 1;
+        }
+        for models in &rounds {
             // TWO statements, both batched over every model, and the split is what makes a
             // NEGATIVE delta (a refund) land. An `INSERT … ON CONFLICT DO UPDATE` can only add
             // `EXCLUDED.col` on conflict, and EXCLUDED is the row the INSERT would have written —
@@ -2144,8 +2047,7 @@ impl Session {
             // row added 0 and was silently lost. Instead: make sure every model's row exists (at
             // zero), then apply the SIGNED deltas to it in one UPDATE, floored at 0 there. A refund
             // against a fresh row floors to 0, exactly as `UsageLedger::apply_model_delta` does.
-            let deltas: Vec<[i64; 4]> = delta
-                .models
+            let deltas: Vec<[i64; 4]> = models
                 .iter()
                 .map(|m| RESERVED_COLUMNS.map(|u| m.usage_units.get(u).copied().unwrap_or(0)))
                 .collect();
@@ -2159,15 +2061,14 @@ impl Session {
                     tokens_cache_write = GREATEST(0, u.tokens_cache_write + v.dcw) \
                  FROM (VALUES ",
             );
-            let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
-                Vec::with_capacity(2 + delta.models.len());
+            let mut ensure_params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(2 + models.len());
             let mut update_params: Vec<&(dyn ToSql + Sync)> =
-                Vec::with_capacity(2 + delta.models.len() * 5);
+                Vec::with_capacity(2 + models.len() * 5);
             ensure_params.push(&bucket_id);
             ensure_params.push(&ws);
             update_params.push(&bucket_id);
             update_params.push(&ws);
-            for (i, (m, d)) in delta.models.iter().zip(deltas.iter()).enumerate() {
+            for (i, (m, d)) in models.iter().zip(deltas.iter()).enumerate() {
                 if i > 0 {
                     ensure.push(',');
                     update.push(',');
@@ -2197,8 +2098,7 @@ impl Session {
             tx.execute(&update, &update_params).await.store()?;
 
             // The OPEN unit classes, the same ensure-then-signed-update shape.
-            let opens: Vec<(&String, &String, i64)> = delta
-                .models
+            let opens: Vec<(&String, &String, i64)> = models
                 .iter()
                 .flat_map(|m| {
                     m.usage_units
@@ -2328,92 +2228,6 @@ impl Session {
         Ok(())
     }
 
-    /// `append_audit` inside the caller's transaction: `Ok(true)` once the record is stored (or an
-    /// identical one already was), `Ok(false)` when the conflicting row vanished before the share
-    /// lock held it (the seq is free again: retry in a fresh transaction), `Err` on a fork.
-    pub(crate) async fn append_audit_in(
-        tx: &mut Transaction<'_>,
-        entry: &AuditRecord,
-    ) -> RecordStoreResult<bool> {
-        // A `seq`/`ts` past `i64::MAX` cannot be stored faithfully: `clamp` pins it, so the record
-        // read back is NOT the record written. Two consequences, both bad, and neither acceptable
-        // silently — an identical retry compares unequal and is reported as "the audit chain has
-        // forked" (naming the same action on both sides, the worst possible page to hand an
-        // operator), and two genuinely distinct seqs collapse onto one row. Rejected outright
-        // instead. Comparing the CLAMPED form would fix the false alarm by causing the silent loss,
-        // which is the wrong half to give up.
-        if entry.seq > i64::MAX as u64 || entry.ts > i64::MAX as u64 {
-            return Err(RecordStoreError(format!(
-                "append_audit: seq {} / ts {} exceeds the storable range (i64::MAX); refusing to \
-                 store a record that would not read back as itself",
-                entry.seq, entry.ts
-            )));
-        }
-        let (seq, ts) = (clamp(entry.seq), clamp(entry.ts));
-        // ON CONFLICT DO NOTHING, not DO UPDATE: the trait's own contract is "append-only... a store
-        // never rewrites or recomputes the digest" (busbar_contract::records::RecordStore::append_audit doc). `seq` is a
-        // per-process counter (see the engine's own known caveat about clustered nodes), so a
-        // collision here means either a real caller bug or two nodes racing on the same seq -- in
-        // BOTH cases silently overwriting a prior entry's hash/prev_hash would corrupt the hash chain
-        // without any trace. Failing loudly on a collision is strictly safer than the alternative:
-        // the caller (or an operator) finds out immediately, instead of the audit log quietly losing
-        // integrity guarantees it claims to hold.
-        // A collision has TWO causes and they are not the same event. Erroring on both (which this
-        // used to do) makes the engine's own write-through look like a corrupt chain the first time
-        // a commit ACK is lost to a timeout or a reconnect and it retries. Compare the records and
-        // let the difference decide, per the trait contract:
-        //   identical -> the retry. Benign, and the common one. Ok.
-        //   different -> two records claiming one chain position: forked or tampered. Error.
-        //
-        // The INSERT and the read-back run in ONE transaction, and the read takes `FOR SHARE`, so
-        // the row that caused the conflict cannot be deleted out from under the comparison. Without
-        // that (an autocommit INSERT then a separate autocommit SELECT), an out-of-band deleter —
-        // operator SQL, an external retention job — could remove the conflicting row in between,
-        // leaving the seq empty and this method with nothing to compare. The obvious-looking answer
-        // there, "nothing occupies the seq, so no fork: return Ok", REPORTS SUCCESS FOR A RECORD IT
-        // NEVER STORED. That is the same silent-loss shape the whole comparison exists to prevent,
-        // just inverted, and an audit entry is the last thing that should vanish quietly.
-
-        let inserted = tx
-            .execute(
-                "INSERT INTO audit_log
-                    (seq, ts, action, resource, outcome, principal, prev_hash, hash)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                 ON CONFLICT (seq) DO NOTHING",
-                &[
-                    &seq,
-                    &ts,
-                    &entry.action,
-                    &entry.resource,
-                    &entry.outcome,
-                    &entry.principal,
-                    &entry.prev_hash,
-                    &entry.hash,
-                ],
-            )
-            .await
-            .store()?;
-        if inserted == 1 {
-            return Ok(true);
-        }
-        let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log WHERE seq=$1 FOR SHARE");
-        let stored = tx
-            .query_opt(&sql, &[&seq])
-            .await
-            .store()?
-            .map(|r| row_to_audit(&r));
-        match stored {
-            Some(stored) if &stored == entry => Ok(true),
-            Some(stored) => Err(RecordStoreError(format!(
-                "append_audit: seq {} already holds a DIFFERENT record; the audit chain \
-                     has forked (stored action '{}', incoming '{}')",
-                entry.seq, stored.action, entry.action
-            ))),
-            // Gone before the share lock could hold it.
-            None => Ok(false),
-        }
-    }
-
     /// `append_plane_record` inside the caller's transaction: `Ok(true)` once the record is stored
     /// (or an identical one already was), `Ok(false)` when the conflicting row vanished before the
     /// share lock held it (retry in a fresh transaction), `Err` on a fork.
@@ -2434,9 +2248,10 @@ impl Session {
         // worth reporting, and this store never restates a digest it was handed).
         //
         // The INSERT and the read-back share ONE transaction and the read takes `FOR SHARE`, so the
-        // conflicting row cannot be purged out from under the comparison; the bounded loop covers
-        // the row vanishing before the share lock lands (the position is then free, so insert). No
-        // path returns Ok without the record being stored.
+        // conflicting row cannot be purged out from under the comparison. There is no retry loop: if
+        // the row vanishes before the share lock lands (the position is then free) this returns
+        // `Ok(false)`, NOT success, and the v3 caller turns that into a failure the kernel retries.
+        // No path returns `Ok(true)` without the record being stored.
         let inserted = tx
             .execute(
                 "INSERT INTO plane_chain (kind, parent, seq, id, ts, disposition, body)
@@ -2486,13 +2301,6 @@ impl Session {
         }
     }
 }
-
-const _: fn() = || {
-    fn assert_tosql<T: ToSql>() {}
-    assert_tosql::<i64>();
-    assert_tosql::<Option<i64>>();
-    assert_tosql::<bool>();
-};
 
 // ── THE PLUGIN DOOR ─────────────────────────────────────────────────────────────────────────────
 // One door, both ways in (THE DESIGN §11, DECISIONS #2 rule (1)): `v3` invokes `store_door!` over

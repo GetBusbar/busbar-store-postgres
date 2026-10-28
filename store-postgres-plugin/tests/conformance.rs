@@ -254,7 +254,12 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
         ),
         "{refusals:?}"
     );
-    assert_eq!(refusals[3], refusals[0], "a non-string url is no url");
+    assert_eq!(
+        refusals[3],
+        "plugin 'busbar-store-postgres' open failed: invalid postgres plugin config: `url` must be \
+         a string",
+        "a present non-string url says so"
+    );
     let unreachable = refusals[4].as_str().unwrap();
     assert!(
         !unreachable.contains("s3cret-conf") && !unreachable.starts_with("opened"),
