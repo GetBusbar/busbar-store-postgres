@@ -258,7 +258,7 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     // crates/busbar/tests/cli_validate.rs::write_configs, not invented here.
     std::fs::write(
         &providers,
-        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n  api_key_env: MOCK_KEY\n",
+        "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n",
     )
     .unwrap();
     let config_text = format!(
@@ -839,7 +839,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // Retention crosses the ABI too, COUNT AND ALL.
     assert_eq!(
         store
-            .purge_plane_records_before("task", BASE_TS + 100)
+            .purge_plane_records("task", BASE_TS + 100, busbar_contract::records::Retention::TerminalOnly)
             .expect("purge_plane_records_before"),
         1,
         "only the TERMINAL row older than the cutoff goes; an active task is never swept no matter \
