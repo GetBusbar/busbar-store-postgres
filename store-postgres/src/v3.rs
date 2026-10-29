@@ -71,12 +71,22 @@ pub const NEEDS: &[Need] = &[Need {
     deny_response_headers_len: 0,
 }];
 
+/// THE REFERENCE-CAPABLE, NOT-SECRET SETTINGS FIELDS (busbar lead ruling item 7a), stated in the
+/// Statement's extensions under the contract's `EXT_REFERENCE_FIELDS` key: a `{env:}`/`{file:}`/
+/// `{module:}` reference written at `url` is resolved by the kernel IN PLACE to its string (a 1.5.5
+/// config's `url: {env: VAR}` keeps booting), and a literal url passes as written (never refused
+/// as a secret literal). The value is not a secret: it is never lent.
+busbar_contract::statement_extensions!(EXTENSIONS: [
+    (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
+]);
+
 busbar_contract::store_door!(
     PostgresStore,
     NAME,
     env!("CARGO_PKG_VERSION"),
     64,
-    needs: NEEDS
+    needs: NEEDS,
+    extensions: EXTENSIONS
 );
 
 /// Run one op on the instance's kept connection (a fresh one when none is kept): open the session
