@@ -877,3 +877,58 @@ fn a_failover_dsn_keeps_the_endpoint_that_connected() {
         "every op ran on the connection the open kept"
     );
 }
+
+/// Oracle cell `store.boot|postgres|url-options` (RED before: `keepalives` was refused at parse,
+/// so the boot never dialed): the cell's exact URL, against a server that answers its startup as
+/// the oracle's mock does (FATAL 28000), reaches the dial, sends the StartupMessage 1.5.5 sent,
+/// and fails in the driver's `db error` words, as 1.5.5's boot did.
+#[test]
+fn the_oracle_url_options_cell_dials_and_fails_with_the_servers_refusal() {
+    let sent = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let seen = sent.clone();
+    let port = fake_server(move |mut s| {
+        let mut len = [0_u8; 4];
+        if s.read_exact(&mut len).is_err() {
+            return;
+        }
+        let mut rest = vec![0_u8; (u32::from_be_bytes(len) as usize).saturating_sub(4)];
+        if s.read_exact(&mut rest).is_err() {
+            return;
+        }
+        let mut it = rest[4..]
+            .split(|b| *b == 0)
+            .map(|x| String::from_utf8_lossy(x).into_owned());
+        let mut params = Vec::new();
+        while let (Some(k), Some(v)) = (it.next(), it.next()) {
+            if k.is_empty() {
+                break;
+            }
+            params.push((k, v));
+        }
+        *seen.lock().unwrap() = params;
+        let _ = s.write_all(&fatal("28000", "oracle capture: no database here"));
+    });
+    let url = format!(
+        "postgres://oracle:oracle-pw@127.0.0.1:{port}/busbar?application_name=busbar-oracle\
+         &options=-c%20statement_timeout%3D5000&connect_timeout=5&keepalives=1\
+         &target_session_attrs=any"
+    );
+    let e = open_within(settings_of(&url), Duration::from_secs(20))
+        .expect("the open finished")
+        .expect_err("the server refused the startup");
+    assert!(
+        e.contains("db error") && e.contains("no database here") && !e.contains("oracle-pw"),
+        "{e}"
+    );
+    let want: Vec<(String, String)> = [
+        ("client_encoding", "UTF8"),
+        ("user", "oracle"),
+        ("database", "busbar"),
+        ("options", "-c statement_timeout=5000"),
+        ("application_name", "busbar-oracle"),
+    ]
+    .iter()
+    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+    .collect();
+    assert_eq!(*sent.lock().unwrap(), want, "the StartupMessage 1.5.5 sent");
+}
