@@ -96,13 +96,29 @@ fn config_err(what: impl Into<String>) -> Error {
     Error::new(Kind_::Config(what.into()))
 }
 
+/// How long the host's connector lets a dialled socket sit idle before the OS probes it
+/// (`busbar-core-connector`'s `KEEPALIVE_IDLE`, 1.5.5's `tcp_keepalive(60s)`), in seconds.
+const KEEPALIVE_IDLE_SECS: i64 = 60;
+
+/// Why a socket-tuning option has no effect.
+const INERT_SOCKET: &str = "the host's connector dials every connection with TCP keepalive on, \
+                            probing after 60 s idle at the OS's interval and count, and has no \
+                            per-store setting for it";
+
+/// Log, at debug (below the default level), that the accepted option `key=value` has no effect,
+/// and why. `value` is a validated number or keyword, never a secret.
+fn inert(key: &str, value: &str, why: &str) {
+    tracing::debug!("postgres connection option {key}={value} has no effect: {why}");
+}
+
 impl Config {
     /// Parse a libpq connection string: `postgres[ql]://user:pass@host:port/db?key=value&...` or
     /// `host=... port=... user=... password=... dbname=... sslmode=...`.
     ///
     /// # Errors
-    /// A malformed string, an unknown option, a Unix-socket host (this store reaches its server
-    /// over the host's connector, which dials TCP) or no user.
+    /// A malformed string, an unknown option, an option value the driver would refuse,
+    /// `keepalives=0`, a Unix-socket host (this store reaches its server over the host's connector,
+    /// which dials TCP) or no user.
     pub fn parse(s: &str) -> Result<Self, Error> {
         let mut pairs: Vec<(String, String)> = Vec::new();
         if let Some(rest) = s
@@ -263,21 +279,64 @@ impl Config {
                          busbar's trust anchors, not a per-store root certificate",
                     ));
                 }
-                // Refused rather than ignored: the host's connector keeps the connection and its
-                // sockets, so a per-store socket or balancing option could never apply.
-                "keepalives"
-                | "keepalives_idle"
-                | "keepalives_interval"
-                | "keepalives_count"
-                | "keepalives_retries"
-                | "load_balance_hosts"
-                | "tcp_user_timeout"
-                | "sslnegotiation" => {
-                    return Err(config_err(format!(
-                        "{k} is not supported by this store: the host's connector owns the \
-                         connection and its sockets, so this option could never apply"
-                    )));
+                // The host's connector owns the sockets: it turns TCP keepalive on for every
+                // connection it dials and offers no way to turn it off, so `keepalives=1` (any
+                // non-zero, as the driver read it) is what happens and `keepalives=0` is refused.
+                "keepalives" => {
+                    let on: u64 = v
+                        .parse()
+                        .map_err(|_| config_err("invalid value for option `keepalives`"))?;
+                    if on == 0 {
+                        return Err(config_err(
+                            "keepalives=0 is not supported: the host's connector keeps TCP \
+                             keepalive on for every connection it dials and cannot turn it off \
+                             for this store (remove the option, or set keepalives=1)",
+                        ));
+                    }
                 }
+                // Accepted as the driver accepted them; the ones the connector cannot apply are
+                // logged at debug (once per option, naming why), never refused and never silent.
+                "keepalives_idle" | "keepalives_interval" | "tcp_user_timeout" => {
+                    let n: i64 = v
+                        .parse()
+                        .map_err(|_| config_err(format!("invalid value for option `{k}`")))?;
+                    // Zero or less is the default (the driver's reading); the connector's own
+                    // idle time is KEEPALIVE_IDLE_SECS.
+                    let applied = n <= 0 || (k == "keepalives_idle" && n == KEEPALIVE_IDLE_SECS);
+                    if !applied {
+                        inert(&k, &v, INERT_SOCKET);
+                    }
+                }
+                "keepalives_count" | "keepalives_retries" => {
+                    let n: u32 = v
+                        .parse()
+                        .map_err(|_| config_err(format!("invalid value for option `{k}`")))?;
+                    if n != 0 {
+                        inert(&k, &v, INERT_SOCKET);
+                    }
+                }
+                // `disable` is what this store does: the endpoints are tried in the order given.
+                "load_balance_hosts" => match v.as_str() {
+                    "disable" => {}
+                    "random" => inert(
+                        &k,
+                        &v,
+                        "the endpoints are tried in the order given, the one that last connected \
+                         first; this store does not shuffle them",
+                    ),
+                    _ => return Err(config_err("invalid value for option `load_balance_hosts`")),
+                },
+                // `postgres` is what this store does: TLS is asked for with an SSLRequest.
+                "sslnegotiation" => match v.as_str() {
+                    "postgres" => {}
+                    "direct" => inert(
+                        &k,
+                        &v,
+                        "this store asks for TLS with an SSLRequest (sslnegotiation=postgres); \
+                         sslmode still decides whether the connection is secured",
+                    ),
+                    _ => return Err(config_err("invalid value for option `sslnegotiation`")),
+                },
                 _ if has_password => {
                     return Err(config_err(
                         "unknown option (its name is withheld: the connection string carries a \
