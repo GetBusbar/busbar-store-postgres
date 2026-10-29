@@ -881,7 +881,8 @@ fn a_failover_dsn_keeps_the_endpoint_that_connected() {
 /// Oracle cell `store.boot|postgres|url-options` (RED before: `keepalives` was refused at parse,
 /// so the boot never dialed): the cell's exact URL, against a server that answers its startup as
 /// the oracle's mock does (FATAL 28000), reaches the dial, sends the StartupMessage 1.5.5 sent,
-/// and fails in the driver's `db error` words, as 1.5.5's boot did.
+/// and fails on the server's refusal, as 1.5.5's boot did (1.5.5 printed `db error`; this store
+/// names the SQLSTATE and the server's message).
 #[test]
 fn the_oracle_url_options_cell_dials_and_fails_with_the_servers_refusal() {
     let sent = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
@@ -917,7 +918,7 @@ fn the_oracle_url_options_cell_dials_and_fails_with_the_servers_refusal() {
         .expect("the open finished")
         .expect_err("the server refused the startup");
     assert!(
-        e.contains("db error") && e.contains("no database here") && !e.contains("oracle-pw"),
+        e.contains("28000") && e.contains("no database here") && !e.contains("oracle-pw"),
         "{e}"
     );
     let want: Vec<(String, String)> = [

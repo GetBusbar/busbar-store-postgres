@@ -142,12 +142,28 @@ comma-separated list of several endpoints, tried in order), `user`,
 dial and handshake; `0` or less means no bound, as in libpq; a value that is
 not a whole number is refused).
 
+**Socket options, accepted as 1.5.5's driver accepted them.** busbar's
+connector owns the sockets: it dials every connection with TCP keepalive on,
+probing after 60 s idle at the OS's interval and count, with no per-store
+setting. So:
+
+- `keepalives=1` (any non-zero) is what happens anyway; `keepalives=0` is
+  **refused** (the connector cannot turn keepalive off).
+- `keepalives_idle` (`60`, or `0` or less), `keepalives_interval`,
+  `tcp_user_timeout` (`0` or less), `keepalives_count`, `keepalives_retries`
+  (`0`), `load_balance_hosts=disable` and `sslnegotiation=postgres` are
+  what the store does: accepted.
+- Any other valid value of those options (say `keepalives_idle=30`,
+  `load_balance_hosts=random`, `sslnegotiation=direct`) cannot apply: it is
+  accepted and logged once, at debug level, naming the option and why it has
+  no effect. Endpoints are always tried in the order given, and TLS is always
+  asked for with an `SSLRequest` (`sslmode` still decides whether it is used).
+- A value 1.5.5's driver refused (not a number, an unknown keyword) is refused.
+
 **Refused, with an explanation (never silently ignored):** `sslmode=allow`
 and `sslmode=prefer`, `channel_binding=require` (no SCRAM-PLUS), `sslrootcert`
-(trust is busbar's), a Unix-socket `host`, `keepalives`, `keepalives_idle`,
-`keepalives_interval`, `keepalives_count` (and `keepalives_retries`),
-`load_balance_hosts`, `tcp_user_timeout` and `sslnegotiation` (the host's
-connector owns the connection and its sockets), and any unknown option.
+(trust is busbar's), a Unix-socket `host`, `keepalives=0`, and any unknown
+option.
 
 A database stamped with a newer schema than this build is refused at open.
 

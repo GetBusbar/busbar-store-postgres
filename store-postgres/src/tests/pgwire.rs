@@ -144,33 +144,125 @@ fn sslmode_prefer_and_allow_are_refused_not_downgraded() {
     }
 }
 
-/// Connect options this store neither applies nor can apply (the host's connector owns the
-/// sockets) are refused with an explanation, not accepted and ignored; the message never
-/// echoes the password.
+/// The libpq socket options a 1.5.5 DSN carried are ACCEPTED (1.5.5's driver accepted them; a 1.5.5
+/// config keeps booting): what the host's connector does anyway is accepted quietly, what it cannot
+/// apply is accepted and logged at debug, naming the option and why. A value the driver refused is
+/// refused, and `keepalives=0`, which the connector cannot honour, is refused with the reason; no
+/// message echoes the password.
 #[test]
-fn connect_options_the_store_cannot_apply_are_refused_not_ignored() {
+fn socket_options_are_accepted_and_what_cannot_apply_is_logged() {
+    let logged = |dsn: &str| -> (Result<(), String>, String) {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || Sink(sink.clone()))
+            .finish();
+        let r = tracing::subscriber::with_default(subscriber, || {
+            Config::parse(dsn).map(drop).map_err(|e| e.to_string())
+        });
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        (r, text)
+    };
+    // Applied (the connector already does it): accepted, nothing logged.
     for opt in [
         "keepalives=1",
-        "keepalives_idle=30",
-        "keepalives_interval=10",
-        "keepalives_count=3",
-        "keepalives_retries=3",
-        "load_balance_hosts=random",
-        "tcp_user_timeout=5000",
-        "sslnegotiation=direct",
+        "keepalives=7",
+        "keepalives_idle=60",
+        "keepalives_idle=0",
+        "keepalives_interval=0",
+        "keepalives_count=0",
+        "keepalives_retries=0",
+        "tcp_user_timeout=0",
+        "load_balance_hosts=disable",
+        "sslnegotiation=postgres",
     ] {
-        let name = opt.split('=').next().unwrap();
         for dsn in [
             format!("host=db user=u password=zq9pw {opt}"),
             format!("postgres://u:zq9pw@db/d?{opt}"),
         ] {
-            let e = Config::parse(&dsn).unwrap_err().to_string();
+            let (r, text) = logged(&dsn);
+            assert_eq!(r, Ok(()), "{dsn}");
+            assert!(!text.contains("has no effect"), "{dsn}: {text}");
+        }
+    }
+    // Cannot apply: accepted, ONE debug line naming the option and why.
+    for (opt, why) in [
+        ("keepalives_idle=30", "after 60 s idle"),
+        ("keepalives_interval=10", "no per-store setting"),
+        ("keepalives_count=3", "no per-store setting"),
+        ("keepalives_retries=3", "no per-store setting"),
+        ("tcp_user_timeout=5000", "no per-store setting"),
+        ("load_balance_hosts=random", "tried in the order given"),
+        ("sslnegotiation=direct", "SSLRequest"),
+    ] {
+        for dsn in [
+            format!("host=db user=u password=zq9pw {opt}"),
+            format!("postgres://u:zq9pw@db/d?{opt}"),
+        ] {
+            let (r, text) = logged(&dsn);
+            assert_eq!(r, Ok(()), "{dsn}");
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|l| l.contains("has no effect"))
+                .collect();
+            assert_eq!(lines.len(), 1, "{dsn}: {text}");
             assert!(
-                e.contains(&format!("{name} is not supported by this store"))
-                    && !e.contains("zq9pw"),
-                "{dsn}: {e}"
+                lines[0].contains("DEBUG")
+                    && lines[0].contains(&format!("option {opt} has no effect"))
+                    && lines[0].contains(why)
+                    && !lines[0].contains("zq9pw"),
+                "{dsn}: {text}"
             );
         }
+    }
+    // keepalives=0 cannot be honoured: refused, with the reason.
+    for dsn in [
+        "host=db user=u password=zq9pw keepalives=0",
+        "postgres://u:zq9pw@db/d?keepalives=0",
+    ] {
+        let e = Config::parse(dsn).unwrap_err().to_string();
+        assert!(
+            e.contains("keepalives=0 is not supported")
+                && e.contains("cannot turn it off")
+                && !e.contains("zq9pw"),
+            "{dsn}: {e}"
+        );
+    }
+    // A value the driver refused is refused.
+    for opt in [
+        "keepalives=yes",
+        "keepalives=-1",
+        "keepalives_idle=soon",
+        "keepalives_interval=1.5",
+        "keepalives_count=-1",
+        "keepalives_retries=x",
+        "tcp_user_timeout=x",
+        "load_balance_hosts=roundrobin",
+        "sslnegotiation=tls",
+    ] {
+        let name = opt.split('=').next().unwrap();
+        let e = Config::parse(&format!("postgres://u:zq9pw@db/d?{opt}"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(&format!("invalid value for option `{name}`")) && !e.contains("zq9pw"),
+            "{opt}: {e}"
+        );
+    }
+}
+
+/// A `MakeWriter` target appending to a shared buffer.
+struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Sink {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
