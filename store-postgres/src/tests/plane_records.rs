@@ -366,12 +366,12 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
         "a replay must not duplicate the row"
     );
 
-    let forked = call(p, 1, LIVE_TS + 100, "", "DIFFERENT");
+    let forked = call(p, 1, LIVE_TS + 100, "", "h2-second-writer");
     let err = store
         .append_plane_record(forked.view())
         .expect_err("a different record at an occupied position is a fork and must error");
     assert!(
-        !format!("{err}").contains("DIFFERENT"),
+        !format!("{err}").contains("h2-second-writer"),
         "the error must not echo stored or caller content back"
     );
     assert_eq!(

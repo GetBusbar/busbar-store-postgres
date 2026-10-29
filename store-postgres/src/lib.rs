@@ -29,11 +29,15 @@
 
 mod pgwire;
 
+use busbar_contract::abi::sdk::store::column::{
+    clamp, read_u64, scope_columns, scopes_from_columns, storable_i64,
+};
+use busbar_contract::abi::sdk::store::fork;
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
     PlaneDisposition, PlaneRecord, PlaneRecordRef, PlaneSelector, RecordStoreError,
-    RecordStoreResult, Retention, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey,
-    UNIT_CACHE_READ, UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
+    RecordStoreResult, Retention, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
+    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use pgwire::{Client, Row, Transaction};
 use postgres_types::ToSql;
@@ -450,18 +454,6 @@ impl std::ops::Deref for Session {
     }
 }
 
-/// Clamp a `u64` into `i64` for a BIGINT column (a value above `i64::MAX` pins to `i64::MAX`, never
-/// wraps).
-fn clamp(v: u64) -> i64 {
-    i64::try_from(v).unwrap_or(i64::MAX)
-}
-
-/// Read a signed BIGINT back as a `u64`, clamping a (corrupt / direct-DB) negative to 0 instead of
-/// wrapping via `as`.
-fn read_u64(v: i64) -> u64 {
-    v.max(0) as u64
-}
-
 /// The four RESERVED unit classes, in the order of the `usage_ledger` token columns
 /// (`tokens_input`, `tokens_output`, `tokens_cache_read`, `tokens_cache_write`). Every other unit
 /// class is an OPEN one and lives in `usage_ledger_units`.
@@ -653,69 +645,12 @@ fn labels_from_storage(stored: &str) -> std::collections::BTreeMap<String, Strin
     serde_json::from_str(stored).unwrap_or_default()
 }
 
-// SCOPE STORAGE. `allowed_pools` holds the `pool` grants as a JSON array of names, or NULL; the v10
-// `allowed_scopes_by_kind` holds every NON-pool grant as `{kind: [value, ...]}`, NULL when none, so a
-// pool-only key is stored as before. `None` (grant omitted = all) -> both NULL; `Some(list)`
-// -> `allowed_pools` is ALWAYS an array (possibly `[]`), so `Some([])` never collapses into `None`
-// and a non-pool-only grant never reads back as "every pool".
-type ScopeColumns = (Option<String>, Option<String>);
-
-fn scopes_to_storage(scopes: &Option<Vec<ScopeRef>>) -> ScopeColumns {
-    let Some(list) = scopes else {
-        return (None, None);
-    };
-    let mut pools: Vec<&str> = Vec::new();
-    let mut by_kind: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for s in list {
-        if s.kind == "pool" {
-            pools.push(s.value.as_str());
-        } else {
-            by_kind
-                .entry(s.kind.as_str())
-                .or_default()
-                .push(s.value.as_str());
-        }
-    }
-    let pools = serde_json::to_string(&pools).unwrap_or_else(|_| "[]".to_string());
-    let by_kind = if by_kind.is_empty() {
-        None
-    } else {
-        Some(serde_json::to_string(&by_kind).unwrap_or_else(|_| "{}".to_string()))
-    };
-    (Some(pools), by_kind)
-}
-
-/// The inverse of [`scopes_to_storage`]: pools first, then every other kind in kind order — the
-/// same canonical order the VirtualKey wire reassembles in.
-fn scopes_from_storage(pools: Option<String>, by_kind: Option<String>) -> Option<Vec<ScopeRef>> {
-    if pools.is_none() && by_kind.is_none() {
-        return None;
-    }
-    let mut out: Vec<ScopeRef> = pools
-        .map(|p| serde_json::from_str::<Vec<String>>(p.trim()).unwrap_or_default())
-        .unwrap_or_default()
-        .into_iter()
-        .map(ScopeRef::pool)
-        .collect();
-    if let Some(by_kind) = by_kind {
-        let map: BTreeMap<String, Vec<String>> =
-            serde_json::from_str(by_kind.trim()).unwrap_or_default();
-        for (kind, values) in map {
-            out.extend(values.into_iter().map(|value| ScopeRef {
-                kind: kind.clone(),
-                value,
-            }));
-        }
-    }
-    Some(out)
-}
-
 fn row_to_key(r: &Row) -> VirtualKey {
     VirtualKey {
         id: r.get(0),
         generation_hash: r.get(1),
         name: r.get(2),
-        allowed_scopes: scopes_from_storage(
+        allowed_scopes: scopes_from_columns(
             r.get::<_, Option<String>>(3),
             r.get::<_, Option<String>>(14),
         ),
@@ -774,7 +709,7 @@ fn row_to_cred_meta(r: &Row) -> CredentialMeta {
 
 impl Session {
     pub(crate) async fn put_key(&mut self, key: &VirtualKey) -> RecordStoreResult<()> {
-        let (pools, by_kind) = scopes_to_storage(&key.allowed_scopes);
+        let (pools, by_kind) = scope_columns(key.allowed_scopes.as_deref());
         let labels = labels_to_storage(&key.labels);
         let created = clamp(key.created_at);
         let expires = key.expires_at.map(clamp);
@@ -1152,7 +1087,7 @@ impl Session {
         secret: &CredentialSecret,
     ) -> RecordStoreResult<()> {
         // ATOMIC mint: the bearer key and its credential commit together or not at all.
-        let (pools, by_kind) = scopes_to_storage(&key.allowed_scopes);
+        let (pools, by_kind) = scope_columns(key.allowed_scopes.as_deref());
         let labels = labels_to_storage(&key.labels);
         let created = clamp(key.created_at);
         let expires = key.expires_at.map(clamp);
@@ -1343,8 +1278,8 @@ impl Session {
         let record = &record.to_record();
         // REFUSED rather than clamped: `clamp` pins a value above i64::MAX, so the row read back
         // would not be the row written and nothing would ever report it.
-        let seq = as_storable_i64("upsert_plane_record", "seq", record.seq)?;
-        let ts = as_storable_i64("upsert_plane_record", "ts", record.ts)?;
+        let seq = storable_i64("upsert_plane_record", "seq", record.seq)?;
+        let ts = storable_i64("upsert_plane_record", "ts", record.ts)?;
         // UPSERT BY (kind, id): the engine writes through on EVERY transition, so a second write
         // for one id REPLACES the row — the sidecar columns included, which is how a terminal
         // transition reaches the retention sweep and the liveness check.
@@ -1561,7 +1496,7 @@ impl Session {
         // alone saturates: minting claims pass `u64::MAX` for "never expires", and the column is only
         // compared against `now` by the sweep, so `i64::MAX` is the same answer.
         let expires = i64::try_from(expires_at).unwrap_or(i64::MAX);
-        let cutoff = as_storable_i64("redeem_plane_token", "now", now)?;
+        let cutoff = storable_i64("redeem_plane_token", "now", now)?;
         let client = self.lock();
         let mut tx = client.transaction().await.store()?;
         // The eviction sweep, STRICTLY less-than (an entry expiring exactly at `now` is kept) and
@@ -1618,18 +1553,6 @@ fn disposition_to_storage(d: PlaneDisposition) -> &'static str {
         PlaneDisposition::Active => "active",
         PlaneDisposition::Terminal => "terminal",
     }
-}
-
-/// Reject a `u64` a signed BIGINT cannot hold, naming the method and the field. `clamp` would pin
-/// it to `i64::MAX`, so the row read back would not be the row written: tolerable on counters, not
-/// on a plane record's chain position or a token ledger's clock.
-fn as_storable_i64(method: &str, field: &str, v: u64) -> RecordStoreResult<i64> {
-    i64::try_from(v).map_err(|_| {
-        RecordStoreError(format!(
-            "{method}: {field} {v} exceeds the storable range (i64::MAX); refusing to store a row \
-             that would not read back as itself"
-        ))
-    })
 }
 
 fn row_to_audit(r: &Row) -> AuditRecord {
@@ -1974,8 +1897,8 @@ impl Session {
         tx: &mut Transaction<'_>,
         record: &PlaneRecord,
     ) -> RecordStoreResult<bool> {
-        let seq = as_storable_i64("append_plane_record", "seq", record.seq)?;
-        let ts = as_storable_i64("append_plane_record", "ts", record.ts)?;
+        let seq = storable_i64("append_plane_record", "seq", record.seq)?;
+        let ts = storable_i64("append_plane_record", "ts", record.ts)?;
         // The chain a child record hangs off: its parent, or (a parentless append) its own id —
         // the same identity busbar's reference backends key a chain by.
         let parent = record.parent.as_deref().unwrap_or(record.id.as_str());
@@ -2024,11 +1947,7 @@ impl Session {
                 }
                 // Names the position and nothing else — it must not echo stored (or caller)
                 // content back.
-                Err(RecordStoreError(format!(
-                    "append_plane_record: kind '{}' parent '{}' seq {} is already occupied by \
-                     another record; the chain has forked",
-                    record.kind, parent, record.seq
-                )))
+                Err(fork::chain_fork(&record.kind, parent, record.seq))
             }
             None => Ok(false),
         }
