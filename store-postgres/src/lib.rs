@@ -32,8 +32,8 @@ mod pgwire;
 use busbar_contract::records::{
     AuditRecord, CredentialMeta, CredentialSecret, MeteringDelta, MeteringRow, ModelTokens,
     PlaneDisposition, PlaneRecord, PlaneRecordRef, PlaneSelector, RecordStoreError,
-    RecordStoreResult, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey, UNIT_CACHE_READ,
-    UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
+    RecordStoreResult, Retention, ScopeRef, SecretForm, UsageDelta, UsageLedger, VirtualKey,
+    UNIT_CACHE_READ, UNIT_CACHE_WRITE, UNIT_INPUT, UNIT_OUTPUT,
 };
 use pgwire::{Client, Row, Transaction};
 use postgres_types::ToSql;
@@ -1462,11 +1462,27 @@ impl Session {
         kind: &str,
         before: u64,
     ) -> RecordStoreResult<u64> {
+        // The age-only entry: the kinds in TERMINAL_ONLY_RETENTION_KINDS have always dropped only
+        // their TERMINAL rows here, every other kind every row older than `before`.
+        let retention = if TERMINAL_ONLY_RETENTION_KINDS.contains(&kind) {
+            Retention::TerminalOnly
+        } else {
+            Retention::Age
+        };
+        self.purge_plane_records(kind, before, retention).await
+    }
+
+    pub(crate) async fn purge_plane_records(
+        &mut self,
+        kind: &str,
+        before: u64,
+        retention: Retention,
+    ) -> RecordStoreResult<u64> {
         // STRICTLY older than the cutoff: a row exactly at `before` is kept. WHICH rows go is the
-        // kind's own contract, read off the typed `disposition` column and never out of the body —
-        // see TERMINAL_ONLY_RETENTION_KINDS.
+        // rule the call carries (never one inferred from the kind's name), read off the typed
+        // `disposition` column and never out of the body.
         let cutoff = clamp(before);
-        let terminal_only = TERMINAL_ONLY_RETENTION_KINDS.contains(&kind);
+        let terminal_only = retention == Retention::TerminalOnly;
         let client = self.lock();
         let mut tx = client.transaction().await.store()?;
         let purged: Vec<String> = tx
@@ -1483,8 +1499,9 @@ impl Session {
             .collect();
         let chain = tx
             .execute(
-                "DELETE FROM plane_chain WHERE kind=$1 AND ts < $2",
-                &[&kind, &cutoff],
+                "DELETE FROM plane_chain
+                 WHERE kind=$1 AND ts < $2 AND (NOT $3 OR disposition = 'terminal')",
+                &[&kind, &cutoff, &terminal_only],
             )
             .await
             .store()?;
