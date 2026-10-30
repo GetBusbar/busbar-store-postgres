@@ -1100,6 +1100,84 @@ fn put_usage_and_add_usage_batch_multiple_models_correctly() {
     assert_eq!(models2[1].tier(UNIT_OUTPUT), 11);
 }
 
+/// A BIGINT accrual pins at `i64::MAX` (rule 8): an upstream's huge count never fails the batch.
+#[test]
+fn usage_accruals_pin_at_the_column_maximum() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let max = i64::MAX;
+    let bucket = format!("vk_sat_{}", unique_suffix());
+    let ws = 20_270_501u64;
+    let mut open_units = mtd("m", max, max, max, max);
+    open_units.usage_units.insert("audio_s".into(), max);
+    let delta = UsageDelta {
+        requests: max,
+        billable_requests: max,
+        models: vec![open_units],
+    };
+    store.add_usage(&bucket, ws, &delta).unwrap();
+    store.add_usage(&bucket, ws, &delta).unwrap();
+    let got = store.get_usage(&bucket, ws).unwrap();
+    assert_eq!(got.requests, max as u64);
+    assert_eq!(got.billable_requests, max as u64);
+    assert_eq!(got.models[0].tier(UNIT_INPUT), max as u64);
+    assert_eq!(got.models[0].tier(UNIT_CACHE_WRITE), max as u64);
+    assert_eq!(got.models[0].tier("audio_s"), max as u64);
+    // A refund still lands off the pin.
+    let mut refund = mtd("m", -1, 0, 0, 0);
+    refund.usage_units.insert("audio_s".into(), -1);
+    store
+        .add_usage(
+            &bucket,
+            ws,
+            &UsageDelta {
+                requests: -1,
+                billable_requests: 0,
+                models: vec![refund],
+            },
+        )
+        .unwrap();
+    let got = store.get_usage(&bucket, ws).unwrap();
+    assert_eq!(got.requests, max as u64 - 1);
+    assert_eq!(got.models[0].tier(UNIT_INPUT), max as u64 - 1);
+    assert_eq!(got.models[0].tier("audio_s"), max as u64 - 1);
+}
+
+/// The metering twin of the usage pin above.
+#[test]
+fn metering_accruals_pin_at_the_column_maximum() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let max = i64::MAX;
+    let key = format!("vk_sat_m_{}", unique_suffix());
+    let mut units = BTreeMap::new();
+    units.insert("audio_s".to_string(), u64::MAX);
+    let meter = busbar_contract::records::MeteringDelta {
+        key_id: key.clone(),
+        bucket: 20_270_502,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: u64::MAX,
+        tokens_output: u64::MAX,
+        tokens_cache_read: u64::MAX,
+        tokens_cache_write: u64::MAX,
+        requests: u64::MAX,
+        billable_requests: u64::MAX,
+        key_group_at_use: "g".into(),
+        pricing_version: "v".into(),
+        priced_from_ms: 0,
+        usage_units: units,
+    };
+    store.add_metering(&meter).unwrap();
+    store.add_metering(&meter).unwrap();
+    let rows = store.list_metering(20_270_502).unwrap();
+    let row = rows.iter().find(|r| r.key_id == key).unwrap();
+    assert_eq!(row.tokens_input, max as u64);
+    assert_eq!(row.requests, max as u64);
+    assert_eq!(row.billable_requests, max as u64);
+    assert_eq!(row.usage_units["audio_s"], max as u64);
+}
+
 /// The denylist pair, previously untested in either direction. `add_denylist` is an UPSERT whose
 /// `DO UPDATE SET reason` half is the part that can silently rot: downgrading it to `DO NOTHING`
 /// keeps every "is this subject denied" check passing while quietly pinning the reason to whatever
