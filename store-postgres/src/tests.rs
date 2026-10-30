@@ -1643,6 +1643,30 @@ fn the_v13_upgrade_drops_the_money_and_dead_slot_tables() {
     assert_eq!(version, SCHEMA_VERSION);
 }
 
+/// A row decoder meeting a column of an unexpected type, or a NULL where the store reads a value,
+/// answers an error naming the column (never the value), not a panic.
+#[test]
+fn a_row_that_does_not_decode_is_an_error_not_a_panic() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_decode");
+    let iso_url = tmp.url();
+    let store = connect_store_with_retry(&iso_url).expect("connect");
+    store
+        .lock()
+        .batch_execute(
+            "ALTER TABLE usage_windows ALTER COLUMN requests TYPE INTEGER;
+             INSERT INTO usage_windows (bucket_id, window_start, requests) VALUES ('b', 1, 77);
+             ALTER TABLE keys ALTER COLUMN name DROP NOT NULL;
+             INSERT INTO keys (id, generation_hash, name, created_at) VALUES ('k', 'g', NULL, 1);",
+        )
+        .unwrap();
+    let err = store.get_usage("b", 1).expect_err("an int4 column is not i64");
+    assert!(err.0.contains("requests"), "{err:?}");
+    assert!(!err.0.contains("77"), "{err:?}");
+    let err = store.get_key("k").expect_err("NULL into a non-Option");
+    assert!(err.0.contains("name"), "{err:?}");
+}
+
 /// A database stamped ABOVE this build is refused at open, with the reason: an older binary would
 /// ignore newer rules (the epoch fence among them). An equal version still opens.
 #[test]
