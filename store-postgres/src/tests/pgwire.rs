@@ -375,7 +375,7 @@ fn a_data_row_short_of_its_columns_is_an_error_not_a_panic() {
     };
     assert_eq!(row.try_get::<_, &str>(0).unwrap(), "ab");
     let e = row.try_get::<_, &str>(1).unwrap_err();
-    assert!(e.to_string().contains("column 1"), "{e}");
+    assert!(e.to_string().contains("column `b`"), "{e}");
 }
 
 #[test]
