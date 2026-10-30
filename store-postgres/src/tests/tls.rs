@@ -621,6 +621,51 @@ fn prefer_secures_the_connection_when_the_server_answers_s() {
     RecordStore::list_denylist(&store).expect("a read over TLS");
 }
 
+/// The startup options a plaintext client sends a server that refuses it.
+fn startup_options(dsn_query: &str) -> String {
+    let seen = Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = seen.clone();
+    let port = fake_server(move |mut s| {
+        let mut len = [0_u8; 4];
+        if s.read_exact(&mut len).is_err() {
+            return;
+        }
+        let mut rest = vec![0_u8; (u32::from_be_bytes(len) as usize).saturating_sub(4)];
+        if s.read_exact(&mut rest).is_err() {
+            return;
+        }
+        let parts: Vec<&[u8]> = rest[4..].split(|b| *b == 0).collect();
+        for kv in parts.chunks(2) {
+            if kv[0] == b"options" {
+                *sink.lock().unwrap() = String::from_utf8_lossy(kv[1]).into_owned();
+            }
+        }
+        let _ = s.write_all(&fatal("3D000", "no such database"));
+    });
+    let e = open_loaded(&settings_of(&format!(
+        "postgres://u:zq9pw@127.0.0.1:{port}/d{dsn_query}"
+    )))
+    .expect_err("the fake server refuses the startup");
+    assert!(e.contains("3D000"), "{e}");
+    let got = seen.lock().unwrap().clone();
+    got
+}
+
+/// A stalled peer holding a row lock must not block the fleet forever: the store asks for a lock
+/// timeout and an idle-in-transaction timeout at startup, unless the DSN sets its own.
+#[test]
+fn startup_asks_for_lock_and_idle_in_transaction_timeouts() {
+    let o = startup_options("");
+    assert!(o.contains("-c lock_timeout=30s"), "{o}");
+    assert!(
+        o.contains("-c idle_in_transaction_session_timeout=60s"),
+        "{o}"
+    );
+    let o = startup_options("?options=-c%20lock_timeout%3D5s");
+    assert!(o.contains("lock_timeout=5s") && !o.contains("lock_timeout=30s"), "{o}");
+    assert!(o.contains("idle_in_transaction_session_timeout=60s"), "{o}");
+}
+
 /// D37 (RED before: `connect_timeout` was ignored, `Wire::bound` never called, and a server that
 /// accepts TCP and never answers held the instance's one connection forever): the dial AND the
 /// handshake are bounded, and the failure is the connection's timeout.
