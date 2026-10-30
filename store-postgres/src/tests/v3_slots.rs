@@ -6,8 +6,10 @@
 //! rows into another's assertions.
 
 use super::*;
+use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::OpRefused;
 use busbar_contract::abi::store::OpId;
+use busbar_contract::records::MeteringDelta;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A namespace unique to this run.
@@ -142,6 +144,138 @@ fn an_op_id_dedupes_durably_across_a_reconnect() {
     b.append_plane_record_op(fork, rec("two").view())
         .expect("a failed op was not recorded, so its retry is evaluated afresh");
     clear(&b);
+}
+
+/// A new op records its body as the SDK's digest (64 hex digits), not a `{:?}` dump.
+#[test]
+fn a_new_op_records_its_digest() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let bucket = format!("{ns}-b");
+    let delta = UsageDelta {
+        requests: 1,
+        ..Default::default()
+    };
+    let id = op();
+    s.add_usage_op(id, &bucket, 4_000_000_000_000_001, &delta)
+        .expect("applied");
+    let cells = [(bucket.as_str(), 4_000_000_000_000_001, delta)];
+    let recorded: String = s
+        .lock()
+        .query_one("SELECT body FROM store_ops WHERE op_id = $1", &[&&id.0[..]])
+        .unwrap()
+        .get(0);
+    assert_eq!(recorded, Dedupe::usage(&cells).body_hex());
+}
+
+/// A body an older build recorded (`<slot>:{:?}`) still replays across the upgrade, and a
+/// different op under its `op_id` is still a conflict; neither applies anything.
+#[test]
+fn an_op_recorded_by_an_older_build_replays() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let old_row = |id: OpId, body: String| {
+        s.lock()
+            .execute(
+                "INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES ($1, $2, '', $3)",
+                &[&&id.0[..], &body, &(now_secs() as i64)],
+            )
+            .unwrap();
+    };
+
+    // Usage.
+    const WINDOW: u64 = 4_000_000_000_000_002;
+    let bucket = format!("{ns}-b");
+    let delta = UsageDelta {
+        requests: 1,
+        billable_requests: 1,
+        ..Default::default()
+    };
+    let cells = [(bucket.as_str(), WINDOW, delta.clone())];
+    let id = op();
+    old_row(id, format!("add_usage_batch:{cells:?}"));
+    s.add_usage_op(id, &bucket, WINDOW, &delta)
+        .expect("an older body replays");
+    let other = UsageDelta {
+        requests: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        s.add_usage_op(id, &bucket, WINDOW, &other),
+        Err(OpRefused::Conflict)
+    );
+    assert_eq!(s.get_usage(&bucket, WINDOW).expect("read").requests, 0);
+
+    // Metering.
+    const BUCKET: u64 = 4_000_000_000_000_003;
+    let key_id = format!("{ns}-k");
+    let m = MeteringDelta {
+        key_id: key_id.clone(),
+        bucket: BUCKET,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: 10,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: String::new(),
+        pricing_version: "v".into(),
+        priced_from_ms: 0,
+        usage_units: Default::default(),
+    };
+    let id = op();
+    old_row(
+        id,
+        format!("add_metering_batch:{:?}", std::slice::from_ref(&m)),
+    );
+    s.add_metering_op(id, &m).expect("an older body replays");
+    let other = MeteringDelta {
+        tokens_input: 11,
+        ..m.clone()
+    };
+    assert_eq!(s.add_metering_op(id, &other), Err(OpRefused::Conflict));
+    assert!(s
+        .list_metering(BUCKET)
+        .expect("read")
+        .iter()
+        .all(|r| r.key_id != key_id));
+
+    // Plane-record append (the older build recorded the owned record).
+    let parent = format!("{ns}-chain");
+    let rec = |hash: &str| PlaneRecord {
+        kind: "call".into(),
+        id: parent.clone(),
+        parent: Some(parent.clone()),
+        seq: 1,
+        ts: 1,
+        disposition: PlaneDisposition::Active,
+        body: format!("{{\"hash\":\"{hash}\"}}").into_bytes(),
+    };
+    let id = op();
+    old_row(id, format!("append_plane_record:{:?}", rec("one")));
+    s.append_plane_record_op(id, rec("one").view())
+        .expect("an older body replays");
+    assert_eq!(
+        s.append_plane_record_op(id, rec("two").view()),
+        Err(OpRefused::Conflict)
+    );
+    let n: i64 = s
+        .lock()
+        .query_one(
+            "SELECT count(*) FROM plane_chain WHERE kind = 'call' AND parent = $1",
+            &[&parent],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(n, 0, "the replay and the conflict applied nothing");
 }
 
 /// The journal, sessions and kernel-held records.

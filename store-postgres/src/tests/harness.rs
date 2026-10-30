@@ -15,7 +15,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use busbar_contract::abi::sdk::store::{OpRefused, StoreSlots};
 use busbar_contract::abi::store::OpId;
 use busbar_contract::kinds::RecordBytes;
-use busbar_contract::records::{PlaneRecordRef, UsageDelta};
+use busbar_contract::records::{MeteringDelta, PlaneRecordRef, UsageDelta};
 use busbar_contract::services::{
     Caller, DiskDest, HookAsk, HostServices, Later, NestAsk, Ran, Reading, RecordsList, Snapshot,
     Stored, UNSERVED,
@@ -247,6 +247,11 @@ impl TestStore {
     ) -> Result<(), OpRefused> {
         let cells = [(bucket, window_start, delta.clone())];
         block_on(StoreCalls::add_usage_batch(&self.store, op, &cells)).map_err(op_refused)
+    }
+
+    pub(crate) fn add_metering_op(&self, op: OpId, delta: &MeteringDelta) -> Result<(), OpRefused> {
+        let deltas = [delta.clone()];
+        block_on(StoreCalls::add_metering_batch(&self.store, op, &deltas)).map_err(op_refused)
     }
 
     pub(crate) fn append_plane_record_op(
