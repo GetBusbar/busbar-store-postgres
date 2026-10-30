@@ -1882,20 +1882,52 @@ impl Session {
                  tokens_cache_write = {},
                  requests           = {},
                  billable_requests  = {}",
-            sat_add("usage_metering.tokens_input", "EXCLUDED.tokens_input", false),
-            sat_add("usage_metering.tokens_output", "EXCLUDED.tokens_output", false),
-            sat_add("usage_metering.tokens_cache_read", "EXCLUDED.tokens_cache_read", false),
-            sat_add("usage_metering.tokens_cache_write", "EXCLUDED.tokens_cache_write", false),
+            sat_add(
+                "usage_metering.tokens_input",
+                "EXCLUDED.tokens_input",
+                false
+            ),
+            sat_add(
+                "usage_metering.tokens_output",
+                "EXCLUDED.tokens_output",
+                false
+            ),
+            sat_add(
+                "usage_metering.tokens_cache_read",
+                "EXCLUDED.tokens_cache_read",
+                false
+            ),
+            sat_add(
+                "usage_metering.tokens_cache_write",
+                "EXCLUDED.tokens_cache_write",
+                false
+            ),
             sat_add("usage_metering.requests", "EXCLUDED.requests", false),
-            sat_add("usage_metering.billable_requests", "EXCLUDED.billable_requests", false),
+            sat_add(
+                "usage_metering.billable_requests",
+                "EXCLUDED.billable_requests",
+                false
+            ),
         );
         tx.execute(
             &meter_sql,
             &[
-                &d.key_id, &bucket, &d.model, &d.provider, &ti, &to, &tcr, &tcw, &requests,
-                &brequests, &d.key_group_at_use, &d.pricing_version, &priced_from,
+                &d.key_id,
+                &bucket,
+                &d.model,
+                &d.provider,
+                &ti,
+                &to,
+                &tcr,
+                &tcw,
+                &requests,
+                &brequests,
+                &d.key_group_at_use,
+                &d.pricing_version,
+                &priced_from,
             ],
-        ).await
+        )
+        .await
         .store()?;
         // Every ledgered class the token columns do not hold, additive like them, in the SAME
         // transaction so a metering row never shows its tokens without its other classes.

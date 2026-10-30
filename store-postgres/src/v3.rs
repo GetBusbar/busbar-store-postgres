@@ -30,6 +30,7 @@ use busbar_contract::abi::host::conn::connector::{
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_OCTETS};
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::door::abi_str;
+use busbar_contract::abi::sdk::store::column::storable_i64;
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::wire::{drive_kept, Body};
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
@@ -124,6 +125,30 @@ fn failed(e: RecordStoreError) -> OpRefused {
     OpRefused::Failed(e.0)
 }
 
+fn refused(e: RecordStoreError) -> OpRefused {
+    OpRefused::Refused(e.0)
+}
+
+/// An apply error the server decided from the values (SQLSTATE class 22 data exception, 23
+/// integrity constraint; the text leads with its code, `render_pg_error`) is a refusal: the
+/// transaction rolled back and a retry of the same values fails the same way. Anything else
+/// (a deadlock, a serialization failure, the chain fork) stays `Failed`.
+fn decided(r: OpRefused) -> OpRefused {
+    match r {
+        OpRefused::Failed(t) if decided_text(&t) => OpRefused::Refused(t),
+        other => other,
+    }
+}
+
+/// `t` leads with a five-character SQLSTATE of class 22 or 23, then `: `.
+fn decided_text(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() > 6
+        && matches!(&b[..2], b"22" | b"23")
+        && b[2..5].iter().all(u8::is_ascii_alphanumeric)
+        && &b[5..7] == b": "
+}
+
 /// Claim `op` for `body` (its [`Dedupe::body_hex`]) inside `tx`: insert its row (`None`), or read
 /// the body a committed call recorded.
 async fn claim(tx: &mut Transaction<'_>, op: OpId, body: &str) -> Result<Option<String>, String> {
@@ -189,7 +214,7 @@ impl Session {
             .map_err(|e| OpRefused::Failed(pg(e)))?;
         let found = claim(&mut tx, op, body).await.map_err(OpRefused::Failed)?;
         if found.is_none() {
-            apply(&mut tx).await?;
+            apply(&mut tx).await.map_err(decided)?;
             tx.commit().await.map_err(|e| OpRefused::Failed(pg(e)))?;
         }
         Ok(found)
@@ -201,6 +226,9 @@ impl Session {
         body: &str,
         record: &busbar_contract::records::PlaneRecord,
     ) -> OpResult<Option<String>> {
+        // Decided before BEGIN: a seq or ts the column cannot hold is refused, nothing written.
+        storable_i64("append_plane_record", "seq", record.seq).map_err(refused)?;
+        storable_i64("append_plane_record", "ts", record.ts).map_err(refused)?;
         self.deduped(op, body, async |tx| {
             if Session::append_plane_record_in(tx, record)
                 .await
@@ -314,6 +342,10 @@ impl Session {
         body: &str,
         deltas: &[MeteringDelta],
     ) -> OpResult<Option<String>> {
+        for d in deltas {
+            storable_i64("add_metering_batch", "priced_from_ms", d.priced_from_ms)
+                .map_err(refused)?;
+        }
         self.deduped(op, body, async |tx| {
             for d in deltas {
                 Session::add_metering_in(tx, d).await.map_err(failed)?;
