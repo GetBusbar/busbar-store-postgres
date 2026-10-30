@@ -78,7 +78,7 @@ pub struct Config {
     pub options: Option<String>,
     pub ssl: SslMode,
     /// `connect_timeout` in milliseconds (whole seconds in the string, as the driver read it);
-    /// `None` = no bound of the store's own.
+    /// `None` = unset (the default bound); `Some(0)` = none.
     connect_timeout_ms: Option<u32>,
     target_session_attrs: SessionAttrs,
 }
