@@ -284,7 +284,7 @@ fn connect_timeout_is_whole_seconds() {
             .unwrap()
             .connect_timeout_ms
     };
-    assert_eq!((ms("5"), ms("0"), ms("-1")), (Some(5000), None, None));
+    assert_eq!((ms("5"), ms("0"), ms("-1")), (Some(5000), Some(0), Some(0)));
     let e = Config::parse("host=db user=u connect_timeout=soon").unwrap_err();
     assert!(e.to_string().contains("whole number of seconds"), "{e}");
 }
