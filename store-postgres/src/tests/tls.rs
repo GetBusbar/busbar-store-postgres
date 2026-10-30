@@ -597,7 +597,11 @@ fn allow_sends_no_sslrequest() {
     )))
     .expect_err("the fake server refuses the startup");
     assert!(e.contains("3D000"), "{e}");
-    assert_eq!(first.load(Ordering::SeqCst), 196_608, "a v3.0 startup, not an SSLRequest");
+    assert_eq!(
+        first.load(Ordering::SeqCst),
+        196_608,
+        "a v3.0 startup, not an SSLRequest"
+    );
 }
 
 /// `sslmode=prefer` against a server that answers `S` secures the connection.

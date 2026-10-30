@@ -126,26 +126,14 @@ fn sslmode_prefer_and_allow_parse() {
     }
 }
 
-/// A downgrade nobody asked for is refused: `prefer` and `allow` would fall back to plaintext
-/// silently, so they are errors that say what to use; `disable` is plaintext on request, and
-/// an ABSENT `sslmode` is plaintext too (documented in the README), not a refused request.
-/// The message never echoes the password.
+/// Each `sslmode` maps to its libpq behaviour: `disable` and `allow` are plaintext, `prefer` asks
+/// for TLS and takes plaintext on `N`, the `require` family insists. An ABSENT `sslmode` is
+/// plaintext too (documented in the README).
 #[test]
-fn sslmode_prefer_and_allow_are_refused_not_downgraded() {
-    for mode in ["prefer", "allow"] {
-        for dsn in [
-            format!("host=db user=u password=zq9pw sslmode={mode}"),
-            format!("postgres://u:zq9pw@db/d?sslmode={mode}"),
-        ] {
-            let e = Config::parse(&dsn).unwrap_err().to_string();
-            assert!(
-                e.contains(&format!("sslmode={mode} is not supported"))
-                    && e.contains("never falls back silently")
-                    && e.contains("verify-full")
-                    && !e.contains("zq9pw"),
-                "{dsn}: {e}"
-            );
-        }
+fn sslmode_values_map_to_their_modes() {
+    for (mode, want) in [("allow", SslMode::Plain), ("prefer", SslMode::Prefer)] {
+        let c = Config::parse(&format!("host=db user=u sslmode={mode}")).unwrap();
+        assert_eq!(c.ssl, want, "{mode}");
     }
     assert_eq!(
         Config::parse("host=db user=u sslmode=disable").unwrap().ssl,

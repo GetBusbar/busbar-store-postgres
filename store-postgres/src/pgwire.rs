@@ -29,14 +29,17 @@ use postgres_types::{FromSql, Kind, ToSql, Type};
 
 use busbar_contract::abi::sdk::store::wire::Wire;
 
-/// Whether the connection is secured (libpq's `sslmode`). `disable`, `allow` and `prefer` connect
-/// in plaintext; `require`,
-/// `verify-ca` and `verify-full` ask the server for TLS and secure the connection through the host
-/// (its trust anchors), refusing a server that declines.
+/// Whether the connection is secured (libpq's `sslmode`). `disable` and `allow` connect in
+/// plaintext (no SSLRequest); `prefer` asks the server for TLS and secures the connection when it
+/// accepts, without verifying its certificate, else goes on in plaintext; `require`, `verify-ca`
+/// and `verify-full` ask for TLS and secure the connection through the host (its trust anchors),
+/// refusing a server that declines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SslMode {
     /// Plaintext.
     Plain,
+    /// TLS (unverified) when the server accepts it, else plaintext.
+    Prefer,
     /// TLS, or no connection.
     Require,
 }
@@ -216,16 +219,10 @@ impl Config {
                 "options" => c.options = Some(v),
                 "sslmode" => {
                     c.ssl = match v.as_str() {
-                        "disable" => SslMode::Plain,
-                        // Refused rather than downgraded: these would try TLS or fall back to
-                        // plaintext silently, and the operator asked for neither outcome by name.
-                        m @ ("allow" | "prefer") => {
-                            return Err(config_err(format!(
-                                "sslmode={m} is not supported: this store never falls back \
-                                 silently; use require/verify-ca/verify-full for TLS or disable \
-                                 for plaintext"
-                            )));
-                        }
+                        // `allow` would try plaintext first and TLS on refusal; this store goes
+                        // straight to plaintext, as libpq does against a server that takes it.
+                        "disable" | "allow" => SslMode::Plain,
+                        "prefer" => SslMode::Prefer,
                         "require" | "verify-ca" | "verify-full" => SslMode::Require,
                         _ => {
                             return Err(config_err("invalid value for option `sslmode`"));
@@ -949,31 +946,50 @@ impl Client {
     }
 
     async fn handshake(&mut self, cfg: &Config, endpoint: &Endpoint) -> Result<(), Error> {
-        if cfg.ssl == SslMode::Require {
+        if cfg.ssl != SslMode::Plain {
             let mut out = BytesMut::new();
             frontend::ssl_request(&mut out);
             self.send(&out).await?;
             let answer = self.read_byte().await?;
-            if answer != b'S' {
+            if answer != b'S' && cfg.ssl == SslMode::Require {
                 return Err(Error::new(Kind_::Tls(
                     "server does not support TLS".to_string(),
                 )));
             }
-            // Anything the server sent after its `S` went out in the clear, and would be parsed
-            // after the upgrade as if the secured server had sent it (CVE-2021-23222, STARTTLS
-            // response injection). The host's guard sees only the wire's input, which this
-            // client's reads have already moved into its own buffer: the check is here.
-            if !self.buf.is_empty() {
+            if answer == b'S' {
+                self.upgrade(cfg, endpoint).await?;
+            } else if answer != b'N' {
                 return Err(Error::new(Kind_::Tls(
-                    "server sent unencrypted data after accepting TLS".to_string(),
+                    "unexpected answer to the SSLRequest".to_string(),
                 )));
             }
-            self.wire
-                .upgrade_secure(Some(&endpoint.name))
-                .await
-                .map_err(|e| Error::new(Kind_::Tls(e.to_string())))?;
         }
         self.startup(cfg).await?;
+        self.check_session_attrs(cfg).await
+    }
+
+    /// Secure the stream after the server's `S`: verified against the host's trust anchors for
+    /// `require` and up, unverified for `prefer` (libpq).
+    async fn upgrade(&mut self, cfg: &Config, endpoint: &Endpoint) -> Result<(), Error> {
+        // Anything the server sent after its `S` went out in the clear, and would be parsed
+        // after the upgrade as if the secured server had sent it (CVE-2021-23222, STARTTLS
+        // response injection). The host's guard sees only the wire's input, which this
+        // client's reads have already moved into its own buffer: the check is here.
+        if !self.buf.is_empty() {
+            return Err(Error::new(Kind_::Tls(
+                "server sent unencrypted data after accepting TLS".to_string(),
+            )));
+        }
+        let name = Some(endpoint.name.as_str());
+        let secured = if cfg.ssl == SslMode::Prefer {
+            self.wire.upgrade_secure_unverified(name).await
+        } else {
+            self.wire.upgrade_secure(name).await
+        };
+        secured.map_err(|e| Error::new(Kind_::Tls(e.to_string())))
+    }
+
+    async fn check_session_attrs(&mut self, cfg: &Config) -> Result<(), Error> {
         if cfg.target_session_attrs != SessionAttrs::Any {
             let row = self.query_one("SHOW transaction_read_only", &[]).await?;
             let read_only: &str = row.try_get(0)?;

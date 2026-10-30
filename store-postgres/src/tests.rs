@@ -1689,7 +1689,9 @@ fn a_held_op_does_not_block_a_second_op() {
         });
         let second = rx.recv_timeout(std::time::Duration::from_secs(5));
         holder.batch_execute("ROLLBACK").unwrap();
-        held.join().unwrap().expect("the held put_key finishes once released");
+        held.join()
+            .unwrap()
+            .expect("the held put_key finishes once released");
         assert!(
             matches!(second, Ok(Ok(None))),
             "a second op must run while the first is held: {second:?}"

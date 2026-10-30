@@ -21,8 +21,9 @@
 //!
 //! - `sslmode=require` / `verify-ca` / `verify-full` secure the connection through the host's
 //!   connector and ALWAYS verify the certificate and name (libpq's `require` would not); a server
-//!   answering the `SSLRequest` with `N` fails the load. `disable`, `allow` and `prefer` connect in
-//!   plaintext.
+//!   answering the `SSLRequest` with `N` fails the load. `disable` and `allow` connect in plaintext
+//!   (no `SSLRequest`); `prefer` sends the `SSLRequest`, secures the connection WITHOUT verifying the
+//!   certificate on `S` and goes on in plaintext on `N` (libpq).
 //! - No partitioning, LISTEN/NOTIFY-accelerated hydration or column-level secret grants: all three
 //!   are internal and can be added without a schema bump.
 
