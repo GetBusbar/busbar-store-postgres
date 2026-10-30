@@ -386,7 +386,11 @@ fn a_snapshot_transaction_begins_repeatable_read() {
         begin_sql(Some(IsolationLevel::RepeatableRead)),
         "BEGIN ISOLATION LEVEL REPEATABLE READ"
     );
-    assert_eq!(begin_sql(None), "BEGIN");
+    assert_eq!(
+        begin_sql(None),
+        "BEGIN ISOLATION LEVEL READ COMMITTED",
+        "a DSN's default_transaction_isolation must not change the store's reasoning"
+    );
 }
 
 /// The connection's prepared statements stay bounded: past `STATEMENTS_KEPT` the least recently
