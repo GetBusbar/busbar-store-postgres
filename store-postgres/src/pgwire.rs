@@ -909,7 +909,7 @@ impl Client {
     /// One endpoint's connect: dial, secure, authenticate, check the session's kind.
     async fn attempt(wire: &Wire, cfg: &Config, endpoint: &Endpoint) -> Result<Client, Error> {
         // `connect_timeout` bounds a NEW connection's dial (the connector's own timeout for it) and
-        // its handshake (`Wire::bound`); never the wait for the instance's one kept connection,
+        // its handshake (`Wire::bound`); never the wait for one of the instance's kept connections,
         // which another op may hold for as long as its statement runs.
         let ms = cfg.connect_timeout_ms.unwrap_or(0);
         wire.connect_timed(0, Some(&target(&endpoint.dial, endpoint.port)), ms)
