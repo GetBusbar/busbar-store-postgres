@@ -114,7 +114,29 @@ fn inert(key: &str, value: &str, why: &str) {
     tracing::debug!("postgres connection option {key}={value} has no effect: {why}");
 }
 
+/// Server-side bounds the store asks for at startup unless the DSN's `options` set them: a peer
+/// stalled while holding a lock (the `store_revision` row, say) must not block the fleet forever.
+const DEFAULT_SERVER_SETTINGS: [(&str, &str); 2] = [
+    ("lock_timeout", "30s"),
+    ("idle_in_transaction_session_timeout", "60s"),
+];
+
 impl Config {
+    /// The startup `options` value: the DSN's, plus each of [`DEFAULT_SERVER_SETTINGS`] it does not
+    /// name.
+    fn startup_options(&self) -> Option<String> {
+        let mut out = self.options.clone().unwrap_or_default();
+        for (name, value) in DEFAULT_SERVER_SETTINGS {
+            if !out.contains(name) {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(&format!("-c {name}={value}"));
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
     /// Parse a libpq connection string: `postgres[ql]://user:pass@host:port/db?key=value&...` or
     /// `host=... port=... user=... password=... dbname=... sslmode=...`.
     ///
@@ -1017,7 +1039,8 @@ impl Client {
         if let Some(db) = &cfg.dbname {
             params.push(("database", db));
         }
-        if let Some(o) = &cfg.options {
+        let options = cfg.startup_options();
+        if let Some(o) = &options {
             params.push(("options", o));
         }
         if let Some(a) = &cfg.application_name {
@@ -1457,12 +1480,12 @@ impl Client {
         }
     }
 
-    /// Begin a transaction (the server's default isolation, READ COMMITTED).
+    /// Begin a READ COMMITTED transaction.
     ///
     /// # Errors
     /// The `BEGIN`'s failure.
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
-        self.batch_execute("BEGIN").await?;
+        self.batch_execute(begin_sql(None)).await?;
         Ok(Transaction {
             client: self,
             done: false,
@@ -1489,11 +1512,12 @@ pub enum IsolationLevel {
     RepeatableRead,
 }
 
-/// The statement that begins a transaction at `isolation` (`None` = the server's default).
+/// The statement that begins a transaction at `isolation` (`None` = READ COMMITTED, stated, so a
+/// DSN's `default_transaction_isolation` cannot change what the store's statements assume).
 #[must_use]
 pub fn begin_sql(isolation: Option<IsolationLevel>) -> &'static str {
     match isolation {
-        None => "BEGIN",
+        None => "BEGIN ISOLATION LEVEL READ COMMITTED",
         Some(IsolationLevel::RepeatableRead) => "BEGIN ISOLATION LEVEL REPEATABLE READ",
     }
 }
