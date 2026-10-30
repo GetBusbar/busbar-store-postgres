@@ -122,6 +122,11 @@ const DEFAULT_SERVER_SETTINGS: [(&str, &str); 2] = [
 ];
 
 impl Config {
+    /// The bound on a new connection's dial and handshake, in milliseconds (0 = none).
+    fn connect_bound_ms(&self) -> u32 {
+        self.connect_timeout_ms.unwrap_or(0)
+    }
+
     /// The startup `options` value: the DSN's, plus each of [`DEFAULT_SERVER_SETTINGS`] it does not
     /// name.
     fn startup_options(&self) -> Option<String> {
@@ -930,7 +935,7 @@ impl Client {
         // `connect_timeout` bounds a NEW connection's dial (the connector's own timeout for it) and
         // its handshake (`Wire::bound`); never the wait for one of the instance's kept connections,
         // which another op may hold for as long as its statement runs.
-        let ms = cfg.connect_timeout_ms.unwrap_or(0);
+        let ms = cfg.connect_bound_ms();
         wire.connect_timed(0, Some(&target(&endpoint.dial, endpoint.port)), ms)
             .await
             .map_err(Error::connect)?;

@@ -289,6 +289,17 @@ fn connect_timeout_is_whole_seconds() {
     assert!(e.to_string().contains("whole number of seconds"), "{e}");
 }
 
+/// A DSN without `connect_timeout` still bounds the handshake (30 s); the DSN's value wins, and 0
+/// is the explicit "no bound".
+#[test]
+fn an_unset_connect_timeout_defaults_to_thirty_seconds() {
+    let bound = |dsn: &str| Config::parse(dsn).unwrap().connect_bound_ms();
+    assert_eq!(bound("host=db user=u"), 30_000);
+    assert_eq!(bound("host=db user=u connect_timeout=5"), 5_000);
+    assert_eq!(bound("host=db user=u connect_timeout=0"), 0);
+    assert_eq!(bound("host=db user=u connect_timeout=-1"), 0);
+}
+
 /// D26 (RED before: the unparsed fragment was echoed): a configuration error never repeats a
 /// token of the string that is not a well-formed `key=`, because a password with a space, a `?`
 /// or a missing `user:` prefix splits there and its tail would be echoed; an unknown option's
