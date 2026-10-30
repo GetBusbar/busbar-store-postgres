@@ -146,6 +146,80 @@ fn an_op_id_dedupes_durably_across_a_reconnect() {
     clear(&b);
 }
 
+/// S5: a value decided before commit (one a column cannot hold, or a data/integrity error the
+/// server raises) is REFUSED, nothing recorded; the same `op_id` with a valid record applies.
+#[test]
+fn a_write_refused_before_commit_answers_refused_and_records_nothing() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let parent = format!("{ns}-refused");
+    let rec = |seq: u64| PlaneRecord {
+        kind: "refusedkind".into(),
+        id: parent.clone(),
+        parent: Some(parent.clone()),
+        seq,
+        ts: 5_000_000_000,
+        disposition: PlaneDisposition::Active,
+        body: b"{}".to_vec(),
+    };
+    let id = op();
+    assert!(matches!(
+        s.append_plane_record_op(id, rec(u64::MAX).view()),
+        Err(OpRefused::Refused(_))
+    ));
+    let recorded: i64 = s
+        .lock()
+        .query_one("SELECT COUNT(*) FROM store_ops WHERE op_id = $1", &[&&id.0[..]])
+        .unwrap()
+        .get(0);
+    assert_eq!(recorded, 0, "a refused op records nothing");
+    s.append_plane_record_op(id, rec(1).view())
+        .expect("the same op_id with a valid record applies");
+    s.lock()
+        .execute("DELETE FROM plane_chain WHERE kind = 'refusedkind'", &[])
+        .unwrap();
+
+    let mut meter = MeteringDelta {
+        key_id: format!("{ns}-k"),
+        bucket: 1,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: "g".into(),
+        pricing_version: "v".into(),
+        priced_from_ms: u64::MAX,
+        usage_units: Default::default(),
+    };
+    assert!(matches!(
+        s.add_metering_op(op(), &meter),
+        Err(OpRefused::Refused(_))
+    ));
+    meter.priced_from_ms = 0;
+    meter.bucket = 4_000_000_000_000_002;
+    s.add_metering_op(op(), &meter).expect("a valid delta applies");
+
+    // A NUL in a text value: the server's data exception (class 22) mid-apply, rolled back.
+    let delta = UsageDelta {
+        requests: 1,
+        ..Default::default()
+    };
+    let nul = op();
+    assert!(matches!(
+        s.add_usage_op(nul, &format!("{ns}\0b"), 4_000_000_000_000_003, &delta),
+        Err(OpRefused::Refused(_))
+    ));
+    s.add_usage_op(nul, &format!("{ns}-b"), 4_000_000_000_000_003, &delta)
+        .expect("a refused op was not recorded");
+}
+
 /// A new op records its body as the SDK's digest (64 hex digits), not a `{:?}` dump.
 #[test]
 fn a_new_op_records_its_digest() {
