@@ -786,7 +786,7 @@ fn a_startup_refusal_moves_on_to_the_next_endpoint() {
     let (host, port) = live_endpoint(&url);
     let dsn = dsn_at(&url, &[("127.0.0.1", starting), (&host, port)], "");
     open_loaded(&settings_of(&dsn)).expect("the second endpoint accepted the connection");
-    // All endpoints refusing: the LAST refusal is the error (the driver's).
+    // All endpoints refusing: every endpoint's failure is in the error, host and port named.
     let a = fake_server(|mut s| {
         if read_startup(&mut s).is_ok() {
             let _ = s.write_all(&fatal("57P03", "first starting up"));
@@ -802,9 +802,10 @@ fn a_startup_refusal_moves_on_to_the_next_endpoint() {
     )))
     .expect_err("every endpoint refused");
     assert!(
-        e.contains("53300") && !e.contains("57P03"),
-        "the last error: {e}"
+        e.contains(&format!("127.0.0.1:{a}: 57P03")) && e.contains(&format!("127.0.0.1:{b}: 53300")),
+        "every endpoint's error: {e}"
     );
+    assert!(!e.contains("zq9pw"), "{e}");
 }
 
 /// D10 (RED before: `target_session_attrs` was ignored): `read-write` refuses a server that is
