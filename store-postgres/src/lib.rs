@@ -683,6 +683,16 @@ fn row_to_key(r: &Row) -> VirtualKey {
     }
 }
 
+/// `a + b` in SQL, pinned at `i64::MAX` instead of failing 22003 (rule 8); `floor` also keeps it >= 0.
+fn sat_add(a: &str, b: &str, floor: bool) -> String {
+    let sum = format!("LEAST(9223372036854775807, ({a})::numeric + ({b})::numeric)");
+    if floor {
+        format!("GREATEST(0, {sum})::bigint")
+    } else {
+        format!("({sum})::bigint")
+    }
+}
+
 const KEY_COLUMNS: &str = "id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,idp_subject,binding_mode,minted_by,allowed_scopes_by_kind,idp_provider";
 
 fn secret_form_to_storage(f: SecretForm) -> &'static str {
@@ -1695,12 +1705,17 @@ impl Session {
         delta: &UsageDelta,
     ) -> RecordStoreResult<()> {
         let ws = clamp(window_start);
-        tx.execute(
+        let window_sql = format!(
             "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
              VALUES ($1,$2,GREATEST(0,$3::bigint),GREATEST(0,$4::bigint))
              ON CONFLICT (bucket_id, window_start) DO UPDATE SET
-                requests = GREATEST(0, usage_windows.requests + $3::bigint),
-                billable_requests = GREATEST(0, usage_windows.billable_requests + $4::bigint)",
+                requests = {},
+                billable_requests = {}",
+            sat_add("usage_windows.requests", "$3::bigint", true),
+            sat_add("usage_windows.billable_requests", "$4::bigint", true),
+        );
+        tx.execute(
+            &window_sql,
             &[&bucket_id, &ws, &delta.requests, &delta.billable_requests],
         )
         .await
@@ -1730,13 +1745,17 @@ impl Session {
                 .collect();
             let mut ensure =
                 String::from("INSERT INTO usage_ledger (bucket_id, window_start, model) VALUES ");
-            let mut update = String::from(
+            let mut update = format!(
                 "UPDATE usage_ledger u SET \
-                    tokens_input       = GREATEST(0, u.tokens_input + v.di), \
-                    tokens_output      = GREATEST(0, u.tokens_output + v.do_), \
-                    tokens_cache_read  = GREATEST(0, u.tokens_cache_read + v.dcr), \
-                    tokens_cache_write = GREATEST(0, u.tokens_cache_write + v.dcw) \
+                    tokens_input       = {}, \
+                    tokens_output      = {}, \
+                    tokens_cache_read  = {}, \
+                    tokens_cache_write = {} \
                  FROM (VALUES ",
+                sat_add("u.tokens_input", "v.di", true),
+                sat_add("u.tokens_output", "v.do_", true),
+                sat_add("u.tokens_cache_read", "v.dcr", true),
+                sat_add("u.tokens_cache_write", "v.dcw", true),
             );
             let mut ensure_params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(2 + models.len());
             let mut update_params: Vec<&(dyn ToSql + Sync)> =
@@ -1788,8 +1807,9 @@ impl Session {
                 let mut ensure = String::from(
                     "INSERT INTO usage_ledger_units (bucket_id, window_start, model, unit) VALUES ",
                 );
-                let mut update = String::from(
-                    "UPDATE usage_ledger_units u SET count = GREATEST(0, u.count + v.d) FROM (VALUES ",
+                let mut update = format!(
+                    "UPDATE usage_ledger_units u SET count = {} FROM (VALUES ",
+                    sat_add("u.count", "v.d", true)
                 );
                 let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
                     Vec::with_capacity(2 + opens.len() * 2);
@@ -1850,18 +1870,27 @@ impl Session {
         // `priced_from_ms` is part of the accrual key: a rate-card edit inside the
         // UTC day opens a SECOND row for that day so each half keeps the card it was earned under,
         // rather than folding counts earned under two prices into one row readable against one.
-        tx.execute(
+        let meter_sql = format!(
             "INSERT INTO usage_metering (key_id, bucket, model, provider,
                  tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
                  requests, billable_requests, key_group_at_use, pricing_version, priced_from_ms)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
              ON CONFLICT (key_id, bucket, model, provider, priced_from_ms) DO UPDATE SET
-                 tokens_input       = usage_metering.tokens_input + EXCLUDED.tokens_input,
-                 tokens_output      = usage_metering.tokens_output + EXCLUDED.tokens_output,
-                 tokens_cache_read  = usage_metering.tokens_cache_read + EXCLUDED.tokens_cache_read,
-                 tokens_cache_write = usage_metering.tokens_cache_write + EXCLUDED.tokens_cache_write,
-                 requests           = usage_metering.requests + EXCLUDED.requests,
-                 billable_requests  = usage_metering.billable_requests + EXCLUDED.billable_requests",
+                 tokens_input       = {},
+                 tokens_output      = {},
+                 tokens_cache_read  = {},
+                 tokens_cache_write = {},
+                 requests           = {},
+                 billable_requests  = {}",
+            sat_add("usage_metering.tokens_input", "EXCLUDED.tokens_input", false),
+            sat_add("usage_metering.tokens_output", "EXCLUDED.tokens_output", false),
+            sat_add("usage_metering.tokens_cache_read", "EXCLUDED.tokens_cache_read", false),
+            sat_add("usage_metering.tokens_cache_write", "EXCLUDED.tokens_cache_write", false),
+            sat_add("usage_metering.requests", "EXCLUDED.requests", false),
+            sat_add("usage_metering.billable_requests", "EXCLUDED.billable_requests", false),
+        );
+        tx.execute(
+            &meter_sql,
             &[
                 &d.key_id, &bucket, &d.model, &d.provider, &ti, &to, &tcr, &tcw, &requests,
                 &brequests, &d.key_group_at_use, &d.pricing_version, &priced_from,
@@ -1896,10 +1925,11 @@ impl Session {
                 params.push(*unit);
                 params.push(count);
             }
-            sql.push_str(
+            sql.push_str(&format!(
                 " ON CONFLICT (key_id, bucket, model, provider, priced_from_ms, unit) DO UPDATE SET \
-                 count = usage_metering_units.count + EXCLUDED.count",
-            );
+                 count = {}",
+                sat_add("usage_metering_units.count", "EXCLUDED.count", false)
+            ));
             tx.execute(&sql, &params).await.store()?;
         }
         Ok(())
