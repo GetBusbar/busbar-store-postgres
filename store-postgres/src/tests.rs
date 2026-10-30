@@ -1494,6 +1494,77 @@ fn migrate_bootstraps_fresh_database() {
     drop(check);
 }
 
+/// Schema v13 drops the pre-release money/journal tables and their `op_id` rows (README); the kept
+/// slots' rows and every other table survive.
+#[test]
+fn the_v13_upgrade_drops_the_money_and_dead_slot_tables() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_v13");
+    let iso_url = tmp.url();
+    drop(connect_store_with_retry(&iso_url).expect("fresh open"));
+    {
+        let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+        c.batch_execute(
+            "CREATE TABLE money_slots (slot TEXT PRIMARY KEY);
+             CREATE TABLE money_slices (slot TEXT);
+             CREATE TABLE money_epoch (epoch BIGINT);
+             CREATE TABLE store_journal (stream TEXT);
+             CREATE TABLE store_sessions (session TEXT);
+             INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES
+                 ('\\x01', 'reserve:cells', '', 1),
+                 ('\\x02', 'append_batch:x', '', 1),
+                 ('\\x03', 'add_usage_batch:x', '', 1),
+                 ('\\x04', 'add_metering_batch:x', '', 1),
+                 ('\\x05', 'append_plane_record:x', '', 1),
+                 ('\\x06', 'abcdef0123', '', 1);
+             INSERT INTO store_records (schema_id, key, value) VALUES ('s', '\\x01', '\\x02');
+             DELETE FROM busbar_schema;
+             INSERT INTO busbar_schema (version) VALUES (12);",
+        )
+        .unwrap();
+    }
+    drop(connect_store_with_retry(&iso_url).expect("v12 upgrade"));
+    let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+    for t in [
+        "money_slots",
+        "money_slices",
+        "money_epoch",
+        "store_journal",
+        "store_sessions",
+    ] {
+        let there: bool = c
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[&t])
+            .unwrap()
+            .get(0);
+        assert!(!there, "{t} must be dropped by the v13 upgrade");
+    }
+    let kept: Vec<String> = c
+        .query("SELECT body FROM store_ops ORDER BY body", &[])
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            "abcdef0123",
+            "add_metering_batch:x",
+            "add_usage_batch:x",
+            "append_plane_record:x"
+        ]
+    );
+    let records: i64 = c
+        .query_one("SELECT COUNT(*) FROM store_records", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(records, 1);
+    let version: i64 = c
+        .query_one("SELECT MAX(version) FROM busbar_schema", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(version, SCHEMA_VERSION);
+}
+
 /// A database stamped ABOVE this build is refused at open, with the reason: an older binary would
 /// ignore newer rules (the epoch fence among them). An equal version still opens.
 #[test]
