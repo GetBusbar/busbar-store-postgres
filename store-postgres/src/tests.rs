@@ -1731,6 +1731,28 @@ fn revision_zero_rows_are_in_every_delta() {
     hard_reset(&store, &id);
 }
 
+/// Re-minting a revoked slot is a new credential: its `created_at` is the new mint's.
+#[test]
+fn re_minting_a_revoked_slot_takes_the_new_created_at() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let id = format!("vk_remint_{}", unique_suffix());
+    hard_reset(&store, &id);
+    store.put_key(&sample_key(&id)).unwrap();
+    let mut first = sample_cred(&id, 0, &format!("AKIA_RM1_{id}"));
+    first.meta.created_at = 100;
+    store.put_credential(&first).unwrap();
+    store.revoke_credential(&first.meta.id, "rotated").unwrap();
+    let mut second = sample_cred(&id, 0, &format!("AKIA_RM2_{id}"));
+    second.meta.created_at = 500;
+    second.meta.updated_at = 500;
+    store.put_credential(&second).unwrap();
+    let got = store.list_credentials(&id).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].created_at, 500, "not the predecessor's 100");
+    hard_reset(&store, &id);
+}
+
 /// A database stamped ABOVE this build is refused at open, with the reason: an older binary would
 /// ignore newer rules (the epoch fence among them). An equal version still opens.
 #[test]
