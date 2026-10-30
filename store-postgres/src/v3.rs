@@ -330,8 +330,12 @@ impl Session {
         body: &str,
         cells: &[(String, u64, UsageDelta)],
     ) -> OpResult<Option<String>> {
+        // Key order, whatever the caller's: two nodes' overlapping batches then lock rows in one
+        // order and cannot deadlock (40P01). Stable, so a repeated cell keeps its order.
+        let mut ordered: Vec<&(String, u64, UsageDelta)> = cells.iter().collect();
+        ordered.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
         self.deduped(op, body, async |tx| {
-            for (bucket, window, delta) in cells {
+            for (bucket, window, delta) in ordered {
                 Session::add_usage_in(tx, bucket, *window, delta)
                     .await
                     .map_err(failed)?;
@@ -351,8 +355,11 @@ impl Session {
             storable_i64("add_metering_batch", "priced_from_ms", d.priced_from_ms)
                 .map_err(refused)?;
         }
+        // Primary-key order, as the usage batch (stable).
+        let mut ordered: Vec<&MeteringDelta> = deltas.iter().collect();
+        ordered.sort_by_key(|d| (&d.key_id, d.bucket, &d.model, &d.provider, d.priced_from_ms));
         self.deduped(op, body, async |tx| {
-            for d in deltas {
+            for d in ordered {
                 Session::add_metering_in(tx, d).await.map_err(failed)?;
             }
             Ok(())
