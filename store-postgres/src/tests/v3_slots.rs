@@ -172,7 +172,10 @@ fn a_write_refused_before_commit_answers_refused_and_records_nothing() {
     ));
     let recorded: i64 = s
         .lock()
-        .query_one("SELECT COUNT(*) FROM store_ops WHERE op_id = $1", &[&&id.0[..]])
+        .query_one(
+            "SELECT COUNT(*) FROM store_ops WHERE op_id = $1",
+            &[&&id.0[..]],
+        )
         .unwrap()
         .get(0);
     assert_eq!(recorded, 0, "a refused op records nothing");
@@ -204,7 +207,8 @@ fn a_write_refused_before_commit_answers_refused_and_records_nothing() {
     ));
     meter.priced_from_ms = 0;
     meter.bucket = 4_000_000_000_000_002;
-    s.add_metering_op(op(), &meter).expect("a valid delta applies");
+    s.add_metering_op(op(), &meter)
+        .expect("a valid delta applies");
 
     // A NUL in a text value: the server's data exception (class 22) mid-apply, rolled back.
     let delta = UsageDelta {
