@@ -1679,7 +1679,8 @@ impl Session {
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,NULL,$11)
                  ON CONFLICT (key_id, kind, slot) DO UPDATE SET
                     id=EXCLUDED.id, public_id=EXCLUDED.public_id, secret=EXCLUDED.secret,
-                    secret_form=EXCLUDED.secret_form, updated_at=EXCLUDED.updated_at,
+                    secret_form=EXCLUDED.secret_form, created_at=EXCLUDED.created_at,
+                    updated_at=EXCLUDED.updated_at,
                     expires_at=EXCLUDED.expires_at, revoked_at=NULL, revoke_reason=NULL,
                     revision=EXCLUDED.revision
                  WHERE credentials.revoked_at IS NOT NULL",
