@@ -224,6 +224,70 @@ fn a_write_refused_before_commit_answers_refused_and_records_nothing() {
         .expect("a refused op was not recorded");
 }
 
+/// A batch applies its cells and deltas in key order whatever the caller's order, so two nodes
+/// writing overlapping batches take row locks in one order (no 40P01). Fresh heap rows land in
+/// application order, which `ctid` shows.
+#[test]
+fn a_batch_applies_in_key_order() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let tmp = super::TempDb::create(&url, "spg_order");
+    let s = store(&tmp.url());
+    let delta = UsageDelta {
+        requests: 1,
+        ..Default::default()
+    };
+    let cells = [
+        ("b2", 5, delta.clone()),
+        ("b1", 5, delta.clone()),
+        ("b1", 3, delta.clone()),
+    ];
+    s.add_usage_batch_op(op(), &cells).expect("applied");
+    let order: Vec<(String, i64)> = s
+        .lock()
+        .query(
+            "SELECT bucket_id, window_start FROM usage_windows ORDER BY ctid",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(
+        order,
+        [("b1".to_string(), 3), ("b1".to_string(), 5), ("b2".to_string(), 5)]
+    );
+
+    let m = |key: &str, model: &str| MeteringDelta {
+        key_id: key.into(),
+        bucket: 7,
+        model: model.into(),
+        provider: "p".into(),
+        tokens_input: 1,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: "g".into(),
+        pricing_version: "v".into(),
+        priced_from_ms: 0,
+        usage_units: Default::default(),
+    };
+    let deltas = [m("k2", "a"), m("k1", "b"), m("k1", "a")];
+    s.add_metering_batch_op(op(), &deltas).expect("applied");
+    let order: Vec<(String, String)> = s
+        .lock()
+        .query("SELECT key_id, model FROM usage_metering ORDER BY ctid", &[])
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    let want = |k: &str, m: &str| (k.to_string(), m.to_string());
+    assert_eq!(order, [want("k1", "a"), want("k1", "b"), want("k2", "a")]);
+}
+
 /// A new op records its body as the SDK's digest (64 hex digits), not a `{:?}` dump.
 #[test]
 fn a_new_op_records_its_digest() {

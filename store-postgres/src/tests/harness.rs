@@ -248,6 +248,22 @@ impl TestStore {
         block_on(StoreCalls::add_usage_batch(&self.store, op, &cells)).map_err(op_refused)
     }
 
+    pub(crate) fn add_usage_batch_op(
+        &self,
+        op: OpId,
+        cells: &[(&str, u64, UsageDelta)],
+    ) -> Result<(), OpRefused> {
+        block_on(StoreCalls::add_usage_batch(&self.store, op, cells)).map_err(op_refused)
+    }
+
+    pub(crate) fn add_metering_batch_op(
+        &self,
+        op: OpId,
+        deltas: &[MeteringDelta],
+    ) -> Result<(), OpRefused> {
+        block_on(StoreCalls::add_metering_batch(&self.store, op, deltas)).map_err(op_refused)
+    }
+
     pub(crate) fn add_metering_op(&self, op: OpId, delta: &MeteringDelta) -> Result<(), OpRefused> {
         let deltas = [delta.clone()];
         block_on(StoreCalls::add_metering_batch(&self.store, op, &deltas)).map_err(op_refused)
