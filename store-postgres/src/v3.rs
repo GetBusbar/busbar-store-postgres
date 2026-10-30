@@ -71,12 +71,19 @@ pub const NEEDS: &[Need] = &[Need {
     deny_response_headers_len: 0,
 }];
 
+// `url` is reference-capable, not secret: a `{env:}`/`{file:}`/`{module:}` reference resolves in
+// place (a 1.5.5 `url: {env: VAR}` keeps booting) and a literal passes as written.
+busbar_contract::statement_extensions!(EXTENSIONS: [
+    (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
+]);
+
 busbar_contract::store_door!(
     PostgresStore,
     NAME,
     env!("CARGO_PKG_VERSION"),
     64,
-    needs: NEEDS
+    needs: NEEDS,
+    extensions: EXTENSIONS
 );
 
 /// Run one op on the instance's kept connection (a fresh one when none is kept): open the session
