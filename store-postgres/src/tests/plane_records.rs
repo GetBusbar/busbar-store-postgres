@@ -494,6 +494,27 @@ fn listing_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
     reset(&reopened, "task", &ids);
 }
 
+/// Deleting a task takes its event chain with it (as the purge does): no `task_event` row is left
+/// with the task as its parent.
+#[test]
+fn deleting_a_task_deletes_its_event_chain() {
+    let Some(url) = live_url() else { return };
+    let t = "t_delete_chain_1";
+    let store = connect_store_with_retry(&url).expect("connect");
+    reset(&store, "task_event", &[t]);
+    reset(&store, "task", &[t]);
+    store
+        .upsert_plane_record(task(t, "working", LIVE_TS, PlaneDisposition::Active).view())
+        .unwrap();
+    for seq in 1..=2 {
+        store
+            .append_plane_record(event(t, seq, "task.working", "", "h").view())
+            .unwrap();
+    }
+    store.delete_plane_record("task", t).unwrap();
+    assert!(chain(&store, "task_event", t).is_empty(), "the chain went with its task");
+}
+
 /// The per-task provenance chain, read back after a reconnect. It never writes the task itself: an
 /// event and the first task write are independent write-throughs with no ordering between them, so
 /// appending an event for a task with no row yet has to WORK (no foreign key between the tables).
