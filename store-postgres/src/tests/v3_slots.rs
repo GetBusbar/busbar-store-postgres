@@ -256,7 +256,11 @@ fn a_batch_applies_in_key_order() {
         .collect();
     assert_eq!(
         order,
-        [("b1".to_string(), 3), ("b1".to_string(), 5), ("b2".to_string(), 5)]
+        [
+            ("b1".to_string(), 3),
+            ("b1".to_string(), 5),
+            ("b2".to_string(), 5)
+        ]
     );
 
     let m = |key: &str, model: &str| MeteringDelta {
@@ -279,7 +283,10 @@ fn a_batch_applies_in_key_order() {
     s.add_metering_batch_op(op(), &deltas).expect("applied");
     let order: Vec<(String, String)> = s
         .lock()
-        .query("SELECT key_id, model FROM usage_metering ORDER BY ctid", &[])
+        .query(
+            "SELECT key_id, model FROM usage_metering ORDER BY ctid",
+            &[],
+        )
         .unwrap()
         .iter()
         .map(|r| (r.get(0), r.get(1)))
