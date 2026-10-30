@@ -1669,6 +1669,35 @@ fn a_row_that_does_not_decode_is_an_error_not_a_panic() {
     assert!(err.0.contains("name"), "{err:?}");
 }
 
+/// An op held on the server (here waiting on the `store_revision` row lock) does not hold up a
+/// second op: the instance keeps more than one connection.
+#[test]
+fn a_held_op_does_not_block_a_second_op() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let mut holder = connect_client_with_retry(&url);
+    holder
+        .batch_execute("BEGIN; UPDATE store_revision SET revision = revision WHERE only_row")
+        .unwrap();
+    let id = format!("vk_held_{}", unique_suffix());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        let held = s.spawn(|| store.put_key(&sample_key(&id)));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        s.spawn(|| {
+            let _ = tx.send(store.get_key("vk_held_nothing_here"));
+        });
+        let second = rx.recv_timeout(std::time::Duration::from_secs(5));
+        holder.batch_execute("ROLLBACK").unwrap();
+        held.join().unwrap().expect("the held put_key finishes once released");
+        assert!(
+            matches!(second, Ok(Ok(None))),
+            "a second op must run while the first is held: {second:?}"
+        );
+    });
+    hard_reset(&store, &id);
+}
+
 /// A database stamped ABOVE this build is refused at open, with the reason: an older binary would
 /// ignore newer rules (the epoch fence among them). An equal version still opens.
 #[test]
