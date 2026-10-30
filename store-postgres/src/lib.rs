@@ -1302,7 +1302,7 @@ impl Session {
         self.lock()
             .execute(
                 "INSERT INTO denylist (sub, reason, created_at) VALUES ($1, $2, $3)
-                 ON CONFLICT (sub) DO UPDATE SET reason = EXCLUDED.reason",
+                 ON CONFLICT (sub) DO NOTHING",
                 &[&sub, &reason, &clamp(now_secs())],
             )
             .await
