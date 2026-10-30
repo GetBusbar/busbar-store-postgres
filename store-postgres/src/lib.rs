@@ -11,7 +11,8 @@
 //!
 //! ## Connections
 //!
-//! One kept connection ([`KEPT_CONNECTIONS`] = 1), so ops take turns on it. `open`'s connect step dials through the host (one declared `tcp` need), authenticates
+//! Up to [`KEPT_CONNECTIONS`] (8) kept connections, so a slow op does not hold up the others.
+//! `open`'s connect step dials through the host (one declared `tcp` need), authenticates
 //! (SCRAM-SHA-256, md5 or cleartext) and ensures the schema, so an unreachable or refusing server
 //! fails the load. A connection is kept only while its session is idle; one that failed or was left
 //! mid-transaction is closed and the next op connects afresh.
@@ -422,8 +423,8 @@ pub struct PostgresStore {
     shared: std::sync::Arc<Shared>,
 }
 
-/// How many connections an instance keeps: exactly one.
-pub const KEPT_CONNECTIONS: usize = 1;
+/// How many connections an instance keeps: at most eight (1.5.5's pool bound).
+pub const KEPT_CONNECTIONS: usize = 8;
 
 /// What every op of one instance shares.
 pub(crate) struct Shared {
@@ -433,8 +434,8 @@ pub(crate) struct Shared {
     pub(crate) secret: Option<String>,
     /// When this instance last swept `store_ops` past its retention (`v3`).
     pub(crate) ops_swept_at: AtomicU64,
-    /// The instance's kept connections: bounded at ONE (there is no pool setting). An op waits
-    /// for it while another holds it.
+    /// The instance's kept connections, bounded at [`KEPT_CONNECTIONS`] (there is no pool setting).
+    /// An op waits for one while all are held.
     pub(crate) pool: std::sync::Arc<busbar_contract::abi::sdk::store::wire::Pool>,
     /// The endpoint (an index into the DSN's list) that last connected: the next connect tries it
     /// first, so a failover DSN keeps asking for the kept connection's own endpoint.

@@ -13,7 +13,7 @@
 //! [`Dedupe::answer`] judges a replay or a conflict. A failed op rolls its row back with its
 //! effect. Rows are kept [`OP_ID_RETENTION_SECS`] and swept at most once a minute per instance.
 //!
-//! CONNECTIONS: every slot runs on the instance's ONE kept connection over the host's connector, as
+//! CONNECTIONS: every slot runs on one of the instance's kept connections over the host's connector, as
 //! straight-line async code by the store SDK's `wire::drive_kept`. The door declares one outbound
 //! `tcp` need (`NEEDS`); `open` parses the settings and its connect step reaches the server and
 //! ensures the schema, so an unreachable or refusing server fails the load.
