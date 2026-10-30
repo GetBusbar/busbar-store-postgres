@@ -1533,6 +1533,15 @@ impl Session {
         )
         .await
         .store()?;
+        // The purge's cascade: a parent's child chain goes with it.
+        for (_, child) in PLANE_CHILD_KINDS.iter().filter(|(p, _)| *p == kind) {
+            tx.execute(
+                "DELETE FROM plane_chain WHERE kind=$1 AND parent=$2",
+                &[child, &id],
+            )
+            .await
+            .store()?;
+        }
         tx.commit().await.store()?;
         Ok(())
     }
