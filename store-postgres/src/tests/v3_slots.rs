@@ -224,6 +224,41 @@ fn a_write_refused_before_commit_answers_refused_and_records_nothing() {
         .expect("a refused op was not recorded");
 }
 
+/// A prefix ending in 0xff: its range ends at the byte before (`prefix_end`), not at the next key.
+#[test]
+fn a_scan_prefix_ending_in_0xff_stops_at_the_range_end() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let keys: [&[u8]; 6] = [
+        &[0x01, 0xFE, 0xFF],
+        &[0x01, 0xFF],
+        &[0x01, 0xFF, 0x05],
+        &[0x01, 0xFF, 0xFF, 0xFF],
+        &[0x02],
+        &[0x02, 0x00],
+    ];
+    for (i, k) in keys.iter().enumerate() {
+        s.record_put(&ns, k, &[i as u8 + 1]).unwrap();
+    }
+    let scan = |prefix: &[u8], limit: u32| -> Vec<Vec<u8>> {
+        s.record_scan(&ns, prefix, limit)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
+    };
+    assert_eq!(
+        scan(&[0x01, 0xFF], 100),
+        vec![vec![1, 0xFF], vec![1, 0xFF, 5], vec![1, 0xFF, 0xFF, 0xFF]]
+    );
+    assert_eq!(scan(&[0x01, 0xFF], 2), vec![vec![1, 0xFF], vec![1, 0xFF, 5]]);
+    assert_eq!(scan(&[0x01], 100).len(), 4);
+    assert_eq!(scan(&[0xFF, 0xFF], 100), Vec::<Vec<u8>>::new());
+}
+
 /// A batch applies its cells and deltas in key order whatever the caller's order, so two nodes
 /// writing overlapping batches take row locks in one order (no 40P01). Fresh heap rows land in
 /// application order, which `ctid` shows.
