@@ -116,6 +116,9 @@ fn inert(key: &str, value: &str, why: &str) {
 
 /// Server-side bounds the store asks for at startup unless the DSN's `options` set them: a peer
 /// stalled while holding a lock (the `store_revision` row, say) must not block the fleet forever.
+/// Postgres' own ceiling on a message (1 GiB).
+const MAX_MESSAGE_LEN: u32 = 1 << 30;
+
 /// The handshake bound when the DSN has no `connect_timeout`.
 const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 30_000;
 
@@ -1202,9 +1205,22 @@ impl Client {
     /// The next message the server sent; asynchronous notices and parameter changes skipped.
     async fn read(&mut self) -> Result<Message, Error> {
         loop {
+            // The declared length is the peer's word: past Postgres' own 1 GiB ceiling it is not a
+            // Postgres peer, and is refused before anything is reserved for it.
+            if let Some(h) = self.buf.get(1..5) {
+                let len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
+                if len > MAX_MESSAGE_LEN {
+                    return Err(Error::new(Kind_::Parse(format!(
+                        "protocol error: the server declared a message of {len} bytes (over 1 GiB)"
+                    ))));
+                }
+            }
             match Message::parse(&mut self.buf).map_err(parse_err)? {
-                Some(Message::ParameterStatus(_) | Message::NoticeResponse(_)) => {}
-                Some(Message::NotificationResponse(_)) => {}
+                Some(
+                    Message::ParameterStatus(_)
+                    | Message::NoticeResponse(_)
+                    | Message::NotificationResponse(_),
+                ) => {}
                 Some(m) => {
                     if let Message::ReadyForQuery(b) = &m {
                         self.status = b.status();
