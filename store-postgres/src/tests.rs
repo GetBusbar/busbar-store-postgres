@@ -1700,6 +1700,41 @@ fn a_held_op_does_not_block_a_second_op() {
     hard_reset(&store, &id);
 }
 
+/// `since = 0` returns every row, and a row at revision 0 (a 1.5.x row the revision bump never
+/// touched) always reads as changed.
+#[test]
+fn revision_zero_rows_are_in_every_delta() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let id = format!("vk_rev0_{}", unique_suffix());
+    hard_reset(&store, &id);
+    store
+        .lock()
+        .batch_execute(&format!(
+            "INSERT INTO keys (id, generation_hash, name, created_at, revision)
+                 VALUES ('{id}', 'g', 'n', 1, 0);
+             INSERT INTO credentials (id, key_id, kind, slot, public_id, secret, secret_form,
+                                      created_at, updated_at, revision)
+                 VALUES ('c_{id}', '{id}', 'sigv4', 0, 'p_{id}', 's', 'recoverable', 1, 1, 0);"
+        ))
+        .unwrap();
+    for since in [0, 1, u64::MAX / 2] {
+        assert!(
+            store.list_keys_since(since).unwrap().iter().any(|k| k.id == id),
+            "key at revision 0, since {since}"
+        );
+        assert!(
+            store
+                .list_credentials_since(since)
+                .unwrap()
+                .iter()
+                .any(|c| c.meta.key_id == id),
+            "credential at revision 0, since {since}"
+        );
+    }
+    hard_reset(&store, &id);
+}
+
 /// A database stamped ABOVE this build is refused at open, with the reason: an older binary would
 /// ignore newer rules (the epoch fence among them). An equal version still opens.
 #[test]
