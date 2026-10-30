@@ -116,6 +116,9 @@ fn inert(key: &str, value: &str, why: &str) {
 
 /// Server-side bounds the store asks for at startup unless the DSN's `options` set them: a peer
 /// stalled while holding a lock (the `store_revision` row, say) must not block the fleet forever.
+/// The handshake bound when the DSN has no `connect_timeout`.
+const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 30_000;
+
 const DEFAULT_SERVER_SETTINGS: [(&str, &str); 2] = [
     ("lock_timeout", "30s"),
     ("idle_in_transaction_session_timeout", "60s"),
@@ -124,7 +127,8 @@ const DEFAULT_SERVER_SETTINGS: [(&str, &str); 2] = [
 impl Config {
     /// The bound on a new connection's dial and handshake, in milliseconds (0 = none).
     fn connect_bound_ms(&self) -> u32 {
-        self.connect_timeout_ms.unwrap_or(0)
+        self.connect_timeout_ms
+            .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS)
     }
 
     /// The startup `options` value: the DSN's, plus each of [`DEFAULT_SERVER_SETTINGS`] it does not
@@ -265,8 +269,12 @@ impl Config {
                              seconds; 0 or less means no bound)",
                         )
                     })?;
-                    c.connect_timeout_ms = (secs > 0)
-                        .then(|| u32::try_from(secs.saturating_mul(1000)).unwrap_or(u32::MAX));
+                    // Some(0) is the explicit "no bound"; unset takes the default.
+                    c.connect_timeout_ms = Some(if secs > 0 {
+                        u32::try_from(secs.saturating_mul(1000)).unwrap_or(u32::MAX)
+                    } else {
+                        0
+                    });
                 }
                 "target_session_attrs" => {
                     c.target_session_attrs = match v.as_str() {
