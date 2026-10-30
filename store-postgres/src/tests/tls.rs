@@ -669,6 +669,31 @@ fn startup_asks_for_lock_and_idle_in_transaction_timeouts() {
     assert!(o.contains("idle_in_transaction_session_timeout=60s"), "{o}");
 }
 
+/// A peer that is not Postgres (an HTTP error page) declares a message length of ~1.3 GiB; the
+/// client refuses it by its header, naming the length, rather than waiting to buffer it.
+#[test]
+fn an_oversized_declared_message_length_is_refused() {
+    let port = fake_server(|mut s| {
+        let mut b = [0_u8; 1024];
+        if s.read(&mut b).is_ok() {
+            let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    });
+    let started = Instant::now();
+    let e = open_within(
+        settings_of(&format!("postgres://u:zq9pw@127.0.0.1:{port}/d")),
+        Duration::from_secs(4),
+    )
+    .expect("the open returned promptly")
+    .expect_err("not a Postgres server");
+    assert!(
+        e.contains("protocol error") && e.contains("1414811695"),
+        "{e}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+}
+
 /// D37 (RED before: `connect_timeout` was ignored, `Wire::bound` never called, and a server that
 /// accepts TCP and never answers held the instance's one connection forever): the dial AND the
 /// handshake are bounded, and the failure is the connection's timeout.
