@@ -1178,11 +1178,7 @@ fn metering_accruals_pin_at_the_column_maximum() {
     assert_eq!(row.usage_units["audio_s"], max as u64);
 }
 
-/// The denylist pair, previously untested in either direction. `add_denylist` is an UPSERT whose
-/// `DO UPDATE SET reason` half is the part that can silently rot: downgrading it to `DO NOTHING`
-/// keeps every "is this subject denied" check passing while quietly pinning the reason to whatever
-/// the first call said, so a re-denylist with a corrected reason reports success and changes
-/// nothing.
+/// The denylist pair: `add_denylist` is idempotent, a repeat add keeps the first reason.
 #[test]
 fn denylist_add_is_listed_and_a_repeat_add_is_a_no_op() {
     let Some(url) = live_url() else { return };
