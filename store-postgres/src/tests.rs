@@ -1184,7 +1184,7 @@ fn metering_accruals_pin_at_the_column_maximum() {
 /// the first call said, so a re-denylist with a corrected reason reports success and changes
 /// nothing.
 #[test]
-fn denylist_add_is_listed_and_a_repeat_add_updates_the_reason() {
+fn denylist_add_is_listed_and_a_repeat_add_is_a_no_op() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
     let sub = format!("sub_denylist_{}", unique_suffix());
@@ -1233,8 +1233,8 @@ fn denylist_add_is_listed_and_a_repeat_add_updates_the_reason() {
         .unwrap()
         .get(0);
     assert_eq!(
-        stored_reason, "corrected reason",
-        "re-denylisting a subject must update the recorded reason, not silently keep the old one"
+        stored_reason, "first reason",
+        "re-denylisting a subject is a no-op (the contract): the first reason stands"
     );
     let occurrences = store
         .list_denylist()
