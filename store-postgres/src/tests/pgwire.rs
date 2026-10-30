@@ -112,6 +112,20 @@ fn what_this_client_cannot_honour_is_refused_not_ignored() {
     assert!(e.to_string().contains("sslrootcert"), "{e}");
 }
 
+/// libpq's `prefer` and `allow` parse (1.5.5 accepted them); the password is never echoed by a
+/// later refusal.
+#[test]
+fn sslmode_prefer_and_allow_parse() {
+    for mode in ["prefer", "allow"] {
+        for dsn in [
+            format!("host=db user=u password=zq9pw sslmode={mode}"),
+            format!("postgres://u:zq9pw@db/d?sslmode={mode}"),
+        ] {
+            Config::parse(&dsn).unwrap_or_else(|e| panic!("{dsn}: {e}"));
+        }
+    }
+}
+
 /// A downgrade nobody asked for is refused: `prefer` and `allow` would fall back to plaintext
 /// silently, so they are errors that say what to use; `disable` is plaintext on request, and
 /// an ABSENT `sslmode` is plaintext too (documented in the README), not a refused request.

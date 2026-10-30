@@ -557,6 +557,66 @@ fn a_server_that_declines_tls_fails_the_open() {
     assert!(e.contains("server does not support TLS"), "{e}");
 }
 
+/// `sslmode=prefer` asks with an SSLRequest and, on the server's `N`, goes on to the startup in
+/// plaintext (libpq); the open then fails only on the server's own refusal.
+#[test]
+fn prefer_continues_in_plaintext_when_the_server_answers_n() {
+    let port = fake_server(|mut s| {
+        let mut req = [0_u8; 8];
+        if s.read_exact(&mut req).is_ok() && req == [0, 0, 0, 8, 4, 210, 22, 47] {
+            let _ = s.write_all(b"N");
+            if read_startup(&mut s).is_ok() {
+                let _ = s.write_all(&fatal("3D000", "no such database"));
+            }
+        }
+    });
+    let e = open_loaded(&settings_of(&format!(
+        "postgres://u:zq9pw@127.0.0.1:{port}/d?sslmode=prefer"
+    )))
+    .expect_err("the fake server refuses the startup");
+    assert!(e.contains("3D000"), "plaintext startup followed the N: {e}");
+}
+
+/// `sslmode=allow` is plaintext: no SSLRequest is sent, the first message is the startup.
+#[test]
+fn allow_sends_no_sslrequest() {
+    let first = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let seen = first.clone();
+    let port = fake_server(move |mut s| {
+        let mut head = [0_u8; 8];
+        if s.read_exact(&mut head).is_ok() {
+            seen.store(
+                u32::from_be_bytes([head[4], head[5], head[6], head[7]]),
+                Ordering::SeqCst,
+            );
+            let _ = s.write_all(&fatal("3D000", "no such database"));
+        }
+    });
+    let e = open_loaded(&settings_of(&format!(
+        "postgres://u:zq9pw@127.0.0.1:{port}/d?sslmode=allow"
+    )))
+    .expect_err("the fake server refuses the startup");
+    assert!(e.contains("3D000"), "{e}");
+    assert_eq!(first.load(Ordering::SeqCst), 196_608, "a v3.0 startup, not an SSLRequest");
+}
+
+/// `sslmode=prefer` against a server that answers `S` secures the connection.
+#[test]
+fn prefer_secures_the_connection_when_the_server_answers_s() {
+    let Some(url) = live_url() else { return };
+    let (ca_der, server) = minted();
+    let (upstream, _) = through_proxy(&url, 0);
+    let port = tls_proxy(upstream, server);
+    let (_, tls_url) = through_proxy(&url, port);
+    let tls_url = tls_url.replace("sslmode=verify-full", "sslmode=prefer");
+    let settings = serde_json::json!({ "url": tls_url }).to_string();
+    let store = open_loaded_over(&settings, |d| {
+        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&ca_der)))
+    })
+    .expect("prefer upgrades over the proxy's S");
+    RecordStore::list_denylist(&store).expect("a read over TLS");
+}
+
 /// D37 (RED before: `connect_timeout` was ignored, `Wire::bound` never called, and a server that
 /// accepts TCP and never answers held the instance's one connection forever): the dial AND the
 /// handshake are bounded, and the failure is the connection's timeout.
