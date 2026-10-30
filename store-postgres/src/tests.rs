@@ -1660,7 +1660,9 @@ fn a_row_that_does_not_decode_is_an_error_not_a_panic() {
              INSERT INTO keys (id, generation_hash, name, created_at) VALUES ('k', 'g', NULL, 1);",
         )
         .unwrap();
-    let err = store.get_usage("b", 1).expect_err("an int4 column is not i64");
+    let err = store
+        .get_usage("b", 1)
+        .expect_err("an int4 column is not i64");
     assert!(err.0.contains("requests"), "{err:?}");
     assert!(!err.0.contains("77"), "{err:?}");
     let err = store.get_key("k").expect_err("NULL into a non-Option");

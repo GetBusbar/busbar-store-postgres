@@ -609,7 +609,7 @@ enum Kind_ {
     Authentication(String),
     Config(String),
     ToSql(usize, String),
-    FromSql(usize, String),
+    FromSql(String, String),
     Column(String),
     RowCount,
     Parameters(usize, usize),
@@ -670,7 +670,7 @@ impl fmt::Display for Error {
             Kind_::Authentication(c) => write!(f, "authentication error: {c}"),
             Kind_::Config(c) => write!(f, "invalid configuration: {c}"),
             Kind_::ToSql(i, c) => write!(f, "error serializing parameter {i}: {c}"),
-            Kind_::FromSql(i, c) => write!(f, "error deserializing column {i}: {c}"),
+            Kind_::FromSql(i, c) => write!(f, "error deserializing column `{i}`: {c}"),
             Kind_::Column(c) => write!(f, "invalid column `{c}`"),
             Kind_::RowCount => f.write_str("query returned an unexpected number of rows"),
             Kind_::Parameters(want, got) => {
@@ -722,17 +722,6 @@ pub struct Row {
 impl Row {
     /// Column `idx` as `T`.
     ///
-    /// # Panics
-    /// An unknown column, or a value that does not convert (the `postgres` crate's `get`).
-    pub fn get<'a, I: RowIndex, T: FromSql<'a>>(&'a self, idx: I) -> T {
-        match self.try_get(idx) {
-            Ok(v) => v,
-            Err(e) => panic!("error retrieving column: {e}"),
-        }
-    }
-
-    /// Column `idx` as `T`.
-    ///
     /// # Errors
     /// An unknown column, a type `T` does not accept, or a value that does not convert.
     pub fn try_get<'a, I: RowIndex, T: FromSql<'a>>(&'a self, idx: I) -> Result<T, Error> {
@@ -740,9 +729,10 @@ impl Row {
             return Err(Error::new(Kind_::Column(idx.to_string())));
         };
         let ty = &self.columns[i].type_;
+        let name = &self.columns[i].name;
         if !T::accepts(ty) {
             return Err(Error::new(Kind_::FromSql(
-                i,
+                name.clone(),
                 format!(
                     "cannot convert between the Rust type `{}` and the Postgres type `{}`",
                     std::any::type_name::<T>(),
@@ -754,7 +744,7 @@ impl Row {
         // protocol violation: an error on the missing column, never an out-of-bounds panic.
         let Some(range) = self.ranges.get(i) else {
             return Err(Error::new(Kind_::FromSql(
-                i,
+                name.clone(),
                 format!(
                     "the server sent a row of {} fields for {} columns",
                     self.ranges.len(),
@@ -763,7 +753,8 @@ impl Row {
             )));
         };
         let raw = range.clone().map(|r| &self.body.buffer()[r]);
-        T::from_sql_nullable(ty, raw).map_err(|e| Error::new(Kind_::FromSql(i, e.to_string())))
+        T::from_sql_nullable(ty, raw)
+            .map_err(|e| Error::new(Kind_::FromSql(name.clone(), e.to_string())))
     }
 }
 

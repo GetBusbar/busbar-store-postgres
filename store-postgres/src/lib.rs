@@ -570,7 +570,7 @@ impl Session {
             .query_opt("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[])
             .await
         {
-            Ok(Some(r)) => r.get(0),
+            Ok(Some(r)) => r.try_get(0).store()?,
             Ok(None) => 0,
             Err(e) if is_undefined_table(&e) => 0,
             Err(e) => return Err(RecordStoreError(render_pg_error(&e))),
@@ -660,27 +660,27 @@ fn labels_from_storage(stored: &str) -> std::collections::BTreeMap<String, Strin
     serde_json::from_str(stored).unwrap_or_default()
 }
 
-fn row_to_key(r: &Row) -> VirtualKey {
-    VirtualKey {
-        id: r.get(0),
-        generation_hash: r.get(1),
-        name: r.get(2),
+fn row_to_key(r: &Row) -> RecordStoreResult<VirtualKey> {
+    Ok(VirtualKey {
+        id: r.try_get(0).store()?,
+        generation_hash: r.try_get(1).store()?,
+        name: r.try_get(2).store()?,
         allowed_scopes: scopes_from_columns(
-            r.get::<_, Option<String>>(3),
-            r.get::<_, Option<String>>(14),
+            r.try_get::<_, Option<String>>(3).store()?,
+            r.try_get::<_, Option<String>>(14).store()?,
         ),
-        enabled: r.get(4),
-        created_at: read_u64(r.get::<_, i64>(5)),
-        group: r.get(6),
-        labels: labels_from_storage(&r.get::<_, String>(7)),
-        expires_at: r.get::<_, Option<i64>>(8).map(read_u64),
-        deleted_at: r.get::<_, Option<i64>>(9).map(read_u64),
-        revision: read_u64(r.get::<_, i64>(10)),
-        idp_subject: r.get(11),
-        binding_mode: r.get(12),
-        minted_by: r.get(13),
-        idp_provider: r.get(15),
-    }
+        enabled: r.try_get(4).store()?,
+        created_at: read_u64(r.try_get::<_, i64>(5).store()?),
+        group: r.try_get(6).store()?,
+        labels: labels_from_storage(&r.try_get::<_, String>(7).store()?),
+        expires_at: r.try_get::<_, Option<i64>>(8).store()?.map(read_u64),
+        deleted_at: r.try_get::<_, Option<i64>>(9).store()?.map(read_u64),
+        revision: read_u64(r.try_get::<_, i64>(10).store()?),
+        idp_subject: r.try_get(11).store()?,
+        binding_mode: r.try_get(12).store()?,
+        minted_by: r.try_get(13).store()?,
+        idp_provider: r.try_get(15).store()?,
+    })
 }
 
 /// `a + b` in SQL, pinned at `i64::MAX` instead of failing 22003 (rule 8); `floor` also keeps it >= 0.
@@ -715,21 +715,21 @@ const CRED_META_COLUMNS: &str = "id,key_id,kind,slot,public_id,secret_form,creat
 /// CRED_META_COLUMNS. Guarded by `cred_secret_column_index_matches_cred_meta_columns_count`.
 const CRED_SECRET_COLUMN_INDEX: usize = 12;
 
-fn row_to_cred_meta(r: &Row) -> CredentialMeta {
-    CredentialMeta {
-        id: r.get(0),
-        key_id: r.get(1),
-        kind: r.get(2),
-        slot: r.get::<_, i16>(3) as u8,
-        public_id: r.get(4),
-        secret_form: secret_form_from_storage(r.get::<_, &str>(5)),
-        created_at: read_u64(r.get::<_, i64>(6)),
-        updated_at: read_u64(r.get::<_, i64>(7)),
-        expires_at: r.get::<_, Option<i64>>(8).map(read_u64),
-        revoked_at: r.get::<_, Option<i64>>(9).map(read_u64),
-        revoke_reason: r.get(10),
-        revision: read_u64(r.get::<_, i64>(11)),
-    }
+fn row_to_cred_meta(r: &Row) -> RecordStoreResult<CredentialMeta> {
+    Ok(CredentialMeta {
+        id: r.try_get(0).store()?,
+        key_id: r.try_get(1).store()?,
+        kind: r.try_get(2).store()?,
+        slot: r.try_get::<_, i16>(3).store()? as u8,
+        public_id: r.try_get(4).store()?,
+        secret_form: secret_form_from_storage(r.try_get::<_, &str>(5).store()?),
+        created_at: read_u64(r.try_get::<_, i64>(6).store()?),
+        updated_at: read_u64(r.try_get::<_, i64>(7).store()?),
+        expires_at: r.try_get::<_, Option<i64>>(8).store()?.map(read_u64),
+        revoked_at: r.try_get::<_, Option<i64>>(9).store()?.map(read_u64),
+        revoke_reason: r.try_get(10).store()?,
+        revision: read_u64(r.try_get::<_, i64>(11).store()?),
+    })
 }
 
 impl Session {
@@ -784,7 +784,7 @@ impl Session {
     pub(crate) async fn get_key(&mut self, id: &str) -> RecordStoreResult<Option<VirtualKey>> {
         let sql = format!("SELECT {KEY_COLUMNS} FROM keys WHERE id=$1");
         let row = self.lock().query_opt(&sql, &[&id]).await.store()?;
-        Ok(row.map(|r| row_to_key(&r)))
+        row.map(|r| row_to_key(&r)).transpose()
     }
 
     pub(crate) async fn list_keys(&mut self) -> RecordStoreResult<Vec<VirtualKey>> {
@@ -793,7 +793,7 @@ impl Session {
         // default fallback, which needs tombstones visible to drive credential eviction downstream.
         let sql = format!("SELECT {KEY_COLUMNS} FROM keys ORDER BY created_at");
         let rows = self.lock().query(&sql, &[]).await.store()?;
-        Ok(rows.iter().map(row_to_key).collect())
+        rows.iter().map(row_to_key).collect()
     }
 
     pub(crate) async fn list_keys_since(
@@ -802,7 +802,7 @@ impl Session {
     ) -> RecordStoreResult<Vec<VirtualKey>> {
         let sql = format!("SELECT {KEY_COLUMNS} FROM keys WHERE revision > $1 ORDER BY revision");
         let rows = self.lock().query(&sql, &[&clamp(since)]).await.store()?;
-        Ok(rows.iter().map(row_to_key).collect())
+        rows.iter().map(row_to_key).collect()
     }
 
     pub(crate) async fn delete_key(&mut self, id: &str) -> RecordStoreResult<()> {
@@ -818,7 +818,8 @@ impl Session {
             )
             .await
             .store()?
-            .map(|r| r.get(0));
+            .map(|r| r.try_get(0).store())
+            .transpose()?;
         match already_deleted {
             None => {
                 // Unknown id is an ERROR, unlike already-tombstoned: answering Ok would tell an operator
@@ -864,7 +865,7 @@ impl Session {
         let ws = clamp(window_start);
         let client = self.lock();
         let mut tx = Self::snapshot_consistent_tx(client).await?;
-        let (requests, billable_requests): (u64, u64) = tx
+        let (requests, billable_requests): (u64, u64) = match tx
             .query_opt(
                 "SELECT requests, billable_requests
                  FROM usage_windows WHERE bucket_id=$1 AND window_start=$2",
@@ -872,8 +873,13 @@ impl Session {
             )
             .await
             .store()?
-            .map(|r| (read_u64(r.get::<_, i64>(0)), read_u64(r.get::<_, i64>(1))))
-            .unwrap_or((0, 0));
+        {
+            Some(r) => (
+                read_u64(r.try_get::<_, i64>(0).store()?),
+                read_u64(r.try_get::<_, i64>(1).store()?),
+            ),
+            None => (0, 0),
+        };
         let rows = tx
             .query(
                 "SELECT model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write
@@ -896,19 +902,23 @@ impl Session {
         // Zero counts are left out, so the map stays sparse the way busbar's own ledger keeps it.
         let mut models: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
         for r in &rows {
-            let units = models.entry(r.get::<_, String>(0)).or_default();
+            let units = models
+                .entry(r.try_get::<_, String>(0).store()?)
+                .or_default();
             for (i, unit) in RESERVED_COLUMNS.iter().enumerate() {
-                let v = read_u64(r.get::<_, i64>(i + 1));
+                let v = read_u64(r.try_get::<_, i64>(i + 1).store()?);
                 if v != 0 {
                     units.insert(unit.to_string(), v);
                 }
             }
         }
         for r in &unit_rows {
-            let v = read_u64(r.get::<_, i64>(2));
-            let units = models.entry(r.get::<_, String>(0)).or_default();
+            let v = read_u64(r.try_get::<_, i64>(2).store()?);
+            let units = models
+                .entry(r.try_get::<_, String>(0).store()?)
+                .or_default();
             if v != 0 {
-                units.insert(r.get::<_, String>(1), v);
+                units.insert(r.try_get::<_, String>(1).store()?, v);
             }
         }
         Ok(UsageLedger {
@@ -1063,36 +1073,45 @@ impl Session {
         let mut units: std::collections::HashMap<RowKey, BTreeMap<String, u64>> =
             std::collections::HashMap::new();
         for r in &unit_rows {
-            let v = read_u64(r.get::<_, i64>(5));
+            let v = read_u64(r.try_get::<_, i64>(5).store()?);
             if v == 0 {
                 continue;
             }
             units
-                .entry((r.get(0), r.get(1), r.get(2), r.get(3)))
+                .entry((
+                    r.try_get(0).store()?,
+                    r.try_get(1).store()?,
+                    r.try_get(2).store()?,
+                    r.try_get(3).store()?,
+                ))
                 .or_default()
-                .insert(r.get(4), v);
+                .insert(r.try_get(4).store()?, v);
         }
-        Ok(rows
-            .iter()
+        rows.iter()
             .map(|r| {
-                let key: RowKey = (r.get(0), r.get(1), r.get(2), r.get(11));
-                MeteringRow {
+                let key: RowKey = (
+                    r.try_get(0).store()?,
+                    r.try_get(1).store()?,
+                    r.try_get(2).store()?,
+                    r.try_get(11).store()?,
+                );
+                Ok(MeteringRow {
                     usage_units: units.remove(&key).unwrap_or_default(),
                     key_id: key.0,
                     model: key.1,
                     provider: key.2,
-                    tokens_input: read_u64(r.get::<_, i64>(3)),
-                    tokens_output: read_u64(r.get::<_, i64>(4)),
-                    tokens_cache_read: read_u64(r.get::<_, i64>(5)),
-                    tokens_cache_write: read_u64(r.get::<_, i64>(6)),
-                    requests: read_u64(r.get::<_, i64>(7)),
-                    billable_requests: read_u64(r.get::<_, i64>(8)),
-                    key_group_at_use: r.get(9),
-                    pricing_version: r.get(10),
+                    tokens_input: read_u64(r.try_get::<_, i64>(3).store()?),
+                    tokens_output: read_u64(r.try_get::<_, i64>(4).store()?),
+                    tokens_cache_read: read_u64(r.try_get::<_, i64>(5).store()?),
+                    tokens_cache_write: read_u64(r.try_get::<_, i64>(6).store()?),
+                    requests: read_u64(r.try_get::<_, i64>(7).store()?),
+                    billable_requests: read_u64(r.try_get::<_, i64>(8).store()?),
+                    key_group_at_use: r.try_get(9).store()?,
+                    pricing_version: r.try_get(10).store()?,
                     priced_from_ms: read_u64(key.3),
-                }
+                })
             })
-            .collect())
+            .collect()
     }
 
     pub(crate) async fn put_credential(
@@ -1161,7 +1180,7 @@ impl Session {
     ) -> RecordStoreResult<Vec<CredentialMeta>> {
         let sql = format!("SELECT {CRED_META_COLUMNS} FROM credentials WHERE key_id=$1");
         let rows = self.lock().query(&sql, &[&key_id]).await.store()?;
-        Ok(rows.iter().map(row_to_cred_meta).collect())
+        rows.iter().map(row_to_cred_meta).collect()
     }
 
     pub(crate) async fn revoke_credential(
@@ -1178,7 +1197,8 @@ impl Session {
             )
             .await
             .store()?
-            .get(0);
+            .try_get(0)
+            .store()?;
         if !exists {
             // NOT idempotent-success: a silent no-op lets an operator believe a leaked secret was
             // killed. Minting into a revoked slot rewrites the row's primary key, so an id from an
@@ -1213,7 +1233,8 @@ impl Session {
                 )
                 .await
                 .store()?
-                .get(0);
+                .try_get(0)
+                .store()?;
             if !still_exists {
                 return Err(RecordStoreError(format!(
                     "revoke_credential: credential id {id} existed when this call started and \
@@ -1237,21 +1258,23 @@ impl Session {
             "SELECT {CRED_META_COLUMNS},secret FROM credentials WHERE revision > $1 ORDER BY revision"
         );
         let rows = self.lock().query(&sql, &[&clamp(since)]).await.store()?;
-        Ok(rows
-            .iter()
-            .map(|r| CredentialSecret {
-                meta: row_to_cred_meta(r),
-                secret: r
-                    .get::<_, Option<String>>(CRED_SECRET_COLUMN_INDEX)
-                    .unwrap_or_default(),
+        rows.iter()
+            .map(|r| {
+                Ok(CredentialSecret {
+                    meta: row_to_cred_meta(r)?,
+                    secret: r
+                        .try_get::<_, Option<String>>(CRED_SECRET_COLUMN_INDEX)
+                        .store()?
+                        .unwrap_or_default(),
+                })
             })
-            .collect())
+            .collect()
     }
 
     pub(crate) async fn list_audit(&mut self) -> RecordStoreResult<Vec<AuditRecord>> {
         let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log ORDER BY seq");
         let rows = self.lock().query(&sql, &[]).await.store()?;
-        Ok(rows.iter().map(row_to_audit).collect())
+        rows.iter().map(row_to_audit).collect()
     }
 
     pub(crate) async fn list_audit_tail(
@@ -1264,7 +1287,10 @@ impl Session {
             .query(&sql, &[&i64::try_from(limit).unwrap_or(i64::MAX)])
             .await
             .store()?;
-        let mut out: Vec<AuditRecord> = rows.iter().map(row_to_audit).collect();
+        let mut out: Vec<AuditRecord> = rows
+            .iter()
+            .map(row_to_audit)
+            .collect::<RecordStoreResult<_>>()?;
         out.reverse();
         Ok(out)
     }
@@ -1288,7 +1314,7 @@ impl Session {
             .query("SELECT sub FROM denylist", &[])
             .await
             .store()?;
-        Ok(rows.iter().map(|r| r.get(0)).collect())
+        rows.iter().map(|r| r.try_get(0).store()).collect()
     }
 
     // The kind-tagged plane-record verbs. Generic over `kind`: an UPSERTED record lives in `plane_records` keyed `(kind, id)`, an
@@ -1346,7 +1372,7 @@ impl Session {
             )
             .await
             .store()?;
-        Ok(row.map(|r| r.get(0)))
+        row.map(|r| r.try_get(0).store()).transpose()
     }
 
     pub(crate) async fn list_plane_records(
@@ -1390,11 +1416,11 @@ impl Session {
             }
         };
         tx.commit().await.store()?;
-        Ok(records
+        records
             .iter()
             .chain(chain.iter())
-            .map(|r| r.get::<_, Vec<u8>>(0))
-            .collect())
+            .map(|r| r.try_get::<_, Vec<u8>>(0).store())
+            .collect()
     }
 
     pub(crate) async fn list_plane_record_parents(
@@ -1414,7 +1440,7 @@ impl Session {
             )
             .await
             .store()?;
-        Ok(rows.iter().map(|r| r.get(0)).collect())
+        rows.iter().map(|r| r.try_get(0).store()).collect()
     }
 
     pub(crate) async fn purge_plane_records_before(
@@ -1455,8 +1481,8 @@ impl Session {
             .await
             .store()?
             .iter()
-            .map(|r| r.get(0))
-            .collect();
+            .map(|r| r.try_get(0).store())
+            .collect::<RecordStoreResult<_>>()?;
         let chain = tx
             .execute(
                 "DELETE FROM plane_chain
@@ -1567,7 +1593,10 @@ impl Session {
             )
             .await
             .store()?;
-        Ok(row.is_some_and(|r| r.get::<_, &str>(0) == "active"))
+        match row {
+            Some(r) => Ok(r.try_get::<_, &str>(0).store()? == "active"),
+            None => Ok(false),
+        }
     }
 }
 
@@ -1580,17 +1609,17 @@ fn disposition_to_storage(d: PlaneDisposition) -> &'static str {
     }
 }
 
-fn row_to_audit(r: &Row) -> AuditRecord {
-    AuditRecord {
-        seq: read_u64(r.get::<_, i64>(0)),
-        ts: read_u64(r.get::<_, i64>(1)),
-        action: r.get(2),
-        resource: r.get(3),
-        outcome: r.get(4),
-        principal: r.get(5),
-        prev_hash: r.get(6),
-        hash: r.get(7),
-    }
+fn row_to_audit(r: &Row) -> RecordStoreResult<AuditRecord> {
+    Ok(AuditRecord {
+        seq: read_u64(r.try_get::<_, i64>(0).store()?),
+        ts: read_u64(r.try_get::<_, i64>(1).store()?),
+        action: r.try_get(2).store()?,
+        resource: r.try_get(3).store()?,
+        outcome: r.try_get(4).store()?,
+        principal: r.try_get(5).store()?,
+        prev_hash: r.try_get(6).store()?,
+        hash: r.try_get(7).store()?,
+    })
 }
 
 impl Session {
@@ -1615,7 +1644,8 @@ impl Session {
             )
             .await
             .store()?
-            .map(|r| r.get(0));
+            .map(|r| r.try_get(0).store())
+            .transpose()?;
         match owner_live {
             None => {
                 return Err(RecordStoreError(format!(
@@ -1676,7 +1706,8 @@ impl Session {
                     &[&m.key_id, &m.kind, &(m.slot as i16)],
                 ).await
                 .store()?
-                .get(0);
+                .try_get(0)
+                .store()?;
             if exists {
                 return Err(RecordStoreError(format!(
                     "put_credential: slot {} for key {} kind {} holds a LIVE credential; revoke it first",
@@ -2015,10 +2046,10 @@ impl Session {
             .store()?;
         match stored {
             Some(r) => {
-                let identical = r.get::<_, String>(0) == record.id
-                    && r.get::<_, i64>(1) == ts
-                    && r.get::<_, String>(2) == disposition
-                    && r.get::<_, Vec<u8>>(3) == record.body;
+                let identical = r.try_get::<_, String>(0).store()? == record.id
+                    && r.try_get::<_, i64>(1).store()? == ts
+                    && r.try_get::<_, String>(2).store()? == disposition
+                    && r.try_get::<_, Vec<u8>>(3).store()? == record.body;
                 if identical {
                     return Ok(true);
                 }

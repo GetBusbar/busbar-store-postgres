@@ -169,7 +169,7 @@ async fn claim(tx: &mut Transaction<'_>, op: OpId, body: &str) -> Result<Option<
         .await
         .map_err(pg)?;
     match row {
-        Some(r) => Ok(Some(r.get(0))),
+        Some(r) => Ok(Some(r.try_get(0).map_err(pg)?)),
         // Swept between the insert and the read (it was past retention): nothing applied, and a
         // retry claims the op afresh.
         None => Err(format!("op_id {op:?} was swept while being claimed; retry")),
@@ -290,7 +290,7 @@ impl Session {
             )
             .await
             .map_err(pg)?;
-        row.map(|r| record(r.get(0))).transpose()
+        row.map(|r| record(r.try_get(0).map_err(pg)?)).transpose()
     }
 
     async fn v3_record_scan(
@@ -315,7 +315,12 @@ impl Session {
             .await
             .map_err(pg)?;
         rows.iter()
-            .map(|r| Ok((r.get(0), record(r.get(1))?)))
+            .map(|r| {
+                Ok((
+                    r.try_get(0).map_err(pg)?,
+                    record(r.try_get(1).map_err(pg)?)?,
+                ))
+            })
             .collect()
     }
 
