@@ -7,11 +7,11 @@
 //! and records only; money is a view on ledger x rate card.
 //!
 //! DEDUPE (`abi::store` S1-S4), DURABLE: every `op_id` this store APPLIED is a `store_ops` row
-//! holding the op's value fields and answer. The row is inserted FIRST in the op's own transaction
-//! with the op's effect: a racing call with the same `op_id` (on this node or another) waits on the
-//! primary key, then reads the committed row and replays it (same value fields) or is refused
-//! (different ones). A failed op rolls its row back with its effect. Rows are kept
-//! [`OP_ID_RETENTION_SECS`] and swept at most once a minute per instance.
+//! holding the op's body ([`Dedupe::body_hex`]; `answer` is written empty and never read). The row
+//! is inserted FIRST in the op's own transaction with the op's effect: a racing call with the same
+//! `op_id` (on this node or another) waits on the primary key, then reads the committed body, which
+//! [`Dedupe::answer`] judges a replay or a conflict. A failed op rolls its row back with its
+//! effect. Rows are kept [`OP_ID_RETENTION_SECS`] and swept at most once a minute per instance.
 //!
 //! CONNECTIONS: every slot runs on the instance's ONE kept connection over the host's connector, as
 //! straight-line async code by the store SDK's `wire::drive_kept`. The door declares one outbound
@@ -30,6 +30,7 @@ use busbar_contract::abi::host::conn::connector::{
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_OCTETS};
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::door::abi_str;
+use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::wire::{drive_kept, Body};
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
 use busbar_contract::abi::store::{OpId, OP_ID_RETENTION_SECS};
@@ -107,33 +108,6 @@ macro_rules! on_conn {
     }};
 }
 
-/// One `op_id`-carrying write in ONE transaction with its dedupe row: a replay answers the
-/// original, a conflict applies nothing, and a new op runs `$apply` (its answer numbers, or `$E`)
-/// and is remembered only if it applied (an error rolls the row back with the effect).
-macro_rules! deduped {
-    ($s:expr, $op:expr, $body:expr, $conflict:expr, $backend:expr, $E:ty, |$tx:ident| $apply:block) => {{
-        let op: OpId = $op;
-        let (mut tx, seen) = $s.dedupe_begin(op, $body).await.map_err($backend)?;
-        match seen {
-            Seen::Replay(answer) => answer,
-            Seen::Conflict => return Err($conflict),
-            Seen::New => {
-                let answer = {
-                    let $tx = &mut tx;
-                    typed::<$E, _>(async { $apply }).await?
-                };
-                dedupe_finish(tx, op, &answer).await.map_err($backend)?;
-                answer
-            }
-        }
-    }};
-}
-
-/// Pin an apply block's error type.
-fn typed<E, F: std::future::Future<Output = Result<Vec<u64>, E>>>(f: F) -> F {
-    f
-}
-
 /// How often (seconds) one instance sweeps `store_ops` past its retention.
 const SWEEP_EVERY_SECS: u64 = 60;
 
@@ -150,28 +124,9 @@ fn failed(e: RecordStoreError) -> OpRefused {
     OpRefused::Failed(e.0)
 }
 
-/// An op's answer, as `store_ops.answer` keeps it: its numbers, space-separated.
-fn encode(answer: &[u64]) -> String {
-    answer
-        .iter()
-        .map(u64::to_string)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn decode(answer: &str) -> Option<Vec<u64>> {
-    answer.split_whitespace().map(|n| n.parse().ok()).collect()
-}
-
-/// Whether an `op_id` is new, a replay (with its recorded answer), or a conflict.
-enum Seen {
-    New,
-    Replay(Vec<u64>),
-    Conflict,
-}
-
-/// Claim `op` for `body` inside `tx`: insert its row, or read the row a committed call left.
-async fn claim(tx: &mut Transaction<'_>, op: OpId, body: &str) -> Result<Seen, String> {
+/// Claim `op` for `body` (its [`Dedupe::body_hex`]) inside `tx`: insert its row (`None`), or read
+/// the body a committed call recorded.
+async fn claim(tx: &mut Transaction<'_>, op: OpId, body: &str) -> Result<Option<String>, String> {
     let id: &[u8] = &op.0;
     let inserted = tx
         .execute(
@@ -182,37 +137,18 @@ async fn claim(tx: &mut Transaction<'_>, op: OpId, body: &str) -> Result<Seen, S
         .await
         .map_err(pg)?;
     if inserted == 1 {
-        return Ok(Seen::New);
+        return Ok(None);
     }
     let row = tx
-        .query_opt(
-            "SELECT body, answer FROM store_ops WHERE op_id = $1",
-            &[&id],
-        )
+        .query_opt("SELECT body FROM store_ops WHERE op_id = $1", &[&id])
         .await
         .map_err(pg)?;
-    Ok(match row {
-        Some(r) if r.get::<_, &str>(0) == body => match decode(r.get(1)) {
-            Some(answer) => Seen::Replay(answer),
-            None => Seen::Conflict,
-        },
-        Some(_) => Seen::Conflict,
+    match row {
+        Some(r) => Ok(Some(r.get(0))),
         // Swept between the insert and the read (it was past retention): nothing applied, and a
         // retry claims the op afresh.
-        None => return Err(format!("op_id {op:?} was swept while being claimed; retry")),
-    })
-}
-
-/// Record a new op's answer on its dedupe row and commit the op's transaction.
-async fn dedupe_finish(mut tx: Transaction<'_>, op: OpId, answer: &[u64]) -> Result<(), String> {
-    let id: &[u8] = &op.0;
-    tx.execute(
-        "UPDATE store_ops SET answer = $2 WHERE op_id = $1",
-        &[&id, &encode(answer)],
-    )
-    .await
-    .map_err(pg)?;
-    tx.commit().await.map_err(pg)
+        None => Err(format!("op_id {op:?} was swept while being claimed; retry")),
+    }
 }
 
 impl Session {
@@ -236,46 +172,50 @@ impl Session {
             .await;
     }
 
-    /// Begin an `op_id`-carrying write: sweep, open its transaction, claim the op.
-    async fn dedupe_begin(
+    /// One `op_id`-carrying write in ONE transaction with its dedupe row: a new op runs `apply` and
+    /// commits (`None`); an op already recorded applies nothing and answers the body found, for
+    /// [`Dedupe::answer`]. A refusal from `apply` rolls the row back with the effect.
+    async fn deduped(
         &mut self,
         op: OpId,
         body: &str,
-    ) -> Result<(Transaction<'_>, Seen), String> {
+        apply: impl AsyncFnOnce(&mut Transaction<'_>) -> OpResult<()>,
+    ) -> OpResult<Option<String>> {
         self.sweep_ops().await;
-        let mut tx = self.lock().transaction().await.map_err(pg)?;
-        let seen = claim(&mut tx, op, body).await?;
-        Ok((tx, seen))
+        let mut tx = self
+            .lock()
+            .transaction()
+            .await
+            .map_err(|e| OpRefused::Failed(pg(e)))?;
+        let found = claim(&mut tx, op, body).await.map_err(OpRefused::Failed)?;
+        if found.is_none() {
+            apply(&mut tx).await?;
+            tx.commit().await.map_err(|e| OpRefused::Failed(pg(e)))?;
+        }
+        Ok(found)
     }
 
     async fn v3_append_plane_record(
         &mut self,
         op: OpId,
+        body: &str,
         record: &busbar_contract::records::PlaneRecord,
-    ) -> OpResult<()> {
-        let body = format!("append_plane_record:{record:?}");
-        deduped!(
-            self,
-            op,
-            &body,
-            OpRefused::Conflict,
-            OpRefused::Failed,
-            OpRefused,
-            |tx| {
-                match Session::append_plane_record_in(tx, record)
-                    .await
-                    .map_err(failed)?
-                {
-                    true => Ok(Vec::new()),
-                    false => Err(OpRefused::Failed(format!(
+    ) -> OpResult<Option<String>> {
+        self.deduped(op, body, async |tx| {
+            if Session::append_plane_record_in(tx, record)
+                .await
+                .map_err(failed)?
+            {
+                Ok(())
+            } else {
+                Err(OpRefused::Failed(format!(
                     "append_plane_record: kind '{}' seq {} was freed between the insert and the \
                      read-back; the record was NOT stored",
                     record.kind, record.seq
-                ))),
-                }
+                )))
             }
-        );
-        Ok(())
+        })
+        .await
     }
 
     /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row: it is
@@ -356,43 +296,31 @@ impl Session {
         op: OpId,
         body: &str,
         cells: &[(String, u64, UsageDelta)],
-    ) -> OpResult<()> {
-        deduped!(
-            self,
-            op,
-            body,
-            OpRefused::Conflict,
-            OpRefused::Failed,
-            OpRefused,
-            |tx| {
-                for (bucket, window, delta) in cells {
-                    Session::add_usage_in(tx, bucket, *window, delta)
-                        .await
-                        .map_err(failed)?;
-                }
-                Ok(Vec::new())
+    ) -> OpResult<Option<String>> {
+        self.deduped(op, body, async |tx| {
+            for (bucket, window, delta) in cells {
+                Session::add_usage_in(tx, bucket, *window, delta)
+                    .await
+                    .map_err(failed)?;
             }
-        );
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
-    async fn v3_add_metering_batch(&mut self, op: OpId, deltas: &[MeteringDelta]) -> OpResult<()> {
-        let body = format!("add_metering_batch:{deltas:?}");
-        deduped!(
-            self,
-            op,
-            &body,
-            OpRefused::Conflict,
-            OpRefused::Failed,
-            OpRefused,
-            |tx| {
-                for d in deltas {
-                    Session::add_metering_in(tx, d).await.map_err(failed)?;
-                }
-                Ok(Vec::new())
+    async fn v3_add_metering_batch(
+        &mut self,
+        op: OpId,
+        body: &str,
+        deltas: &[MeteringDelta],
+    ) -> OpResult<Option<String>> {
+        self.deduped(op, body, async |tx| {
+            for d in deltas {
+                Session::add_metering_in(tx, d).await.map_err(failed)?;
             }
-        );
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -488,10 +416,12 @@ impl StoreSlots for PostgresStore {
         op: OpId,
         record: PlaneRecordRef<'_>,
     ) -> Step<OpResult<()>> {
-        let record = record.to_record();
+        let d = Dedupe::append(record);
+        let (body, record) = (d.body_hex(), record.to_record());
         on_conn!(self, cx, OpRefused::Failed, |s| s
-            .v3_append_plane_record(op, &record)
+            .v3_append_plane_record(op, &body, &record)
             .await)
+        .map(|r| d.answer(r))
     }
 
     fn record_put(
@@ -536,7 +466,8 @@ impl StoreSlots for PostgresStore {
         op: OpId,
         cells: &[(&str, u64, UsageDelta)],
     ) -> Step<OpResult<()>> {
-        let body = format!("add_usage_batch:{cells:?}");
+        let d = Dedupe::usage(cells);
+        let body = d.body_hex();
         let cells: Vec<(String, u64, UsageDelta)> = cells
             .iter()
             .map(|(b, w, d)| ((*b).to_owned(), *w, d.clone()))
@@ -544,6 +475,7 @@ impl StoreSlots for PostgresStore {
         on_conn!(self, cx, OpRefused::Failed, |s| s
             .v3_add_usage_batch(op, &body, &cells)
             .await)
+        .map(|r| d.answer(r))
     }
 
     fn add_metering_batch(
@@ -552,10 +484,12 @@ impl StoreSlots for PostgresStore {
         op: OpId,
         deltas: &[MeteringDelta],
     ) -> Step<OpResult<()>> {
-        let deltas = deltas.to_vec();
+        let d = Dedupe::metering(deltas);
+        let (body, deltas) = (d.body_hex(), deltas.to_vec());
         on_conn!(self, cx, OpRefused::Failed, |s| s
-            .v3_add_metering_batch(op, &deltas)
+            .v3_add_metering_batch(op, &body, &deltas)
             .await)
+        .map(|r| d.answer(r))
     }
 
     // The base op set: each the store's own body, on the op's connection, over owned copies of its
