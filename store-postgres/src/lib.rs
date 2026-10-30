@@ -613,6 +613,21 @@ impl Session {
             .await
             .store()?;
         }
+        // v13: the deleted slots' tables and `op_id` rows go (digest bodies carry no ':').
+        if version < 13 {
+            tx.batch_execute(
+                "DROP TABLE IF EXISTS money_slices;
+                 DROP TABLE IF EXISTS money_slots;
+                 DROP TABLE IF EXISTS money_epoch;
+                 DROP TABLE IF EXISTS store_journal;
+                 DROP TABLE IF EXISTS store_sessions;
+                 DELETE FROM store_ops WHERE position(':' IN body) > 0
+                     AND split_part(body, ':', 1) NOT IN
+                     ('append_plane_record', 'add_usage_batch', 'add_metering_batch');",
+            )
+            .await
+            .store()?;
+        }
         tx.execute(
             "INSERT INTO busbar_schema (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
             &[&SCHEMA_VERSION],
