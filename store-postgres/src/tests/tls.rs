@@ -802,7 +802,8 @@ fn a_startup_refusal_moves_on_to_the_next_endpoint() {
     )))
     .expect_err("every endpoint refused");
     assert!(
-        e.contains(&format!("127.0.0.1:{a}: 57P03")) && e.contains(&format!("127.0.0.1:{b}: 53300")),
+        e.contains(&format!("127.0.0.1:{a}: 57P03"))
+            && e.contains(&format!("127.0.0.1:{b}: 53300")),
         "every endpoint's error: {e}"
     );
     assert!(!e.contains("zq9pw"), "{e}");

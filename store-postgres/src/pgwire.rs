@@ -921,7 +921,7 @@ impl Client {
         let n = cfg.endpoints.len();
         let first = preferred.load(Ordering::Relaxed);
         let first = if first < n { first } else { 0 };
-        let mut last = None;
+        let mut failures: Vec<(usize, Error)> = Vec::new();
         for i in std::iter::once(first).chain((0..n).filter(|i| *i != first)) {
             match Self::attempt(&wire, cfg, &cfg.endpoints[i]).await {
                 Ok(c) => {
@@ -934,11 +934,25 @@ impl Client {
                     // endpoint's socket in place under the next one's connect.
                     wire.unbound();
                     wire.close().await;
-                    last = Some(e);
+                    failures.push((i, e));
                 }
             }
         }
-        Err(last.unwrap_or_else(|| config_err("no server to connect to")))
+        // One endpoint: its error as it came. Several: every one, so the operator sees why each
+        // was passed over, not only the last.
+        if failures.len() > 1 {
+            let joined: Vec<String> = failures
+                .iter()
+                .map(|(i, e)| {
+                    let ep = &cfg.endpoints[*i];
+                    format!("{}:{}: {}", ep.name, ep.port, crate::render_pg_error(e))
+                })
+                .collect();
+            return Err(Error::connect(joined.join("; ")));
+        }
+        Err(failures
+            .pop()
+            .map_or_else(|| config_err("no server to connect to"), |(_, e)| e))
     }
 
     /// One endpoint's connect: dial, secure, authenticate, check the session's kind.
