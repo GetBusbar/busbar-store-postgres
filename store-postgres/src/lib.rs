@@ -527,7 +527,7 @@ impl Session {
         self.client.release().await;
     }
 
-    fn lock(&mut self) -> &mut Client {
+    fn client(&mut self) -> &mut Client {
         &mut self.client
     }
 
@@ -547,7 +547,7 @@ impl Session {
     const MIGRATE_LOCK_KEY: i64 = 0x6275_7362_6172_5f70; // ASCII "busbar_p"
 
     pub(crate) async fn migrate(&mut self) -> RecordStoreResult<()> {
-        let client = self.lock();
+        let client = self.client();
         client
             .batch_execute(&format!(
                 "SELECT pg_advisory_lock({})",
@@ -756,42 +756,83 @@ fn row_to_cred_meta(r: &Row) -> RecordStoreResult<CredentialMeta> {
     })
 }
 
+/// The `keys` upsert both key writes run; the conflict branch's `WHERE` is the tombstone
+/// precondition (a write not carrying a tombstone never overwrites one).
+const KEY_UPSERT: &str = "INSERT INTO keys
+        (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,
+         idp_subject,binding_mode,minted_by,allowed_scopes_by_kind,idp_provider)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+     ON CONFLICT (id) DO UPDATE SET
+        generation_hash=EXCLUDED.generation_hash, name=EXCLUDED.name,
+        allowed_pools=EXCLUDED.allowed_pools, enabled=EXCLUDED.enabled,
+        key_group=EXCLUDED.key_group, labels=EXCLUDED.labels,
+        expires_at=EXCLUDED.expires_at, deleted_at=EXCLUDED.deleted_at,
+        revision=EXCLUDED.revision, idp_subject=EXCLUDED.idp_subject,
+        binding_mode=EXCLUDED.binding_mode, minted_by=EXCLUDED.minted_by,
+        allowed_scopes_by_kind=EXCLUDED.allowed_scopes_by_kind,
+        idp_provider=EXCLUDED.idp_provider
+     WHERE EXCLUDED.deleted_at IS NOT NULL OR keys.deleted_at IS NULL";
+
+/// The derived column values of a [`KEY_UPSERT`], owned so its parameters can borrow them.
+struct KeyColumns {
+    pools: Option<String>,
+    by_kind: Option<String>,
+    labels: String,
+    created: i64,
+    expires: Option<i64>,
+    deleted: Option<i64>,
+}
+
+impl KeyColumns {
+    fn of(key: &VirtualKey, deleted: Option<i64>) -> Self {
+        let (pools, by_kind) = scope_columns(key.allowed_scopes.as_deref());
+        Self {
+            pools,
+            by_kind,
+            labels: labels_to_storage(&key.labels),
+            created: clamp(key.created_at),
+            expires: key.expires_at.map(clamp),
+            deleted,
+        }
+    }
+
+    /// The statement's parameters, `$1..$16` in order.
+    fn params<'a>(&'a self, key: &'a VirtualKey, rev: &'a i64) -> [&'a (dyn ToSql + Sync); 16] {
+        [
+            &key.id,
+            &key.generation_hash,
+            &key.name,
+            &self.pools,
+            &key.enabled,
+            &self.created,
+            &key.group,
+            &self.labels,
+            &self.expires,
+            &self.deleted,
+            rev,
+            &key.idp_subject,
+            &key.binding_mode,
+            &key.minted_by,
+            &self.by_kind,
+            &key.idp_provider,
+        ]
+    }
+}
+
 impl Session {
     pub(crate) async fn put_key(&mut self, key: &VirtualKey) -> RecordStoreResult<()> {
-        let (pools, by_kind) = scope_columns(key.allowed_scopes.as_deref());
-        let labels = labels_to_storage(&key.labels);
-        let created = clamp(key.created_at);
-        let expires = key.expires_at.map(clamp);
-        let deleted = key.deleted_at.map(clamp);
-        let client = self.lock();
+        let cols = KeyColumns::of(key, key.deleted_at.map(clamp));
+        let client = self.client();
         let mut tx = client.transaction().await.store()?;
         let rev = Self::next_revision(&mut tx).await?;
         // The conflict branch's `WHERE` is the TOMBSTONE PRECONDITION: a live-shaped write must not
         // overwrite a tombstoned row (that would reissue a never-reissued id and revive its tokens).
         // It rides on the statement, not a prior SELECT, so under READ COMMITTED it closes the TOCTOU
         // window. A write that CARRIES a tombstone still applies.
-        let changed = tx.execute(
-            "INSERT INTO keys
-                (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,
-                 idp_subject,binding_mode,minted_by,allowed_scopes_by_kind,idp_provider)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-             ON CONFLICT (id) DO UPDATE SET
-                generation_hash=EXCLUDED.generation_hash, name=EXCLUDED.name,
-                allowed_pools=EXCLUDED.allowed_pools, enabled=EXCLUDED.enabled,
-                key_group=EXCLUDED.key_group, labels=EXCLUDED.labels,
-                expires_at=EXCLUDED.expires_at, deleted_at=EXCLUDED.deleted_at,
-                revision=EXCLUDED.revision, idp_subject=EXCLUDED.idp_subject,
-                binding_mode=EXCLUDED.binding_mode, minted_by=EXCLUDED.minted_by,
-                allowed_scopes_by_kind=EXCLUDED.allowed_scopes_by_kind,
-                idp_provider=EXCLUDED.idp_provider
-             WHERE EXCLUDED.deleted_at IS NOT NULL OR keys.deleted_at IS NULL",
-            &[
-                &key.id, &key.generation_hash, &key.name, &pools, &key.enabled, &created,
-                &key.group, &labels, &expires, &deleted, &rev, &key.idp_subject,
-                &key.binding_mode, &key.minted_by, &by_kind, &key.idp_provider,
-            ],
-        ).await
-        .store()?;
+        let changed = tx
+            .execute(KEY_UPSERT, &cols.params(key, &rev))
+            .await
+            .store()?;
         if changed == 0 {
             // The conflict branch matched a row but its WHERE rejected the write: the stored row is
             // tombstoned and this one is not. That is the only way to reach 0 here.
@@ -807,7 +848,7 @@ impl Session {
 
     pub(crate) async fn get_key(&mut self, id: &str) -> RecordStoreResult<Option<VirtualKey>> {
         let sql = format!("SELECT {KEY_COLUMNS} FROM keys WHERE id=$1");
-        let row = self.lock().query_opt(&sql, &[&id]).await.store()?;
+        let row = self.client().query_opt(&sql, &[&id]).await.store()?;
         row.map(|r| row_to_key(&r)).transpose()
     }
 
@@ -816,7 +857,7 @@ impl Session {
         // the admin-listing caller (which filters deleted_at.is_none() itself) and list_keys_since's
         // default fallback, which needs tombstones visible to drive credential eviction downstream.
         let sql = format!("SELECT {KEY_COLUMNS} FROM keys ORDER BY created_at");
-        let rows = self.lock().query(&sql, &[]).await.store()?;
+        let rows = self.client().query(&sql, &[]).await.store()?;
         rows.iter().map(row_to_key).collect()
     }
 
@@ -827,15 +868,16 @@ impl Session {
         let sql = format!(
             "SELECT {KEY_COLUMNS} FROM keys WHERE revision > $1 OR revision = 0 ORDER BY revision"
         );
-        let rows = self.lock().query(&sql, &[&clamp(since)]).await.store()?;
+        let rows = self.client().query(&sql, &[&clamp(since)]).await.store()?;
         rows.iter().map(row_to_key).collect()
     }
 
     pub(crate) async fn delete_key(&mut self, id: &str) -> RecordStoreResult<()> {
         // TOMBSTONE: the `keys` row survives (attribution keeps resolving) and every credential row
-        // is destroyed, in ONE transaction under the SAME revision, so a REPEATABLE READ hydration
-        // snapshot never sees the tombstoned key with its credentials still live.
-        let client = self.lock();
+        // is destroyed, in ONE transaction under the SAME revision, so any one statement sees the
+        // delete whole or not at all; a consumer reading `keys` and `credentials` in two statements
+        // closes the gap between them itself (see `list_credentials_since`).
+        let client = self.client();
         let mut tx = client.transaction().await.store()?;
         let already_deleted: Option<bool> = tx
             .query_opt(
@@ -889,7 +931,7 @@ impl Session {
         window_start: u64,
     ) -> RecordStoreResult<UsageLedger> {
         let ws = clamp(window_start);
-        let client = self.lock();
+        let client = self.client();
         let mut tx = Self::snapshot_consistent_tx(client).await?;
         let (requests, billable_requests): (u64, u64) = match tx
             .query_opt(
@@ -966,7 +1008,7 @@ impl Session {
         let ws = clamp(window_start);
         let rq = clamp(ledger.requests);
         let brq = clamp(ledger.billable_requests);
-        let client = self.lock();
+        let client = self.client();
         let mut tx = client.transaction().await.store()?;
         tx.execute(
             "DELETE FROM usage_ledger WHERE bucket_id=$1 AND window_start=$2",
@@ -1071,7 +1113,7 @@ impl Session {
         bucket: u64,
     ) -> RecordStoreResult<Vec<MeteringRow>> {
         let b = clamp(bucket);
-        let client = self.lock();
+        let client = self.client();
         // ONE snapshot for both reads, so a row's open classes are never read from a different
         // moment than its token columns.
         let mut tx = Self::snapshot_consistent_tx(client).await?;
@@ -1144,7 +1186,7 @@ impl Session {
         &mut self,
         secret: &CredentialSecret,
     ) -> RecordStoreResult<()> {
-        let client = self.lock();
+        let client = self.client();
         let mut tx = client.transaction().await.store()?;
         Self::put_credential_tx(&mut tx, secret).await?;
         tx.commit().await.store()?;
@@ -1156,38 +1198,18 @@ impl Session {
         key: &VirtualKey,
         secret: &CredentialSecret,
     ) -> RecordStoreResult<()> {
-        // ATOMIC mint: the bearer key and its credential commit together or not at all.
-        let (pools, by_kind) = scope_columns(key.allowed_scopes.as_deref());
-        let labels = labels_to_storage(&key.labels);
-        let created = clamp(key.created_at);
-        let expires = key.expires_at.map(clamp);
-        let client = self.lock();
+        // ATOMIC mint: the bearer key and its credential commit together or not at all. A mint
+        // supplies no tombstone (`deleted_at` NULL).
+        let cols = KeyColumns::of(key, None);
+        let client = self.client();
         let mut tx = client.transaction().await.store()?;
         let rev = Self::next_revision(&mut tx).await?;
-        // Same TOMBSTONE PRECONDITION as `put_key`, where it matters most: re-minting over a
-        // tombstoned id must be REFUSED, not clear the tombstone and revive every earlier token. The
-        // insert supplies `deleted_at = NULL`, so the guard is "the stored row must not be a tombstone".
-        let changed = tx.execute(
-            "INSERT INTO keys
-                (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,
-                 idp_subject,binding_mode,minted_by,allowed_scopes_by_kind,idp_provider)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10,$11,$12,$13,$14,$15)
-             ON CONFLICT (id) DO UPDATE SET
-                generation_hash=EXCLUDED.generation_hash, name=EXCLUDED.name,
-                allowed_pools=EXCLUDED.allowed_pools, enabled=EXCLUDED.enabled,
-                key_group=EXCLUDED.key_group, labels=EXCLUDED.labels,
-                expires_at=EXCLUDED.expires_at, revision=EXCLUDED.revision,
-                idp_subject=EXCLUDED.idp_subject, binding_mode=EXCLUDED.binding_mode,
-                minted_by=EXCLUDED.minted_by, allowed_scopes_by_kind=EXCLUDED.allowed_scopes_by_kind,
-                idp_provider=EXCLUDED.idp_provider
-             WHERE keys.deleted_at IS NULL",
-            &[
-                &key.id, &key.generation_hash, &key.name, &pools, &key.enabled, &created,
-                &key.group, &labels, &expires, &rev, &key.idp_subject, &key.binding_mode,
-                &key.minted_by, &by_kind, &key.idp_provider,
-            ],
-        ).await
-        .store()?;
+        // The same TOMBSTONE PRECONDITION as `put_key`, where it matters most: re-minting over a
+        // tombstoned id must be REFUSED, not clear the tombstone and revive every earlier token.
+        let changed = tx
+            .execute(KEY_UPSERT, &cols.params(key, &rev))
+            .await
+            .store()?;
         if changed == 0 {
             return Err(RecordStoreError(format!(
                 "put_key_with_credential: '{}' is tombstoned and its id is never reissued; \
@@ -1205,7 +1227,7 @@ impl Session {
         key_id: &str,
     ) -> RecordStoreResult<Vec<CredentialMeta>> {
         let sql = format!("SELECT {CRED_META_COLUMNS} FROM credentials WHERE key_id=$1");
-        let rows = self.lock().query(&sql, &[&key_id]).await.store()?;
+        let rows = self.client().query(&sql, &[&key_id]).await.store()?;
         rows.iter().map(row_to_cred_meta).collect()
     }
 
@@ -1214,7 +1236,7 @@ impl Session {
         id: &str,
         reason: &str,
     ) -> RecordStoreResult<()> {
-        let client = self.lock();
+        let client = self.client();
         let mut tx = client.transaction().await.store()?;
         let exists: bool = tx
             .query_one(
@@ -1283,7 +1305,7 @@ impl Session {
         let sql = format!(
             "SELECT {CRED_META_COLUMNS},secret FROM credentials WHERE revision > $1 OR revision = 0 ORDER BY revision"
         );
-        let rows = self.lock().query(&sql, &[&clamp(since)]).await.store()?;
+        let rows = self.client().query(&sql, &[&clamp(since)]).await.store()?;
         rows.iter()
             .map(|r| {
                 Ok(CredentialSecret {
@@ -1299,7 +1321,7 @@ impl Session {
 
     pub(crate) async fn list_audit(&mut self) -> RecordStoreResult<Vec<AuditRecord>> {
         let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log ORDER BY seq");
-        let rows = self.lock().query(&sql, &[]).await.store()?;
+        let rows = self.client().query(&sql, &[]).await.store()?;
         rows.iter().map(row_to_audit).collect()
     }
 
@@ -1309,7 +1331,7 @@ impl Session {
     ) -> RecordStoreResult<Vec<AuditRecord>> {
         let sql = format!("SELECT {AUDIT_COLUMNS} FROM audit_log ORDER BY seq DESC LIMIT $1");
         let rows = self
-            .lock()
+            .client()
             .query(&sql, &[&i64::try_from(limit).unwrap_or(i64::MAX)])
             .await
             .store()?;
@@ -1323,7 +1345,7 @@ impl Session {
 
     pub(crate) async fn add_denylist(&mut self, sub: &str, reason: &str) -> RecordStoreResult<()> {
         // `created_at` is a clock read, not the literal 0 (as store-sqlite writes).
-        self.lock()
+        self.client()
             .execute(
                 "INSERT INTO denylist (sub, reason, created_at) VALUES ($1, $2, $3)
                  ON CONFLICT (sub) DO NOTHING",
@@ -1336,7 +1358,7 @@ impl Session {
 
     pub(crate) async fn list_denylist(&mut self) -> RecordStoreResult<Vec<String>> {
         let rows = self
-            .lock()
+            .client()
             .query("SELECT sub FROM denylist", &[])
             .await
             .store()?;
@@ -1360,7 +1382,7 @@ impl Session {
         // UPSERT BY (kind, id): the engine writes through on EVERY transition, so a second write
         // for one id REPLACES the row — the sidecar columns included, which is how a terminal
         // transition reaches the retention sweep and the liveness check.
-        self.lock()
+        self.client()
             .execute(
                 "INSERT INTO plane_records (kind, id, parent, seq, ts, disposition, body)
                  VALUES ($1,$2,$3,$4,$5,$6,$7)
@@ -1391,7 +1413,7 @@ impl Session {
         // authorization check living in the backend is one an unauthorized reader bypasses by
         // configuring a different backend.
         let row = self
-            .lock()
+            .client()
             .query_opt(
                 "SELECT body FROM plane_records WHERE kind=$1 AND id=$2",
                 &[&kind, &id],
@@ -1406,7 +1428,7 @@ impl Session {
         kind: &str,
         selector: &PlaneSelector<'_>,
     ) -> RecordStoreResult<Vec<Vec<u8>>> {
-        let client = self.lock();
+        let client = self.client();
         // One snapshot across both tables.
         let mut tx = Self::snapshot_consistent_tx(client).await?;
         let (records, chain) = match selector {
@@ -1456,7 +1478,7 @@ impl Session {
         // The boot enumeration a restart resumes chains from: every parent holding a record of
         // `kind`, each exactly once.
         let rows = self
-            .lock()
+            .client()
             .query(
                 "SELECT parent FROM plane_chain WHERE kind=$1
                  UNION
@@ -1495,7 +1517,7 @@ impl Session {
         // `disposition` column and never out of the body.
         let cutoff = clamp(before);
         let terminal_only = retention == Retention::TerminalOnly;
-        let client = self.lock();
+        let client = self.client();
         let mut tx = client.transaction().await.store()?;
         // In batches, so no more than `PURGE_BATCH` ids are ever held or bound at once; each
         // batch takes its own child chains.
@@ -1563,7 +1585,7 @@ impl Session {
         // Absent is a NO-OP, not an error: the engine clears on every observation that agrees with
         // the operator rather than tracking whether it had written one. A chain whose parent is
         // `id` goes too, so deleting a record cannot leave part of its chain behind.
-        let client = self.lock();
+        let client = self.client();
         let mut tx = client.transaction().await.store()?;
         tx.execute(
             "DELETE FROM plane_records WHERE kind=$1 AND id=$2",
@@ -1603,7 +1625,7 @@ impl Session {
         // compared against `now` by the sweep, so `i64::MAX` is the same answer.
         let expires = i64::try_from(expires_at).unwrap_or(i64::MAX);
         let cutoff = storable_i64("redeem_plane_token", "now", now)?;
-        let client = self.lock();
+        let client = self.client();
         let mut tx = client.transaction().await.store()?;
         // The eviction sweep, STRICTLY less-than (an entry expiring exactly at `now` is kept) and
         // BEFORE the insert, so it never deletes the row this call records.
@@ -1641,7 +1663,7 @@ impl Session {
             return Ok(false);
         }
         let row = self
-            .lock()
+            .client()
             .query_opt(
                 "SELECT disposition FROM plane_records WHERE kind=$1 AND id=$2",
                 &[&kind, &token],
@@ -1753,9 +1775,8 @@ impl Session {
             ).await
             .store()?;
         if changed == 0 {
-            // Either the slot is occupied by a LIVE credential (the WHERE guard blocked it), or this
-            // is a genuine first insert into a free slot that the ON CONFLICT branch didn't need --
-            // distinguish by checking existence.
+            // The conflict branch matched and its WHERE refused: the slot's credential is live, or
+            // (rarely) it was removed since. Existence tells them apart.
             let exists: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM credentials WHERE key_id=$1 AND kind=$2 AND slot=$3)",
@@ -1770,11 +1791,10 @@ impl Session {
                     m.slot, m.key_id, m.kind
                 )));
             }
-            // Free slot, first insert -- the INSERT branch of the upsert should have applied. If we
-            // get here with changed==0 and no existing row, something else rejected the write (e.g.
-            // a UNIQUE(kind, public_id) violation on a DIFFERENT key/slot) -- surface plainly.
+            // No row in the slot any more (removed between the upsert and this check): nothing was
+            // written. A UNIQUE(kind, public_id) clash raises its own error rather than landing here.
             return Err(RecordStoreError(
-                "put_credential: insert did not apply (public_id may already be in use by another credential)".to_string(),
+                "put_credential: insert did not apply (the slot's credential was removed concurrently; retry)".to_string(),
             ));
         }
         Ok(())
@@ -2068,8 +2088,8 @@ impl Session {
         let parent = record.parent.as_deref().unwrap_or(record.id.as_str());
         let disposition = disposition_to_storage(record.disposition);
         // APPEND-ONLY. A record on an occupied (kind, parent, seq) is IDENTICAL (the write-through
-        // retrying: Ok) or DIFFERENT (a forked chain: an error), as `append_audit` settles a duplicate
-        // seq. The INSERT and the `FOR SHARE` read-back share one transaction so the conflicting row
+        // retrying: Ok) or DIFFERENT (a forked chain: an error), as any append-only chain settles a
+        // duplicate seq. The INSERT and the `FOR SHARE` read-back share one transaction so the conflicting row
         // cannot be purged under the comparison; if it vanishes first this returns `Ok(false)`, never
         // success, and the v3 caller turns that into a failure the kernel retries.
         let inserted = tx
