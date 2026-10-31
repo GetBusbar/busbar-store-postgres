@@ -1623,6 +1623,7 @@ impl Session {
         // rule the call carries (never one inferred from the kind's name), read off the typed
         // `disposition` column and never out of the body.
         let cutoff = clamp(before);
+        let above_sql_maximum = before > i64::MAX as u64;
         let terminal_only = retention == Retention::TerminalOnly;
         let client = self.client();
         let mut tx = client.transaction().await.store()?;
@@ -1633,13 +1634,19 @@ impl Session {
             let ids: Vec<String> = tx
                 .query(
                     "DELETE FROM plane_records
-                     WHERE kind=$1 AND ts < $2 AND (NOT $3 OR disposition = 'terminal')
+                     WHERE kind=$1 AND ($5 OR ts < $2) AND (NOT $3 OR disposition = 'terminal')
                        AND (kind, id) IN
                          (SELECT kind, id FROM plane_records
-                          WHERE kind=$1 AND ts < $2 AND (NOT $3 OR disposition = 'terminal')
+                          WHERE kind=$1 AND ($5 OR ts < $2) AND (NOT $3 OR disposition = 'terminal')
                           LIMIT $4)
                      RETURNING id",
-                    &[&kind, &cutoff, &terminal_only, &PURGE_BATCH],
+                    &[
+                        &kind,
+                        &cutoff,
+                        &terminal_only,
+                        &PURGE_BATCH,
+                        &above_sql_maximum,
+                    ],
                 )
                 .await
                 .store()?
@@ -1670,9 +1677,15 @@ impl Session {
                 .execute(
                     "DELETE FROM plane_chain WHERE ctid IN
                          (SELECT ctid FROM plane_chain
-                          WHERE kind=$1 AND ts < $2 AND (NOT $3 OR disposition = 'terminal')
+                          WHERE kind=$1 AND ($5 OR ts < $2) AND (NOT $3 OR disposition = 'terminal')
                           LIMIT $4)",
-                    &[&kind, &cutoff, &terminal_only, &PURGE_BATCH],
+                    &[
+                        &kind,
+                        &cutoff,
+                        &terminal_only,
+                        &PURGE_BATCH,
+                        &above_sql_maximum,
+                    ],
                 )
                 .await
                 .store()?;
