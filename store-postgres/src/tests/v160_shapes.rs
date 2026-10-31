@@ -115,6 +115,32 @@ fn signed(pairs: &[(&str, i64)]) -> BTreeMap<String, i64> {
     pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
 }
 
+/// A database stamped below the oldest released schema (v6) is refused at open, with the reason.
+#[test]
+fn a_database_stamped_below_v6_is_refused() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_v5");
+    let iso_url = tmp.url();
+    {
+        let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+        c.batch_execute(
+            "CREATE TABLE busbar_schema (version BIGINT PRIMARY KEY);
+             INSERT INTO busbar_schema (version) VALUES (5);",
+        )
+        .unwrap();
+    }
+    let err = TestStore::open(&iso_url)
+        .err()
+        .expect("a pre-release schema is refused");
+    assert!(
+        err.ends_with(
+            "postgres store: database schema v5 predates v6, the oldest released schema; \
+             refusing to open"
+        ),
+        "{err}"
+    );
+}
+
 /// A released 1.5.x database upgrades IN PLACE. Nothing is dropped, every existing row reads back
 /// exactly as it meant under 1.5.x, and the new shapes work on it afterwards.
 #[test]
@@ -611,17 +637,20 @@ fn a_mint_racing_a_delete_never_leaves_a_credential_under_the_tombstone() {
         hard_reset(&setup, &id);
         setup.put_key(&sample_key(&id)).unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mints = std::sync::Mutex::new(Vec::new());
         std::thread::scope(|scope| {
             for slot in 0..2u8 {
                 let (url, id, barrier) = (url.clone(), id.clone(), barrier.clone());
+                let mints = &mints;
                 scope.spawn(move || {
                     let s = connect_store_with_retry(&url).expect("connect");
                     barrier.wait();
-                    let _ = s.put_credential(&sample_cred(
+                    let r = s.put_credential(&sample_cred(
                         &id,
                         slot,
                         &format!("AKIA_RACE_{}_{slot}", id.to_uppercase()),
                     ));
+                    mints.lock().unwrap().push(r);
                 });
             }
             let (url, id, barrier) = (url.clone(), id.clone(), barrier.clone());
@@ -631,7 +660,26 @@ fn a_mint_racing_a_delete_never_leaves_a_credential_under_the_tombstone() {
                 s.delete_key(&id).unwrap();
             });
         });
+        // One of the two documented orders: the mint won (it applied, and the delete's cascade took
+        // it) or the delete won (the mint was refused, naming the tombstone). Nothing else.
+        for r in mints.into_inner().unwrap() {
+            if let Err(e) = r {
+                assert!(
+                    e.0.contains("is tombstoned"),
+                    "round {round}: a mint lost to the delete must say so: {e:?}"
+                );
+            }
+        }
         assert!(setup.get_key(&id).unwrap().unwrap().deleted_at.is_some());
+        // The delete-first order, settled: a mint after the tombstone is refused naming it.
+        let late = setup
+            .put_credential(&sample_cred(
+                &id,
+                0,
+                &format!("AKIA_LATE_{}", id.to_uppercase()),
+            ))
+            .expect_err("a mint under a tombstone is refused");
+        assert!(late.0.contains("is tombstoned"), "{late:?}");
         assert!(
             setup.list_credentials(&id).unwrap().is_empty(),
             "round {round}: a credential survived under a tombstoned key"
