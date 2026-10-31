@@ -1244,10 +1244,10 @@ impl Session {
                 .try_get(0)
                 .store()?;
             if !still_exists {
+                // Deleted (a `delete_key` cascade) or re-keyed by a mint since the check above:
+                // no row answers to this id any more.
                 return Err(RecordStoreError(format!(
-                    "revoke_credential: credential id {id} existed when this call started and \
-                     names no row by the time the revocation was written (a concurrent mint into \
-                     the same slot rewrites the row's id); nothing was revoked"
+                    "revoke_credential: unknown credential id {id}; nothing was revoked"
                 )));
             }
             // The row is there and was already revoked: a true idempotent no-op, exactly what the
