@@ -1449,3 +1449,32 @@ fn an_appended_record_honours_its_actual_parent() {
     assert_eq!(store.get_plane_record(&kind, "solo").unwrap(), None);
     wipe_kind(&store, &kind);
 }
+
+/// R15: `list_plane_records` returns ONE order, (seq, identity) ascending, across the upserted and
+/// the appended rows together.
+#[test]
+fn list_plane_records_is_one_order_across_upserts_and_appends() {
+    let url = require_live_url();
+    let store = connect_store_with_retry(&url).expect("connect");
+    let kind = format!("r15_{}", unique_suffix());
+    wipe_kind(&store, &kind);
+
+    for (id, seq, label) in [("u", 5, "u5"), ("a", 3, "a3"), ("b", 2, "b2")] {
+        store
+            .upsert_plane_record(bare(&kind, id, None, seq, label).view())
+            .unwrap();
+    }
+    for (parent, seq, label) in [("m", 1, "m1"), ("c", 3, "c3")] {
+        store
+            .append_plane_record(bare(&kind, parent, Some(parent), seq, label).view())
+            .unwrap();
+    }
+    let got: Vec<String> = store
+        .list_plane_records(&kind, &PlaneSelector::All)
+        .unwrap()
+        .iter()
+        .map(|b| String::from_utf8(b.clone()).unwrap())
+        .collect();
+    assert_eq!(got, ["m1", "b2", "a3", "c3", "u5"]);
+    wipe_kind(&store, &kind);
+}
