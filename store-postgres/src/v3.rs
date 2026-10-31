@@ -109,6 +109,10 @@ macro_rules! on_conn {
     }};
 }
 
+/// Rows one sweep statement removes, and how many statements one sweep runs at most.
+const SWEEP_BATCH: i64 = 10_000;
+const SWEEP_MAX_BATCHES: usize = 10;
+
 /// How often (seconds) one instance sweeps `store_ops` past its retention.
 const SWEEP_EVERY_SECS: u64 = 60;
 
@@ -190,11 +194,21 @@ impl Session {
             return;
         }
         let before = bits(now.saturating_sub(OP_ID_RETENTION_SECS));
-        // Best effort: a failed sweep leaves rows that the next sweep takes.
-        let _ = self
-            .lock()
-            .execute("DELETE FROM store_ops WHERE recorded_at < $1", &[&before])
-            .await;
+        // Best effort: a failed sweep leaves rows that the next sweep takes. Batched and bounded, so
+        // the first sweep after a long stop is not one huge delete ahead of an admitted write.
+        for _ in 0..SWEEP_MAX_BATCHES {
+            let removed = self
+                .lock()
+                .execute(
+                    "DELETE FROM store_ops WHERE ctid IN
+                         (SELECT ctid FROM store_ops WHERE recorded_at < $1 LIMIT $2)",
+                    &[&before, &SWEEP_BATCH],
+                )
+                .await;
+            if !matches!(removed, Ok(n) if n == SWEEP_BATCH as u64) {
+                break;
+            }
+        }
     }
 
     /// One `op_id`-carrying write in ONE transaction with its dedupe row: a new op runs `apply` and
