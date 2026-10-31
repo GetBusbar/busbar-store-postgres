@@ -644,8 +644,10 @@ impl Session {
             .await
             .store()?;
         }
-        // v13: the deleted slots' tables and `op_id` rows go (digest bodies carry no ':').
-        if version < 13 {
+        // v13: the deleted slots' tables and `op_id` rows go (digest bodies carry no ':'), but only
+        // from a pre-release v11/v12 database that made them: elsewhere a table of that name is
+        // another application's.
+        if (11..13).contains(&version) {
             tx.batch_execute(
                 "DROP TABLE IF EXISTS money_slices;
                  DROP TABLE IF EXISTS money_slots;
