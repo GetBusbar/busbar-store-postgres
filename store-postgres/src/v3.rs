@@ -408,32 +408,57 @@ fn record(bytes: Vec<u8>) -> Result<RecordBytes, String> {
 /// The store section's settings: its `url`. Shared by `validate` and `open`, so their refusals are
 /// the same words.
 fn settings_url(settings: &[u8]) -> Result<String, String> {
+    const BAD: &str = "invalid postgres plugin config";
     let v: serde_json::Value = if settings.trim_ascii().is_empty() {
         serde_json::Value::Object(Default::default())
     } else {
-        serde_json::from_slice(settings)
-            .map_err(|e| format!("invalid postgres plugin config: {e}"))?
+        serde_json::from_slice(settings).map_err(|e| format!("{BAD}: {e}"))?
     };
-    if let Some(map) = v.as_object() {
-        if let Some(k) = map.keys().find(|k| k.as_str() != "url") {
+    let map = match v {
+        serde_json::Value::Null => serde_json::Map::new(),
+        serde_json::Value::Object(m) => m,
+        other => {
             return Err(format!(
-                "invalid postgres plugin config: unknown setting `{k}` (accepted: url)"
-            ));
+                "{BAD}: expected a JSON object, got {}",
+                json_type(&other)
+            ))
         }
+    };
+    if let Some(k) = map.keys().find(|k| k.as_str() != "url") {
+        return Err(format!("{BAD}: unknown setting `{k}` (accepted: url)"));
     }
-    let url = match v.get("url") {
-        None => None,
+    let url = match map.get("url") {
+        None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(s)) => Some(s.as_str()),
-        Some(_) => {
-            return Err("invalid postgres plugin config: `url` must be a string".to_string());
+        Some(other) => {
+            return Err(format!(
+                "{BAD}: `url` must be a string, got {}",
+                json_type(other)
+            ));
         }
     };
     url.map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| {
-            "postgres plugin config requires a \"url\" (a libpq connection string)".to_string()
-        })
+        .ok_or_else(|| format!("{BAD}: `url` is required (a libpq connection string)"))
+}
+
+/// A JSON value's type, as a phrase (never the value).
+fn json_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// The store `settings` name, parsed and not yet connected: `validate` and `open` both run this.
+fn parse_settings(settings: &[u8]) -> Result<PostgresStore, String> {
+    PostgresStore::new(&settings_url(settings)?)
+        .map_err(|e| format!("invalid postgres plugin config: url: {}", e.0))
 }
 
 /// One argument as the slot's body takes it: `:` borrows the owned copy, `=` passes it by value.
@@ -465,7 +490,7 @@ impl StoreSlots for PostgresStore {
     };
 
     fn validate(settings: &[u8]) -> Result<(), String> {
-        settings_url(settings).map(drop)
+        parse_settings(settings).map(drop)
     }
 
     /// Open from the store section's settings:
@@ -476,8 +501,7 @@ impl StoreSlots for PostgresStore {
     ///
     /// The settings are parsed here; the server is reached by the connect step.
     fn open(settings: &[u8], _host: Option<Host>) -> Result<Self, String> {
-        let url = settings_url(settings)?;
-        PostgresStore::new(&url).map_err(|e| e.0)
+        parse_settings(settings)
     }
 
     /// Reach the server and ensure the schema (connect + migrate, at the same moment: the load),

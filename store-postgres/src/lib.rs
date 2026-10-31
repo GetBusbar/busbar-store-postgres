@@ -517,7 +517,10 @@ impl Session {
     ) -> Result<Self, String> {
         match Client::connect(wire, &shared.config, &shared.endpoint).await {
             Ok(client) => Ok(Self { client, shared }),
-            Err(e) => Err(scrub(render_pg_error(&e), shared.secret.as_deref())),
+            Err(e) => Err(format!(
+                "postgres store: failed to connect: {}",
+                scrub(render_pg_error(&e), shared.secret.as_deref())
+            )),
         }
     }
 
