@@ -2368,11 +2368,7 @@ fn usage_cleanup_waits_for_a_usage_writer_and_removes_its_complete_old_window() 
     writer
         .batch_execute(
             "BEGIN;
-         INSERT INTO usage_windows (bucket_id,window_start,requests) VALUES ('writer',9,3);
-         INSERT INTO usage_ledger (bucket_id,window_start,model,tokens_input)
-         VALUES ('writer',9,'alpha',5);
-         INSERT INTO usage_ledger_units (bucket_id,window_start,model,unit,count)
-         VALUES ('writer',9,'alpha','audio_seconds',7);",
+         INSERT INTO usage_windows (bucket_id,window_start,requests) VALUES ('writer',9,3);",
         )
         .unwrap();
     let worker_url = tmp.url();
@@ -2394,7 +2390,7 @@ fn usage_cleanup_waits_for_a_usage_writer_and_removes_its_complete_old_window() 
             .query_one(
                 "SELECT count(*) FROM pg_locks
              WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database())
-               AND relation='usage_ledger'::regclass
+               AND relation='usage_windows'::regclass
                AND mode='ShareRowExclusiveLock' AND NOT granted",
                 &[],
             )
@@ -2408,13 +2404,25 @@ fn usage_cleanup_waits_for_a_usage_writer_and_removes_its_complete_old_window() 
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    writer.batch_execute("COMMIT").unwrap();
+    // Continue the actual windows → ledger → units writer order only after cleanup is waiting.
+    // A cleanup holding the ledger lock while waiting for windows creates a deadlock here.
+    let write = writer.batch_execute(
+        "INSERT INTO usage_ledger (bucket_id,window_start,model,tokens_input)
+         VALUES ('writer',9,'alpha',5);
+         INSERT INTO usage_ledger_units (bucket_id,window_start,model,unit,count)
+         VALUES ('writer',9,'alpha','audio_seconds',7);
+         COMMIT;",
+    );
+    if write.is_err() {
+        writer.batch_execute("ROLLBACK").unwrap();
+    }
     let removed = premature.unwrap_or_else(|| {
         result
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("cleanup finishes after the writer commits")
     });
     worker.join().unwrap();
+    write.expect("the usage writer and cleanup must both finish without a lock-order deadlock");
     assert!(
         waited_on_writer,
         "cleanup must synchronize with the in-flight usage transaction"
