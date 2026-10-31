@@ -223,13 +223,19 @@ fn connect_store_with_retry(url: &str) -> Result<TestStore, String> {
 /// `deleted_at` from a previous run's tombstone would violate `keys_tombstone_disabled`).
 fn hard_reset(store: &TestStore, id: &str) {
     let mut client = store.lock();
-    let _ = client.execute("DELETE FROM credentials WHERE key_id=$1", &[&id]);
-    let _ = client.execute("DELETE FROM keys WHERE id=$1", &[&id]);
-    let _ = client.execute("DELETE FROM usage_metering WHERE key_id=$1", &[&id]);
-    let _ = client.execute("DELETE FROM usage_windows WHERE bucket_id=$1", &[&id]);
-    let _ = client.execute("DELETE FROM usage_ledger WHERE bucket_id=$1", &[&id]);
-    let _ = client.execute("DELETE FROM usage_ledger_units WHERE bucket_id=$1", &[&id]);
-    let _ = client.execute("DELETE FROM usage_metering_units WHERE key_id=$1", &[&id]);
+    for sql in [
+        "DELETE FROM credentials WHERE key_id=$1",
+        "DELETE FROM keys WHERE id=$1",
+        "DELETE FROM usage_metering WHERE key_id=$1",
+        "DELETE FROM usage_windows WHERE bucket_id=$1",
+        "DELETE FROM usage_ledger WHERE bucket_id=$1",
+        "DELETE FROM usage_ledger_units WHERE bucket_id=$1",
+        "DELETE FROM usage_metering_units WHERE key_id=$1",
+    ] {
+        client
+            .execute(sql, &[&id])
+            .unwrap_or_else(|e| panic!("hard_reset `{sql}`: {e}"));
+    }
 }
 
 fn sample_key(id: &str) -> VirtualKey {
@@ -275,14 +281,18 @@ fn sample_cred(key_id: &str, slot: u8, public_id: &str) -> CredentialSecret {
 fn key_roundtrip_new_fields() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    hard_reset(&store, "vk_rt1");
-    hard_reset(&store, "vk_rt2");
+    let (rt1, rt2) = (
+        format!("vk_rt1_{}", unique_suffix()),
+        format!("vk_rt2_{}", unique_suffix()),
+    );
+    hard_reset(&store, &rt1);
+    hard_reset(&store, &rt2);
 
-    let mut k = sample_key("vk_rt1");
+    let mut k = sample_key(&rt1);
     k.expires_at = Some(999);
     k.allowed_scopes = Some(vec![]); // explicit empty grant, must NOT read back as None
     store.put_key(&k).unwrap();
-    let back = store.get_key("vk_rt1").unwrap().unwrap();
+    let back = store.get_key(&rt1).unwrap().unwrap();
     assert_eq!(back.generation_hash, "binding:x:g1");
     assert_eq!(back.expires_at, Some(999));
     assert_eq!(back.deleted_at, None);
@@ -293,10 +303,10 @@ fn key_roundtrip_new_fields() {
     );
     assert!(back.revision > 0, "put_key must stamp a nonzero revision");
 
-    let mut k2 = sample_key("vk_rt2");
+    let mut k2 = sample_key(&rt2);
     k2.allowed_scopes = None; // omitted grant = all pools
     store.put_key(&k2).unwrap();
-    let back2 = store.get_key("vk_rt2").unwrap().unwrap();
+    let back2 = store.get_key(&rt2).unwrap().unwrap();
     assert_eq!(
         back2.allowed_scopes, None,
         "omitted grant must round-trip as None, not Some([])"
@@ -310,11 +320,12 @@ fn key_roundtrip_new_fields() {
 fn delete_key_is_a_tombstone_not_a_hard_delete() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_tombstone1";
+    let id_owned = format!("vk_tombstone1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
 
     let key = sample_key(id);
-    let cred = sample_cred(id, 0, "AKIA_TOMBSTONE1");
+    let cred = sample_cred(id, 0, &format!("AKIA_TOMBSTONE1_{id}"));
     store.put_key_with_credential(&key, &cred).unwrap();
     assert_eq!(store.list_credentials(id).unwrap().len(), 1);
 
@@ -360,7 +371,8 @@ fn delete_key_is_a_tombstone_not_a_hard_delete() {
 fn delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_deleted_at_clock1";
+    let id_owned = format!("vk_deleted_at_clock1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
     store.put_key(&sample_key(id)).unwrap();
 
@@ -411,11 +423,12 @@ fn delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision() {
 fn put_key_with_credential_refuses_to_remint_over_a_tombstone() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_remint_over_tombstone1";
+    let id_owned = format!("vk_remint_over_tombstone1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
 
     let key = sample_key(id);
-    let cred = sample_cred(id, 0, "AKIA_REMINT1");
+    let cred = sample_cred(id, 0, &format!("AKIA_REMINT1_{id}"));
     store.put_key_with_credential(&key, &cred).unwrap();
     store.delete_key(id).unwrap();
     let tombstoned = store.get_key(id).unwrap().unwrap();
@@ -427,7 +440,7 @@ fn put_key_with_credential_refuses_to_remint_over_a_tombstone() {
     let mut remint = sample_key(id);
     remint.enabled = true;
     remint.deleted_at = None;
-    let remint_cred = sample_cred(id, 0, "AKIA_REMINT1_NEW");
+    let remint_cred = sample_cred(id, 0, &format!("AKIA_REMINT1_NEW_{id}"));
     let err = store
         .put_key_with_credential(&remint, &remint_cred)
         .expect_err("re-minting over a tombstoned id must be refused, not silently resurrected");
@@ -462,20 +475,21 @@ fn put_key_with_credential_refuses_to_remint_over_a_tombstone() {
 fn credential_slot_guard_rejects_clobbering_a_live_credential() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_slotguard1";
+    let id_owned = format!("vk_slotguard1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
     store.put_key(&sample_key(id)).unwrap();
 
-    let c0 = sample_cred(id, 0, "AKIA_SLOT0_A");
+    let c0 = sample_cred(id, 0, &format!("AKIA_SLOT0_A_{id}"));
     store.put_credential(&c0).unwrap();
 
     // Same slot, different public_id, while c0 is still LIVE -- must be rejected.
-    let c0b = sample_cred(id, 0, "AKIA_SLOT0_B");
+    let c0b = sample_cred(id, 0, &format!("AKIA_SLOT0_B_{id}"));
     let err = store.put_credential(&c0b);
     assert!(err.is_err(), "minting into an occupied LIVE slot must fail");
     // The original credential must be untouched.
     let live = store
-        .lookup_credential_secret("sigv4", "AKIA_SLOT0_A")
+        .lookup_credential_secret("sigv4", &format!("AKIA_SLOT0_A_{id}"))
         .unwrap();
     assert!(
         live.is_some(),
@@ -483,17 +497,17 @@ fn credential_slot_guard_rejects_clobbering_a_live_credential() {
     );
 
     // Slot 1 is free -- overlap-window rotation must succeed.
-    let c1 = sample_cred(id, 1, "AKIA_SLOT1_A");
+    let c1 = sample_cred(id, 1, &format!("AKIA_SLOT1_A_{id}"));
     store.put_credential(&c1).unwrap();
     assert_eq!(store.list_credentials(id).unwrap().len(), 2);
 
     // Revoke slot 0, then re-minting into it must succeed (revoked slots are reusable).
     let cred0_id = c0.meta.id.clone();
     store.revoke_credential(&cred0_id, "rotated").unwrap();
-    let c0c = sample_cred(id, 0, "AKIA_SLOT0_C");
+    let c0c = sample_cred(id, 0, &format!("AKIA_SLOT0_C_{id}"));
     store.put_credential(&c0c).unwrap();
     let resolved = store
-        .lookup_credential_secret("sigv4", "AKIA_SLOT0_C")
+        .lookup_credential_secret("sigv4", &format!("AKIA_SLOT0_C_{id}"))
         .unwrap()
         .expect("re-mint into a revoked slot must succeed");
     assert_eq!(resolved.meta.slot, 0);
@@ -509,11 +523,12 @@ fn credential_slot_guard_rejects_clobbering_a_live_credential() {
 fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_updated_at1";
+    let id_owned = format!("vk_updated_at1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
     store.put_key(&sample_key(id)).unwrap();
 
-    let mut cred = sample_cred(id, 0, "AKIA_UPDATEDAT1");
+    let mut cred = sample_cred(id, 0, &format!("AKIA_UPDATEDAT1_{id}"));
     cred.meta.created_at = 100;
     cred.meta.updated_at = 200;
     store.put_credential(&cred).unwrap();
@@ -522,7 +537,7 @@ fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
         .list_credentials(id)
         .unwrap()
         .into_iter()
-        .find(|m| m.public_id == "AKIA_UPDATEDAT1")
+        .find(|m| m.public_id == format!("AKIA_UPDATEDAT1_{id}"))
         .expect("the minted credential must be listed");
     assert_eq!(got.created_at, 100, "created_at must round-trip untouched");
     assert_eq!(
@@ -540,11 +555,12 @@ fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
 fn revoke_credential_is_independent_of_the_key_and_other_slots() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_revoke1";
+    let id_owned = format!("vk_revoke1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
     store.put_key(&sample_key(id)).unwrap();
-    let c0 = sample_cred(id, 0, "AKIA_REVOKE1_A");
-    let c1 = sample_cred(id, 1, "AKIA_REVOKE1_B");
+    let c0 = sample_cred(id, 0, &format!("AKIA_REVOKE1_A_{id}"));
+    let c1 = sample_cred(id, 1, &format!("AKIA_REVOKE1_B_{id}"));
     store.put_credential(&c0).unwrap();
     store.put_credential(&c1).unwrap();
 
@@ -577,7 +593,7 @@ fn revoke_credential_is_independent_of_the_key_and_other_slots() {
     // `revoked_at.is_some()` has been asserted above, so it would pass no matter what this lookup
     // returned.
     let resolved = store
-        .lookup_credential_secret("sigv4", "AKIA_REVOKE1_A")
+        .lookup_credential_secret("sigv4", &format!("AKIA_REVOKE1_A_{id}"))
         .unwrap()
         .expect("the verify path must still resolve a revoked credential, not report it unknown");
     assert!(
@@ -595,7 +611,7 @@ fn revoke_credential_is_independent_of_the_key_and_other_slots() {
     // the case that must come back LIVE, and it is the only thing here that can fail if liveness
     // stops discriminating.
     let untouched = store
-        .lookup_credential_secret("sigv4", "AKIA_REVOKE1_B")
+        .lookup_credential_secret("sigv4", &format!("AKIA_REVOKE1_B_{id}"))
         .unwrap()
         .expect("the other slot's credential must still resolve");
     assert!(
@@ -623,7 +639,8 @@ fn revoke_credential_is_independent_of_the_key_and_other_slots() {
 fn revoke_credential_errors_on_an_unknown_id_but_stays_idempotent_on_a_revoked_one() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_revoke_unknown1";
+    let id_owned = format!("vk_revoke_unknown1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
     store.put_key(&sample_key(id)).unwrap();
 
@@ -639,7 +656,7 @@ fn revoke_credential_errors_on_an_unknown_id_but_stays_idempotent_on_a_revoked_o
     // The idempotent half. Asserting only that the second call returns Ok pins almost nothing:
     // deleting the `AND revoked_at IS NULL` guard, or the whole UPDATE, leaves both calls
     // returning Ok. A no-op means the row is UNCHANGED, so read it back on both sides.
-    let cred = sample_cred(id, 0, "AKIA_REVOKE_UNKNOWN1");
+    let cred = sample_cred(id, 0, &format!("AKIA_REVOKE_UNKNOWN1_{id}"));
     store.put_credential(&cred).unwrap();
     store.revoke_credential(&cred.meta.id, "leaked").unwrap();
     let after_first = store
@@ -693,11 +710,12 @@ fn revoke_credential_errors_on_an_unknown_id_but_stays_idempotent_on_a_revoked_o
 fn hydration_delta_makes_credential_deletion_observable_via_the_key_tombstone() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_hydrate1";
+    let id_owned = format!("vk_hydrate1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
 
     let key = sample_key(id);
-    let cred = sample_cred(id, 0, "AKIA_HYDRATE1");
+    let cred = sample_cred(id, 0, &format!("AKIA_HYDRATE1_{id}"));
     store.put_key_with_credential(&key, &cred).unwrap();
 
     // Establish a watermark AFTER the mint (so the delete is the only thing after it).
@@ -748,10 +766,11 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
     // other delete does not pay, so the two deletes ran one after the other and the race this test
     // names never happened.
     let store_c = connect_store_with_retry(&url).expect("connect c");
-    let id = "vk_concurrent_del1";
+    let id_owned = format!("vk_concurrent_del1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store_a, id);
     store_a.put_key(&sample_key(id)).unwrap();
-    let cred = sample_cred(id, 0, "AKIA_CONCURRENT1");
+    let cred = sample_cred(id, 0, &format!("AKIA_CONCURRENT1_{id}"));
     store_a.put_credential(&cred).unwrap();
 
     let start = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -776,110 +795,53 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
     assert!(store_a.list_credentials(id).unwrap().is_empty());
 }
 
-/// THE actual torn-read proof the previous test's docstring used to promise but never ran: a
-/// concurrent add_usage landing between get_usage's requests-row read and its model-rows read must
-/// not be half-visible. Drives get_usage's own two-step read manually (its real SQL, via the same
-/// `snapshot_consistent_tx` helper it uses internally) so a write can be deliberately interleaved
-/// between the two steps on a SEPARATE connection, then asserts REPEATABLE READ's snapshot held: the
-/// second read still sees the pre-interleave state, not the concurrent writer's new model row.
-///
-/// Non-vacuous: downgrading `snapshot_consistent_tx`'s isolation level to READ COMMITTED makes the
-/// `model_count` assertion below fail, because the second read then observes the interleaved
-/// writer's new model row.
+/// A concurrent `add_usage` landing between `get_usage`'s reads must not be half-visible. A writer
+/// adds one request and one NEW model per call, so any consistent snapshot has exactly as many model
+/// rows as requests; `get_usage` itself is read in a loop against it. Non-vacuous: downgrading
+/// `snapshot_consistent_tx` to READ COMMITTED makes a read observe the counter and the models of
+/// different commits.
 #[test]
-fn get_usage_snapshot_does_not_observe_a_concurrent_add_usage_between_its_two_reads() {
+fn get_usage_never_returns_a_torn_snapshot_under_a_concurrent_writer() {
     let Some(url) = live_url() else { return };
-    let store = connect_store_with_retry(&url).expect("connect");
-    let bucket = "vk_torn_read1";
+    let reader = connect_store_with_retry(&url).expect("connect");
+    let writer = connect_store_with_retry(&url).expect("connect");
+    let bucket = format!("vk_torn_{}", unique_suffix());
     let ws = 20_270_301u64;
-    hard_reset(&store, bucket);
-    let _ = store
-        .lock()
-        .execute("DELETE FROM usage_windows WHERE bucket_id=$1", &[&bucket]);
-    let _ = store
-        .lock()
-        .execute("DELETE FROM usage_ledger WHERE bucket_id=$1", &[&bucket]);
-
-    // Seed one model row so the "before" state is non-empty and distinguishable from "after".
-    store
-        .put_usage(
-            bucket,
-            ws,
-            &UsageLedger {
-                requests: 10,
-                billable_requests: 10,
-                models: vec![mt("seed-model", 1, 1, 0, 0)],
-            },
-        )
-        .unwrap();
-
-    // Open the snapshot and take the FIRST of get_usage's two reads (the requests row) manually.
-    // This SECOND connection is genuinely required (the snapshot must stay open here while `store`
-    // writes on its own connection below), so it can't be reused away like the sibling isolation
-    // test's -- instead its connect is bounded-retried to absorb transient connection-pressure
-    // refusals under the gate's parallel load.
-    let mut client = connect_client_with_retry(&url);
-    // `snapshot_consistent_tx`'s statement, on this independent connection.
-    let mut tx = client
-        .build_transaction()
-        .isolation_level(postgres::IsolationLevel::RepeatableRead)
-        .start()
-        .unwrap();
-    let _requests_row = tx
-        .query_one(
-            "SELECT requests, billable_requests FROM usage_windows WHERE bucket_id=$1 AND window_start=$2",
-            &[&bucket, &clamp(ws)],
-        )
-        .unwrap();
-
-    // Interleave: a SEPARATE connection commits an add_usage that adds a brand-new model row and
-    // bumps requests, fully committed before this transaction's second read runs. `store` is already
-    // an independent connection from the snapshot's `client` (a distinct `Client::connect` above) and
-    // is idle here, so it IS the required separate writer -- reusing it (rather than opening a third
-    // connection) keeps the interleave semantics identical while removing a connect()/migrate() that
-    // could fail under a shared CI Postgres's connection pressure (the observed gate flake: the third
-    // connect's `.expect` panicked, never the isolation assertion below).
-    store
-        .add_usage(
-            bucket,
-            ws,
-            &UsageDelta {
-                requests: 5,
-                billable_requests: 5,
-                models: vec![mtd("concurrent-writer-model", 1, 1, 0, 0)],
-            },
-        )
-        .unwrap();
-
-    // The SECOND read, same transaction/snapshot: under REPEATABLE READ this must still see only
-    // the pre-interleave model row, not the concurrent writer's new one.
-    let model_rows = tx
-        .query(
-            "SELECT model FROM usage_ledger WHERE bucket_id=$1 AND window_start=$2",
-            &[&bucket, &clamp(ws)],
-        )
-        .unwrap();
-    tx.commit().unwrap();
-
-    let models: Vec<String> = model_rows.iter().map(|r| r.get(0)).collect();
-    assert_eq!(
-        models,
-        vec!["seed-model".to_string()],
-        "a REPEATABLE READ snapshot must not observe a model row committed by a concurrent \
-         add_usage after this transaction began; observed: {models:?}"
-    );
-
-    // Sanity: the interleaved write DID land for a fresh read (proves it wasn't silently a no-op).
-    let after = store.get_usage(bucket, ws).unwrap();
-    assert_eq!(
-        after.requests, 15,
-        "the concurrent add_usage must have applied for a fresh read"
-    );
-    assert_eq!(
-        after.models.len(),
-        2,
-        "both models must be present for a fresh read"
-    );
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let reads = std::thread::scope(|s| {
+        let w = s.spawn(|| {
+            for i in 0..400 {
+                writer
+                    .add_usage(
+                        &bucket,
+                        ws,
+                        &UsageDelta {
+                            requests: 1,
+                            billable_requests: 1,
+                            models: vec![mtd(format!("m{i}"), 1, 0, 0, 0)],
+                        },
+                    )
+                    .unwrap();
+            }
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let mut reads = 0;
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            let got = reader.get_usage(&bucket, ws).unwrap();
+            assert_eq!(
+                got.models.len() as u64,
+                got.requests,
+                "a torn read: {} requests beside {} model rows",
+                got.requests,
+                got.models.len()
+            );
+            reads += 1;
+        }
+        w.join().unwrap();
+        reads
+    });
+    assert!(reads > 0);
+    hard_reset(&reader, &bucket);
 }
 
 /// usage_metering round-trip including the new fields (billable_requests, key_group_at_use,
@@ -889,10 +851,11 @@ fn metering_roundtrip_new_fields() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
     let bucket = 20_270_101u64;
-    hard_reset(&store, "vk_meter_new1");
+    let meter_key = format!("vk_meter_new1_{}", unique_suffix());
+    hard_reset(&store, &meter_key);
     store
         .add_metering(&busbar_contract::records::MeteringDelta {
-            key_id: "vk_meter_new1".into(),
+            key_id: meter_key.clone(),
             bucket,
             model: "m".into(),
             provider: "p".into(),
@@ -909,7 +872,7 @@ fn metering_roundtrip_new_fields() {
         })
         .unwrap();
     let rows = store.list_metering(bucket).unwrap();
-    let row = rows.iter().find(|r| r.key_id == "vk_meter_new1").unwrap();
+    let row = rows.iter().find(|r| r.key_id == meter_key).unwrap();
     assert_eq!(row.tokens_cache_write, 2);
     assert_eq!(row.billable_requests, 2);
     assert_eq!(row.key_group_at_use, "growth");
@@ -978,15 +941,16 @@ fn is_undefined_table_matches_only_the_real_sqlstate() {
 fn labels_round_trip_non_empty_map() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    hard_reset(&store, "vk_labels_rt");
+    let labels_id = format!("vk_labels_rt_{}", unique_suffix());
+    hard_reset(&store, &labels_id);
 
-    let mut k = sample_key("vk_labels_rt");
+    let mut k = sample_key(&labels_id);
     k.labels = std::collections::BTreeMap::from([
         ("team".to_string(), "growth".to_string()),
         ("env".to_string(), "prod".to_string()),
     ]);
     store.put_key(&k).unwrap();
-    let back = store.get_key("vk_labels_rt").unwrap().unwrap();
+    let back = store.get_key(&labels_id).unwrap().unwrap();
     assert_eq!(back.labels.get("team").map(String::as_str), Some("growth"));
     assert_eq!(back.labels.get("env").map(String::as_str), Some("prod"));
     assert_eq!(back.labels.len(), 2);
@@ -1027,7 +991,8 @@ fn secret_form_storage_round_trip_all_variants() {
 fn put_usage_and_add_usage_batch_multiple_models_correctly() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let bucket = "vk_multi_model_batch";
+    let bucket_owned = format!("vk_multi_model_batch_{}", unique_suffix());
+    let bucket = bucket_owned.as_str();
     let ws = 20_270_401u64;
     let ws2 = ws + 1;
     for w in [ws, ws2] {
@@ -1100,13 +1065,87 @@ fn put_usage_and_add_usage_batch_multiple_models_correctly() {
     assert_eq!(models2[1].tier(UNIT_OUTPUT), 11);
 }
 
-/// The denylist pair, previously untested in either direction. `add_denylist` is an UPSERT whose
-/// `DO UPDATE SET reason` half is the part that can silently rot: downgrading it to `DO NOTHING`
-/// keeps every "is this subject denied" check passing while quietly pinning the reason to whatever
-/// the first call said, so a re-denylist with a corrected reason reports success and changes
-/// nothing.
+/// A BIGINT accrual pins at `i64::MAX` (rule 8): an upstream's huge count never fails the batch.
 #[test]
-fn denylist_add_is_listed_and_a_repeat_add_updates_the_reason() {
+fn usage_accruals_pin_at_the_column_maximum() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let max = i64::MAX;
+    let bucket = format!("vk_sat_{}", unique_suffix());
+    let ws = 20_270_501u64;
+    let mut open_units = mtd("m", max, max, max, max);
+    open_units.usage_units.insert("audio_s".into(), max);
+    let delta = UsageDelta {
+        requests: max,
+        billable_requests: max,
+        models: vec![open_units],
+    };
+    store.add_usage(&bucket, ws, &delta).unwrap();
+    store.add_usage(&bucket, ws, &delta).unwrap();
+    let got = store.get_usage(&bucket, ws).unwrap();
+    assert_eq!(got.requests, max as u64);
+    assert_eq!(got.billable_requests, max as u64);
+    assert_eq!(got.models[0].tier(UNIT_INPUT), max as u64);
+    assert_eq!(got.models[0].tier(UNIT_CACHE_WRITE), max as u64);
+    assert_eq!(got.models[0].tier("audio_s"), max as u64);
+    // A refund still lands off the pin.
+    let mut refund = mtd("m", -1, 0, 0, 0);
+    refund.usage_units.insert("audio_s".into(), -1);
+    store
+        .add_usage(
+            &bucket,
+            ws,
+            &UsageDelta {
+                requests: -1,
+                billable_requests: 0,
+                models: vec![refund],
+            },
+        )
+        .unwrap();
+    let got = store.get_usage(&bucket, ws).unwrap();
+    assert_eq!(got.requests, max as u64 - 1);
+    assert_eq!(got.models[0].tier(UNIT_INPUT), max as u64 - 1);
+    assert_eq!(got.models[0].tier("audio_s"), max as u64 - 1);
+}
+
+/// The metering twin of the usage pin above.
+#[test]
+fn metering_accruals_pin_at_the_column_maximum() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let max = i64::MAX;
+    let key = format!("vk_sat_m_{}", unique_suffix());
+    let mut units = BTreeMap::new();
+    units.insert("audio_s".to_string(), u64::MAX);
+    let meter = busbar_contract::records::MeteringDelta {
+        key_id: key.clone(),
+        bucket: 20_270_502,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: u64::MAX,
+        tokens_output: u64::MAX,
+        tokens_cache_read: u64::MAX,
+        tokens_cache_write: u64::MAX,
+        requests: u64::MAX,
+        billable_requests: u64::MAX,
+        key_group_at_use: "g".into(),
+        pricing_version: "v".into(),
+        priced_from_ms: 0,
+        usage_units: units,
+    };
+    store.add_metering(&meter).unwrap();
+    store.add_metering(&meter).unwrap();
+    let rows = store.list_metering(20_270_502).unwrap();
+    let row = rows.iter().find(|r| r.key_id == key).unwrap();
+    assert_eq!(row.tokens_input, max as u64);
+    assert_eq!(row.requests, max as u64);
+    assert_eq!(row.billable_requests, max as u64);
+    assert_eq!(row.usage_units["audio_s"], max as u64);
+}
+
+/// The denylist pair: `add_denylist` is idempotent, a repeat add keeps the first reason.
+#[test]
+fn denylist_add_is_listed_and_a_repeat_add_is_a_no_op() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
     let sub = format!("sub_denylist_{}", unique_suffix());
@@ -1155,8 +1194,8 @@ fn denylist_add_is_listed_and_a_repeat_add_updates_the_reason() {
         .unwrap()
         .get(0);
     assert_eq!(
-        stored_reason, "corrected reason",
-        "re-denylisting a subject must update the recorded reason, not silently keep the old one"
+        stored_reason, "first reason",
+        "re-denylisting a subject is a no-op (the contract): the first reason stands"
     );
     let occurrences = store
         .list_denylist()
@@ -1466,11 +1505,36 @@ impl Drop for TempDb {
     }
 }
 
-/// `migrate_locked`'s undefined-table bootstrap path AND its legacy-table drop, together, on a
-/// genuinely fresh (separate, disposable) database rather than the shared test database -- which,
-/// once any test has run against it, never again presents an undefined `busbar_schema` or a
-/// version < `SCHEMA_VERSION`, so this code was structurally unreachable from every other test in
-/// this file.
+/// Every store transaction opens with `SET LOCAL lock_timeout` and
+/// `idle_in_transaction_session_timeout` (no startup `options`, which poolers refuse): a trigger
+/// on `keys` reports what the transaction sees.
+#[test]
+fn a_store_transaction_runs_with_the_lock_and_idle_timeouts() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_txto");
+    let iso_url = tmp.url();
+    let store = connect_store_with_retry(&iso_url).expect("fresh open");
+    store
+        .lock()
+        .batch_execute(
+            "CREATE FUNCTION probe_timeouts() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+                 RAISE EXCEPTION 'probe lock_timeout=% idle=%',
+                     current_setting('lock_timeout'),
+                     current_setting('idle_in_transaction_session_timeout');
+             END $$;
+             CREATE TRIGGER probe BEFORE INSERT ON keys
+                 FOR EACH ROW EXECUTE FUNCTION probe_timeouts();",
+        )
+        .unwrap();
+    let e = store.put_key(&sample_key("txto")).unwrap_err().to_string();
+    assert!(e.contains("probe lock_timeout=30s idle=1min"), "{e}");
+}
+
+/// `migrate_locked`'s undefined-table bootstrap path on a genuinely fresh (separate, disposable)
+/// database rather than the shared test database -- which, once any test has run against it, never
+/// again presents an undefined `busbar_schema` or a version < `SCHEMA_VERSION`, so this code was
+/// structurally unreachable from every other test in this file. (The v12 -> v13 drops are
+/// `the_v13_upgrade_drops_the_money_and_dead_slot_tables`.)
 #[test]
 fn migrate_bootstraps_fresh_database() {
     let Some(url) = live_url() else { return };
@@ -1492,6 +1556,322 @@ fn migrate_bootstraps_fresh_database() {
 
     drop(store);
     drop(check);
+}
+
+/// The v13 drops belong to a pre-release v11/v12 database only: on a fresh database or a released
+/// v6-v10 upgrade, a table of that name on a shared database is some other application's.
+#[test]
+fn the_v13_drops_never_touch_a_fresh_or_a_released_database() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_v13keep");
+    let iso_url = tmp.url();
+    let other_apps =
+        "CREATE TABLE store_sessions (session TEXT); CREATE TABLE money_slots (slot TEXT);";
+    postgres::Client::connect(&iso_url, postgres::NoTls)
+        .unwrap()
+        .batch_execute(other_apps)
+        .unwrap();
+    drop(connect_store_with_retry(&iso_url).expect("fresh open"));
+    let kept = |c: &mut postgres::Client| -> bool {
+        c.query_one(
+            "SELECT to_regclass('store_sessions') IS NOT NULL AND to_regclass('money_slots') IS NOT NULL",
+            &[],
+        )
+        .unwrap()
+        .get(0)
+    };
+    let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+    assert!(
+        kept(&mut c),
+        "a fresh open dropped another application's table"
+    );
+
+    c.batch_execute("DELETE FROM busbar_schema; INSERT INTO busbar_schema (version) VALUES (10);")
+        .unwrap();
+    drop(connect_store_with_retry(&iso_url).expect("v10 upgrade"));
+    assert!(
+        kept(&mut c),
+        "a v10 upgrade dropped another application's table"
+    );
+}
+
+/// Schema v13 drops the pre-release money/journal tables and their `op_id` rows (README); the kept
+/// slots' rows and every other table survive.
+#[test]
+fn the_v13_upgrade_drops_the_money_and_dead_slot_tables() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_v13");
+    let iso_url = tmp.url();
+    drop(connect_store_with_retry(&iso_url).expect("fresh open"));
+    {
+        let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+        c.batch_execute(
+            "CREATE TABLE money_slots (slot TEXT PRIMARY KEY);
+             CREATE TABLE money_slices (slot TEXT);
+             CREATE TABLE money_epoch (epoch BIGINT);
+             CREATE TABLE store_journal (stream TEXT);
+             CREATE TABLE store_sessions (session TEXT);
+             INSERT INTO store_ops (op_id, body, answer, recorded_at) VALUES
+                 ('\\x01', 'reserve:cells', '', 1),
+                 ('\\x02', 'append_batch:x', '', 1),
+                 ('\\x03', 'add_usage_batch:x', '', 1),
+                 ('\\x04', 'add_metering_batch:x', '', 1),
+                 ('\\x05', 'append_plane_record:x', '', 1),
+                 ('\\x06', 'abcdef0123', '', 1);
+             INSERT INTO store_records (schema_id, key, value) VALUES ('s', '\\x01', '\\x02');
+             DELETE FROM busbar_schema;
+             INSERT INTO busbar_schema (version) VALUES (12);",
+        )
+        .unwrap();
+    }
+    drop(connect_store_with_retry(&iso_url).expect("v12 upgrade"));
+    let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+    for t in [
+        "money_slots",
+        "money_slices",
+        "money_epoch",
+        "store_journal",
+        "store_sessions",
+    ] {
+        let there: bool = c
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[&t])
+            .unwrap()
+            .get(0);
+        assert!(!there, "{t} must be dropped by the v13 upgrade");
+    }
+    let kept: Vec<String> = c
+        .query("SELECT body FROM store_ops ORDER BY body", &[])
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            "abcdef0123",
+            "add_metering_batch:x",
+            "add_usage_batch:x",
+            "append_plane_record:x"
+        ]
+    );
+    let records: i64 = c
+        .query_one("SELECT COUNT(*) FROM store_records", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(records, 1);
+    let version: i64 = c
+        .query_one("SELECT MAX(version) FROM busbar_schema", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(version, SCHEMA_VERSION);
+}
+
+/// A row decoder meeting a column of an unexpected type, or a NULL where the store reads a value,
+/// answers an error naming the column (never the value), not a panic.
+#[test]
+fn a_row_that_does_not_decode_is_an_error_not_a_panic() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_decode");
+    let iso_url = tmp.url();
+    let store = connect_store_with_retry(&iso_url).expect("connect");
+    store
+        .lock()
+        .batch_execute(
+            "ALTER TABLE usage_windows ALTER COLUMN requests TYPE INTEGER;
+             INSERT INTO usage_windows (bucket_id, window_start, requests) VALUES ('b', 1, 77);
+             ALTER TABLE keys ALTER COLUMN name DROP NOT NULL;
+             INSERT INTO keys (id, generation_hash, name, created_at) VALUES ('k', 'g', NULL, 1);",
+        )
+        .unwrap();
+    let err = store
+        .get_usage("b", 1)
+        .expect_err("an int4 column is not i64");
+    assert!(err.0.contains("requests"), "{err:?}");
+    assert!(!err.0.contains("77"), "{err:?}");
+    let err = store.get_key("k").expect_err("NULL into a non-Option");
+    assert!(err.0.contains("name"), "{err:?}");
+}
+
+/// An op held on the server (here waiting on the `store_revision` row lock) does not hold up a
+/// second op: the instance keeps more than one connection.
+#[test]
+fn a_held_op_does_not_block_a_second_op() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let mut holder = connect_client_with_retry(&url);
+    holder
+        .batch_execute("BEGIN; UPDATE store_revision SET revision = revision WHERE only_row")
+        .unwrap();
+    let id = format!("vk_held_{}", unique_suffix());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        let held = s.spawn(|| store.put_key(&sample_key(&id)));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        s.spawn(|| {
+            let _ = tx.send(store.get_key("vk_held_nothing_here"));
+        });
+        let second = rx.recv_timeout(std::time::Duration::from_secs(5));
+        holder.batch_execute("ROLLBACK").unwrap();
+        held.join()
+            .unwrap()
+            .expect("the held put_key finishes once released");
+        assert!(
+            matches!(second, Ok(Ok(None))),
+            "a second op must run while the first is held: {second:?}"
+        );
+    });
+    hard_reset(&store, &id);
+}
+
+/// `since = 0` returns every row, and a row at revision 0 (a 1.5.x row the revision bump never
+/// touched) always reads as changed.
+#[test]
+fn revision_zero_rows_are_in_every_delta() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let id = format!("vk_rev0_{}", unique_suffix());
+    hard_reset(&store, &id);
+    store
+        .lock()
+        .batch_execute(&format!(
+            "INSERT INTO keys (id, generation_hash, name, created_at, revision)
+                 VALUES ('{id}', 'g', 'n', 1, 0);
+             INSERT INTO credentials (id, key_id, kind, slot, public_id, secret, secret_form,
+                                      created_at, updated_at, revision)
+                 VALUES ('c_{id}', '{id}', 'sigv4', 0, 'p_{id}', 's', 'recoverable', 1, 1, 0);"
+        ))
+        .unwrap();
+    for since in [0, 1, u64::MAX / 2] {
+        assert!(
+            store
+                .list_keys_since(since)
+                .unwrap()
+                .iter()
+                .any(|k| k.id == id),
+            "key at revision 0, since {since}"
+        );
+        assert!(
+            store
+                .list_credentials_since(since)
+                .unwrap()
+                .iter()
+                .any(|c| c.meta.key_id == id),
+            "credential at revision 0, since {since}"
+        );
+    }
+    hard_reset(&store, &id);
+}
+
+/// Re-minting a revoked slot is a new credential: its `created_at` is the new mint's.
+#[test]
+fn re_minting_a_revoked_slot_takes_the_new_created_at() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let id = format!("vk_remint_{}", unique_suffix());
+    hard_reset(&store, &id);
+    store.put_key(&sample_key(&id)).unwrap();
+    let mut first = sample_cred(&id, 0, &format!("AKIA_RM1_{id}"));
+    first.meta.created_at = 100;
+    store.put_credential(&first).unwrap();
+    store.revoke_credential(&first.meta.id, "rotated").unwrap();
+    let mut second = sample_cred(&id, 0, &format!("AKIA_RM2_{id}"));
+    second.meta.created_at = 500;
+    second.meta.updated_at = 500;
+    store.put_credential(&second).unwrap();
+    let got = store.list_credentials(&id).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].created_at, 500, "not the predecessor's 100");
+    hard_reset(&store, &id);
+}
+
+/// The redeem sweep (`kind`, `expires_at`) has its index on a fresh database.
+#[test]
+fn plane_tokens_has_its_sweep_index() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_idx");
+    let store = connect_store_with_retry(&tmp.url()).expect("connect");
+    let def: Option<String> = store
+        .lock()
+        .query_opt(
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'plane_tokens_kind_expires'",
+            &[],
+        )
+        .unwrap()
+        .map(|r| r.get(0));
+    assert!(
+        def.is_some_and(|d| d.contains("(kind, expires_at)")),
+        "plane_tokens_kind_expires on (kind, expires_at)"
+    );
+}
+
+/// A credential deleted (a `delete_key` cascade) between the revoke's existence check and its
+/// write names no row any more: the unknown-id error, not a story about a concurrent mint.
+#[test]
+fn revoking_a_credential_deleted_underneath_says_unknown_id() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let id = format!("vk_revdel_{}", unique_suffix());
+    hard_reset(&store, &id);
+    store.put_key(&sample_key(&id)).unwrap();
+    let cred = sample_cred(&id, 0, &format!("AKIA_RD_{id}"));
+    store.put_credential(&cred).unwrap();
+    let mut holder = connect_client_with_retry(&url);
+    holder
+        .batch_execute(&format!(
+            "BEGIN; SELECT 1 FROM credentials WHERE id = '{}' FOR UPDATE",
+            cred.meta.id
+        ))
+        .unwrap();
+    let err = std::thread::scope(|s| {
+        let revoke = s.spawn(|| store.revoke_credential(&cred.meta.id, "r"));
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        holder
+            .batch_execute(&format!(
+                "DELETE FROM credentials WHERE id = '{}'; COMMIT",
+                cred.meta.id
+            ))
+            .unwrap();
+        revoke.join().unwrap().expect_err("the row is gone")
+    });
+    assert_eq!(
+        err.0,
+        format!("revoke_credential: unknown id '{}'", cred.meta.id),
+        "{err:?}"
+    );
+    assert!(!err.0.contains("concurrent mint"), "{err:?}");
+    hard_reset(&store, &id);
+}
+
+/// A rolling-upgrade migration chosen as a deadlock victim (40P01) against a node holding locks
+/// in the other order is retried, not failed.
+#[test]
+fn a_migration_deadlock_victim_is_retried() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_dead");
+    let iso_url = tmp.url();
+    drop(connect_store_with_retry(&iso_url).expect("fresh open"));
+    let mut node = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+    node.batch_execute(
+        "DELETE FROM busbar_schema; INSERT INTO busbar_schema (version) VALUES (12);",
+    )
+    .unwrap();
+    // The old node holds `store_ops` (late in the schema's order) ...
+    node.batch_execute(
+        "BEGIN; INSERT INTO store_ops (op_id, body, answer, recorded_at)
+         VALUES ('\\xdead', 'x', '', 1)",
+    )
+    .unwrap();
+    let opening = {
+        let iso_url = iso_url.clone();
+        std::thread::spawn(move || TestStore::open(&iso_url).map(drop))
+    };
+    // ... while the migration holds earlier tables and waits on it; the node then wants one of those.
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let wanted = node.batch_execute("LOCK TABLE credentials IN ROW EXCLUSIVE MODE");
+    node.batch_execute("COMMIT").ok();
+    let _ = wanted;
+    let opened = opening.join().unwrap();
+    assert!(opened.is_ok(), "the migration was retried: {opened:?}");
 }
 
 /// A database stamped ABOVE this build is refused at open, with the reason: an older binary would
@@ -1636,6 +2016,30 @@ fn two_nodes_opening_a_fresh_database_together_both_migrate_cleanly() {
     }
 
     let store = opened.into_iter().next().unwrap().unwrap();
+    for table in [
+        "keys",
+        "credentials",
+        "usage_windows",
+        "usage_ledger",
+        "usage_ledger_units",
+        "usage_metering",
+        "usage_metering_units",
+        "audit_log",
+        "denylist",
+        "store_revision",
+        "plane_records",
+        "plane_chain",
+        "plane_tokens",
+        "store_ops",
+        "store_records",
+    ] {
+        let there: bool = store
+            .lock()
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+            .unwrap()
+            .get(0);
+        assert!(there, "{table} must exist after the race");
+    }
     let stamped: i64 = store
         .lock()
         .query_one(
@@ -1826,6 +2230,9 @@ mod plane_records;
 
 // ── THE 1.6.0 RECORD SHAPES AND THE IN-PLACE v6 -> v10 UPGRADE ─────────────────────────────────
 mod v160_shapes;
+
+// ── THE FAMILY'S CREDENTIAL RULES (R3, R4, R5, R7, W2, W5) ────────────────────────────────────
+mod credential_rules;
 
 // ── THE STORE v3 SLOTS (the door's table beyond the 1.5.5 op set) ──────────────────────────────
 mod v3_slots;

@@ -12,7 +12,7 @@ First-party signed kind:store plugin cdylib: the Postgres backend for busbar's d
 
 ## What it is for
 
-**This plugin's version: v1.0.0.** (Independently versioned from busbar
+**This plugin's version: v1.6.0.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
 
 [![CI](https://github.com/GetBusbar/busbar-store-postgres/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/busbar-store-postgres/actions/workflows/ci.yml)
@@ -32,14 +32,14 @@ node.
 
 ### Versioning
 
-This plugin is versioned **independently of busbar** — `v1.0.0` here says
+This plugin is versioned **independently of busbar** — `v1.6.0` here says
 nothing about which busbar release it is. Compatibility with busbar is
 stated separately: **requires busbar 1.6.0+** (the release whose store
 interface this crate implements: the kind-tagged plane-record verbs, the
 name-keyed usage ledger and the dated metering rows). Pin both versions
 explicitly in production; do not assume they move together.
 
-### Upgrading from a 1.5.x deployment
+### Upgrading an existing database
 
 The first connect of this build upgrades an existing database **in place**
 (schema v6 → this build's current schema, inside one transaction, under the same advisory lock every
@@ -62,7 +62,13 @@ meaning:
   derives money from the counts and its rate card.
 - Schema v13 drops the tables a pre-release v11/v12 build created for the
   deleted store slots (`money_slots`, `money_slices`, `money_epoch`,
-  `store_journal`, `store_sessions`) and their op-id dedupe rows.
+  `store_journal`, `store_sessions`) and their op-id dedupe rows, and only when
+  upgrading from such a v11/v12 database: a fresh database or a released
+  v6-v10 one never loses a table of those names.
+- Schema v14 adds `plane_chain.has_parent`: a record appended without a parent
+  is stored under its own id, read back by `get_plane_record`, and never listed
+  as a parent. Rows already keyed by their own id are marked parentless. A
+  build older than v14 refuses a v14 database.
 
 A database a pre-release dev build took to schema v7–v9 keeps its
 `mcp_calls`/`tasks`/`task_events`/`mcp_demotions`/`spent_ask_states` tables
@@ -95,27 +101,29 @@ that crate and exports its `door` through `export_door!`.
   against the assumption that the two are byte-identical.
 - **A few error cases differ across backends.** Revoking a credential
   id that names no row is an error here and on MySQL, and a silent
-  success on SQLite and Valkey. Appending an audit entry whose `seq`
-  already exists is an error here, where the other backends overwrite
-  or ignore. Tooling that treats a store error as fatal should not
-  assume the same input produces the same outcome on every backend.
+  success on SQLite and Valkey. Tooling that treats a store error as
+  fatal should not assume the same input produces the same outcome on
+  every backend.
 
 ### Known limitations (documented honestly, not papered over)
 
 - **The store opens no socket of its own.** It reaches Postgres through
   busbar's connector (the store declares one outbound `tcp` need in the
   `operator-infrastructure` egress class).
-- **One kept connection, as 1.5.x.** The store connects and authenticates
-  once and keeps that connection; operations take turns on it. A
+- **Up to eight kept connections.** (1.5.x kept one.) The store connects and
+  authenticates on demand and keeps up to eight idle connections; an
+  operation that finds none free waits for one. A
   connection that fails (or is left inside a transaction) is closed, and
   the next operation connects afresh rather than needing a restart.
 - **TLS through busbar.** `sslmode=require`, `verify-ca` and
   `verify-full` secure the connection through busbar's connector and its
   trust anchors (always verifying the certificate and name); `disable`
-  connects in plaintext, as 1.5.x (`NoTls`) did. `allow` and `prefer` are
-  refused, never downgraded silently. An ABSENT `sslmode` is plaintext (the
-  same as `disable`; libpq's default of `prefer` is not applied, because this
-  store never falls back silently): set `sslmode` explicitly. A Unix-socket
+  connects in plaintext, as 1.5.x (`NoTls`) did. `allow` is plaintext (no
+  `SSLRequest`); `prefer` sends the `SSLRequest`, secures the connection on
+  the server's `S` WITHOUT verifying its certificate, and goes on in plaintext
+  on `N` (libpq's behaviour). An ABSENT `sslmode` is plaintext (the same as
+  `disable`; libpq's default of `prefer` is not applied): set `sslmode`
+  explicitly. A Unix-socket
   `host` is refused: the store reaches its server over TCP.
 
 See the doc comments at the top of
@@ -130,17 +138,29 @@ thin `cdylib` adapter around it.
 |---|---|---|---|
 | `url` | yes | — | A libpq connection string, URL (`postgres://user:pass@host:5432/busbar?sslmode=require`) or keyword form (`host=... user=... password=... dbname=...`). Connections go through busbar's connector. See the lists below. |
 
-The only setting is `url`; any other top-level key is refused
-(`unknown setting`), and a `url` that is not a string is refused.
+The only setting is `url`; every refusal starts
+`invalid postgres plugin config: `. Any other top-level key is refused
+(`unknown setting`), a settings value that is not a JSON object is refused
+naming its type, a `url` that is not a string is refused naming the type it
+is, and a missing or `null` `url` is refused as required. A connection string
+the parser refuses is refused at `validate` as at `open`, as
+`invalid postgres plugin config: url: ...`; only the connect is left to `open`.
+A failed connect reads `postgres store: failed to connect: ...`.
 
 **Connection-string options honoured:** `host`, `hostaddr`, `port` (a
 comma-separated list of several endpoints, tried in order), `user`,
 `password`, `dbname`, `application_name`, `options`, `target_session_attrs`
 (`any`, `read-write`, `read-only`), `channel_binding` (`disable` or `prefer`),
-`sslmode` (`disable`, `require`, `verify-ca`, `verify-full`; absent means
-`disable`) and `connect_timeout` (whole seconds; it bounds a new connection's
-dial and handshake; `0` or less means no bound, as in libpq; a value that is
-not a whole number is refused).
+`sslmode` (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`;
+absent means `disable`) and `connect_timeout` (whole seconds; it bounds a new
+connection's dial and handshake and defaults to 30 when absent; `0` or less
+means no bound, as in libpq; a value that is not a whole number is refused).
+The store sends no startup `options` of its own (a pooler such as pgbouncer
+refuses them; a DSN's `options` goes through as written). Every transaction
+begins with one simple-query batch that states its isolation level and bounds
+it server-side: `BEGIN ISOLATION LEVEL READ COMMITTED` (or `REPEATABLE READ`);
+`SET LOCAL lock_timeout = '30s'`; `SET LOCAL idle_in_transaction_session_timeout
+= '60s'`. A single statement run outside a transaction carries no such bound.
 
 **Socket options, accepted as 1.5.5's driver accepted them.** busbar's
 connector owns the sockets: it dials every connection with TCP keepalive on,
@@ -160,8 +180,7 @@ setting. So:
   asked for with an `SSLRequest` (`sslmode` still decides whether it is used).
 - A value 1.5.5's driver refused (not a number, an unknown keyword) is refused.
 
-**Refused, with an explanation (never silently ignored):** `sslmode=allow`
-and `sslmode=prefer`, `channel_binding=require` (no SCRAM-PLUS), `sslrootcert`
+**Refused, with an explanation (never silently ignored):** `channel_binding=require` (no SCRAM-PLUS), `sslrootcert`
 (trust is busbar's), a Unix-socket `host`, `keepalives=0`, and any unknown
 option.
 
@@ -271,9 +290,9 @@ in busbar for the full reference. In short:
 BUSBAR_SIGN_KEY=<signing key> busbar-plugin-pack pack \
     --lib target/release/libbusbar_store_postgres_plugin.so \
     --name busbar-store-postgres-plugin --alias postgres --kind store \
-    --version 1.0.0 --publisher busbar \
+    --version 1.6.0 --publisher busbar \
     --license Apache-2.0 \
-    --out busbar-store-postgres-plugin-1.0.0-x86_64-linux.tar.gz
+    --out busbar-store-postgres-plugin-1.6.0-x86_64-linux.tar.gz
 ```
 
 For local development without a signing key, `busbar-plugin-pack pack

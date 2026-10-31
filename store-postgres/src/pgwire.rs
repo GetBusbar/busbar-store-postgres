@@ -29,14 +29,17 @@ use postgres_types::{FromSql, Kind, ToSql, Type};
 
 use busbar_contract::abi::sdk::store::wire::Wire;
 
-/// Whether the connection is secured (libpq's `sslmode`). `disable`, `allow` and `prefer` connect
-/// in plaintext; `require`,
-/// `verify-ca` and `verify-full` ask the server for TLS and secure the connection through the host
-/// (its trust anchors), refusing a server that declines.
+/// Whether the connection is secured (libpq's `sslmode`). `disable` and `allow` connect in
+/// plaintext (no SSLRequest); `prefer` asks the server for TLS and secures the connection when it
+/// accepts, without verifying its certificate, else goes on in plaintext; `require`, `verify-ca`
+/// and `verify-full` ask for TLS and secure the connection through the host (its trust anchors),
+/// refusing a server that declines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SslMode {
     /// Plaintext.
     Plain,
+    /// TLS (unverified) when the server accepts it, else plaintext.
+    Prefer,
     /// TLS, or no connection.
     Require,
 }
@@ -75,7 +78,7 @@ pub struct Config {
     pub options: Option<String>,
     pub ssl: SslMode,
     /// `connect_timeout` in milliseconds (whole seconds in the string, as the driver read it);
-    /// `None` = no bound of the store's own.
+    /// `None` = unset (the default bound); `Some(0)` = none.
     connect_timeout_ms: Option<u32>,
     target_session_attrs: SessionAttrs,
 }
@@ -111,7 +114,20 @@ fn inert(key: &str, value: &str, why: &str) {
     tracing::debug!("postgres connection option {key}={value} has no effect: {why}");
 }
 
+/// The most a message may declare: Postgres' own ceiling on a value (1 GiB) plus the four bytes
+/// of the length word, which the declared length counts.
+const MAX_MESSAGE_LEN: u32 = (1 << 30) + 4;
+
+/// The handshake bound when the DSN has no `connect_timeout`.
+const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 30_000;
+
 impl Config {
+    /// The bound on a new connection's dial and handshake, in milliseconds (0 = none).
+    fn connect_bound_ms(&self) -> u32 {
+        self.connect_timeout_ms
+            .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS)
+    }
+
     /// Parse a libpq connection string: `postgres[ql]://user:pass@host:port/db?key=value&...` or
     /// `host=... port=... user=... password=... dbname=... sslmode=...`.
     ///
@@ -216,16 +232,10 @@ impl Config {
                 "options" => c.options = Some(v),
                 "sslmode" => {
                     c.ssl = match v.as_str() {
-                        "disable" => SslMode::Plain,
-                        // Refused rather than downgraded: these would try TLS or fall back to
-                        // plaintext silently, and the operator asked for neither outcome by name.
-                        m @ ("allow" | "prefer") => {
-                            return Err(config_err(format!(
-                                "sslmode={m} is not supported: this store never falls back \
-                                 silently; use require/verify-ca/verify-full for TLS or disable \
-                                 for plaintext"
-                            )));
-                        }
+                        // `allow` would try plaintext first and TLS on refusal; this store goes
+                        // straight to plaintext, as libpq does against a server that takes it.
+                        "disable" | "allow" => SslMode::Plain,
+                        "prefer" => SslMode::Prefer,
                         "require" | "verify-ca" | "verify-full" => SslMode::Require,
                         _ => {
                             return Err(config_err("invalid value for option `sslmode`"));
@@ -241,8 +251,12 @@ impl Config {
                              seconds; 0 or less means no bound)",
                         )
                     })?;
-                    c.connect_timeout_ms = (secs > 0)
-                        .then(|| u32::try_from(secs.saturating_mul(1000)).unwrap_or(u32::MAX));
+                    // Some(0) is the explicit "no bound"; unset takes the default.
+                    c.connect_timeout_ms = Some(if secs > 0 {
+                        u32::try_from(secs.saturating_mul(1000)).unwrap_or(u32::MAX)
+                    } else {
+                        0
+                    });
                 }
                 "target_session_attrs" => {
                     c.target_session_attrs = match v.as_str() {
@@ -609,7 +623,7 @@ enum Kind_ {
     Authentication(String),
     Config(String),
     ToSql(usize, String),
-    FromSql(usize, String),
+    FromSql(String, String),
     Column(String),
     RowCount,
     Parameters(usize, usize),
@@ -670,7 +684,7 @@ impl fmt::Display for Error {
             Kind_::Authentication(c) => write!(f, "authentication error: {c}"),
             Kind_::Config(c) => write!(f, "invalid configuration: {c}"),
             Kind_::ToSql(i, c) => write!(f, "error serializing parameter {i}: {c}"),
-            Kind_::FromSql(i, c) => write!(f, "error deserializing column {i}: {c}"),
+            Kind_::FromSql(i, c) => write!(f, "error deserializing column `{i}`: {c}"),
             Kind_::Column(c) => write!(f, "invalid column `{c}`"),
             Kind_::RowCount => f.write_str("query returned an unexpected number of rows"),
             Kind_::Parameters(want, got) => {
@@ -722,17 +736,6 @@ pub struct Row {
 impl Row {
     /// Column `idx` as `T`.
     ///
-    /// # Panics
-    /// An unknown column, or a value that does not convert (the `postgres` crate's `get`).
-    pub fn get<'a, I: RowIndex, T: FromSql<'a>>(&'a self, idx: I) -> T {
-        match self.try_get(idx) {
-            Ok(v) => v,
-            Err(e) => panic!("error retrieving column: {e}"),
-        }
-    }
-
-    /// Column `idx` as `T`.
-    ///
     /// # Errors
     /// An unknown column, a type `T` does not accept, or a value that does not convert.
     pub fn try_get<'a, I: RowIndex, T: FromSql<'a>>(&'a self, idx: I) -> Result<T, Error> {
@@ -740,9 +743,10 @@ impl Row {
             return Err(Error::new(Kind_::Column(idx.to_string())));
         };
         let ty = &self.columns[i].type_;
+        let name = &self.columns[i].name;
         if !T::accepts(ty) {
             return Err(Error::new(Kind_::FromSql(
-                i,
+                name.clone(),
                 format!(
                     "cannot convert between the Rust type `{}` and the Postgres type `{}`",
                     std::any::type_name::<T>(),
@@ -754,7 +758,7 @@ impl Row {
         // protocol violation: an error on the missing column, never an out-of-bounds panic.
         let Some(range) = self.ranges.get(i) else {
             return Err(Error::new(Kind_::FromSql(
-                i,
+                name.clone(),
                 format!(
                     "the server sent a row of {} fields for {} columns",
                     self.ranges.len(),
@@ -763,7 +767,8 @@ impl Row {
             )));
         };
         let raw = range.clone().map(|r| &self.body.buffer()[r]);
-        T::from_sql_nullable(ty, raw).map_err(|e| Error::new(Kind_::FromSql(i, e.to_string())))
+        T::from_sql_nullable(ty, raw)
+            .map_err(|e| Error::new(Kind_::FromSql(name.clone(), e.to_string())))
     }
 }
 
@@ -895,7 +900,7 @@ impl Client {
         let n = cfg.endpoints.len();
         let first = preferred.load(Ordering::Relaxed);
         let first = if first < n { first } else { 0 };
-        let mut last = None;
+        let mut failures: Vec<(usize, Error)> = Vec::new();
         for i in std::iter::once(first).chain((0..n).filter(|i| *i != first)) {
             match Self::attempt(&wire, cfg, &cfg.endpoints[i]).await {
                 Ok(c) => {
@@ -908,19 +913,33 @@ impl Client {
                     // endpoint's socket in place under the next one's connect.
                     wire.unbound();
                     wire.close().await;
-                    last = Some(e);
+                    failures.push((i, e));
                 }
             }
         }
-        Err(last.unwrap_or_else(|| config_err("no server to connect to")))
+        // One endpoint: its error as it came. Several: every one, so the operator sees why each
+        // was passed over, not only the last.
+        if failures.len() > 1 {
+            let joined: Vec<String> = failures
+                .iter()
+                .map(|(i, e)| {
+                    let ep = &cfg.endpoints[*i];
+                    format!("{}:{}: {}", ep.name, ep.port, crate::render_pg_error(e))
+                })
+                .collect();
+            return Err(Error::connect(joined.join("; ")));
+        }
+        Err(failures
+            .pop()
+            .map_or_else(|| config_err("no server to connect to"), |(_, e)| e))
     }
 
     /// One endpoint's connect: dial, secure, authenticate, check the session's kind.
     async fn attempt(wire: &Wire, cfg: &Config, endpoint: &Endpoint) -> Result<Client, Error> {
         // `connect_timeout` bounds a NEW connection's dial (the connector's own timeout for it) and
-        // its handshake (`Wire::bound`); never the wait for the instance's one kept connection,
+        // its handshake (`Wire::bound`); never the wait for one of the instance's kept connections,
         // which another op may hold for as long as its statement runs.
-        let ms = cfg.connect_timeout_ms.unwrap_or(0);
+        let ms = cfg.connect_bound_ms();
         wire.connect_timed(0, Some(&target(&endpoint.dial, endpoint.port)), ms)
             .await
             .map_err(Error::connect)?;
@@ -958,31 +977,50 @@ impl Client {
     }
 
     async fn handshake(&mut self, cfg: &Config, endpoint: &Endpoint) -> Result<(), Error> {
-        if cfg.ssl == SslMode::Require {
+        if cfg.ssl != SslMode::Plain {
             let mut out = BytesMut::new();
             frontend::ssl_request(&mut out);
             self.send(&out).await?;
             let answer = self.read_byte().await?;
-            if answer != b'S' {
+            if answer != b'S' && cfg.ssl == SslMode::Require {
                 return Err(Error::new(Kind_::Tls(
                     "server does not support TLS".to_string(),
                 )));
             }
-            // Anything the server sent after its `S` went out in the clear, and would be parsed
-            // after the upgrade as if the secured server had sent it (CVE-2021-23222, STARTTLS
-            // response injection). The host's guard sees only the wire's input, which this
-            // client's reads have already moved into its own buffer: the check is here.
-            if !self.buf.is_empty() {
+            if answer == b'S' {
+                self.upgrade(cfg, endpoint).await?;
+            } else if answer != b'N' {
                 return Err(Error::new(Kind_::Tls(
-                    "server sent unencrypted data after accepting TLS".to_string(),
+                    "unexpected answer to the SSLRequest".to_string(),
                 )));
             }
-            self.wire
-                .upgrade_secure(Some(&endpoint.name))
-                .await
-                .map_err(|e| Error::new(Kind_::Tls(e.to_string())))?;
         }
         self.startup(cfg).await?;
+        self.check_session_attrs(cfg).await
+    }
+
+    /// Secure the stream after the server's `S`: verified against the host's trust anchors for
+    /// `require` and up, unverified for `prefer` (libpq).
+    async fn upgrade(&mut self, cfg: &Config, endpoint: &Endpoint) -> Result<(), Error> {
+        // Anything the server sent after its `S` went out in the clear, and would be parsed
+        // after the upgrade as if the secured server had sent it (CVE-2021-23222, STARTTLS
+        // response injection). The host's guard sees only the wire's input, which this
+        // client's reads have already moved into its own buffer: the check is here.
+        if !self.buf.is_empty() {
+            return Err(Error::new(Kind_::Tls(
+                "server sent unencrypted data after accepting TLS".to_string(),
+            )));
+        }
+        let name = Some(endpoint.name.as_str());
+        let secured = if cfg.ssl == SslMode::Prefer {
+            self.wire.upgrade_secure_unverified(name).await
+        } else {
+            self.wire.upgrade_secure(name).await
+        };
+        secured.map_err(|e| Error::new(Kind_::Tls(e.to_string())))
+    }
+
+    async fn check_session_attrs(&mut self, cfg: &Config) -> Result<(), Error> {
         if cfg.target_session_attrs != SessionAttrs::Any {
             let row = self.query_one("SHOW transaction_read_only", &[]).await?;
             let read_only: &str = row.try_get(0)?;
@@ -1159,9 +1197,22 @@ impl Client {
     /// The next message the server sent; asynchronous notices and parameter changes skipped.
     async fn read(&mut self) -> Result<Message, Error> {
         loop {
+            // The declared length is the peer's word: past Postgres' own 1 GiB ceiling it is not a
+            // Postgres peer, and is refused before anything is reserved for it.
+            if let Some(h) = self.buf.get(1..5) {
+                let len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
+                if len > MAX_MESSAGE_LEN {
+                    return Err(Error::new(Kind_::Parse(format!(
+                        "protocol error: the server declared a message of {len} bytes (over 1 GiB)"
+                    ))));
+                }
+            }
             match Message::parse(&mut self.buf).map_err(parse_err)? {
-                Some(Message::ParameterStatus(_) | Message::NoticeResponse(_)) => {}
-                Some(Message::NotificationResponse(_)) => {}
+                Some(
+                    Message::ParameterStatus(_)
+                    | Message::NoticeResponse(_)
+                    | Message::NotificationResponse(_),
+                ) => {}
                 Some(m) => {
                     if let Message::ReadyForQuery(b) = &m {
                         self.status = b.status();
@@ -1450,12 +1501,12 @@ impl Client {
         }
     }
 
-    /// Begin a transaction (the server's default isolation, READ COMMITTED).
+    /// Begin a READ COMMITTED transaction.
     ///
     /// # Errors
     /// The `BEGIN`'s failure.
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
-        self.batch_execute("BEGIN").await?;
+        self.batch_execute(begin_sql(None)).await?;
         Ok(Transaction {
             client: self,
             done: false,
@@ -1482,12 +1533,22 @@ pub enum IsolationLevel {
     RepeatableRead,
 }
 
-/// The statement that begins a transaction at `isolation` (`None` = the server's default).
+/// The one simple-query batch that begins a transaction at `isolation` (`None` = READ COMMITTED,
+/// stated, so a DSN's `default_transaction_isolation` cannot change what the store's statements
+/// assume). It also bounds the transaction server-side with `SET LOCAL`, which a pooler passes
+/// where a startup `options` parameter is refused: a peer stalled while holding a lock (the
+/// `store_revision` row, say) must not block the fleet forever.
 #[must_use]
 pub fn begin_sql(isolation: Option<IsolationLevel>) -> &'static str {
     match isolation {
-        None => "BEGIN",
-        Some(IsolationLevel::RepeatableRead) => "BEGIN ISOLATION LEVEL REPEATABLE READ",
+        None => {
+            "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = '30s'; \
+             SET LOCAL idle_in_transaction_session_timeout = '60s'"
+        }
+        Some(IsolationLevel::RepeatableRead) => {
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL lock_timeout = '30s'; \
+             SET LOCAL idle_in_transaction_session_timeout = '60s'"
+        }
     }
 }
 

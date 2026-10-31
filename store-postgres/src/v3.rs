@@ -13,7 +13,7 @@
 //! [`Dedupe::answer`] judges a replay or a conflict. A failed op rolls its row back with its
 //! effect. Rows are kept [`OP_ID_RETENTION_SECS`] and swept at most once a minute per instance.
 //!
-//! CONNECTIONS: every slot runs on the instance's ONE kept connection over the host's connector, as
+//! CONNECTIONS: every slot runs on one of the instance's kept connections over the host's connector, as
 //! straight-line async code by the store SDK's `wire::drive_kept`. The door declares one outbound
 //! `tcp` need (`NEEDS`); `open` parses the settings and its connect step reaches the server and
 //! ensures the schema, so an unreachable or refusing server fails the load.
@@ -30,6 +30,7 @@ use busbar_contract::abi::host::conn::connector::{
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_OCTETS};
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::door::abi_str;
+use busbar_contract::abi::sdk::store::column::{prefix_end, storable_i64};
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::wire::{drive_kept, Body};
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
@@ -78,11 +79,14 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
 ]);
 
+/// How many ops of this store the host may have in flight at once.
+const MAX_INFLIGHT: u32 = 64;
+
 busbar_contract::store_door!(
     PostgresStore,
     NAME,
     env!("CARGO_PKG_VERSION"),
-    64,
+    MAX_INFLIGHT,
     needs: NEEDS,
     extensions: EXTENSIONS
 );
@@ -108,6 +112,10 @@ macro_rules! on_conn {
     }};
 }
 
+/// Rows one sweep statement removes, and how many statements one sweep runs at most.
+const SWEEP_BATCH: i64 = 10_000;
+const SWEEP_MAX_BATCHES: usize = 10;
+
 /// How often (seconds) one instance sweeps `store_ops` past its retention.
 const SWEEP_EVERY_SECS: u64 = 60;
 
@@ -122,6 +130,30 @@ fn pg(e: crate::pgwire::Error) -> String {
 
 fn failed(e: RecordStoreError) -> OpRefused {
     OpRefused::Failed(e.0)
+}
+
+fn refused(e: RecordStoreError) -> OpRefused {
+    OpRefused::Refused(e.0)
+}
+
+/// An apply error the server decided from the values (SQLSTATE class 22 data exception, 23
+/// integrity constraint; the text leads with its code, `render_pg_error`) is a refusal: the
+/// transaction rolled back and a retry of the same values fails the same way. Anything else
+/// (a deadlock, a serialization failure, the chain fork) stays `Failed`.
+fn decided(r: OpRefused) -> OpRefused {
+    match r {
+        OpRefused::Failed(t) if decided_text(&t) => OpRefused::Refused(t),
+        other => other,
+    }
+}
+
+/// `t` leads with a five-character SQLSTATE of class 22 or 23, then `: `.
+fn decided_text(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() > 6
+        && matches!(&b[..2], b"22" | b"23")
+        && b[2..5].iter().all(u8::is_ascii_alphanumeric)
+        && &b[5..7] == b": "
 }
 
 /// Claim `op` for `body` (its [`Dedupe::body_hex`]) inside `tx`: insert its row (`None`), or read
@@ -144,7 +176,7 @@ async fn claim(tx: &mut Transaction<'_>, op: OpId, body: &str) -> Result<Option<
         .await
         .map_err(pg)?;
     match row {
-        Some(r) => Ok(Some(r.get(0))),
+        Some(r) => Ok(Some(r.try_get(0).map_err(pg)?)),
         // Swept between the insert and the read (it was past retention): nothing applied, and a
         // retry claims the op afresh.
         None => Err(format!("op_id {op:?} was swept while being claimed; retry")),
@@ -165,11 +197,21 @@ impl Session {
             return;
         }
         let before = bits(now.saturating_sub(OP_ID_RETENTION_SECS));
-        // Best effort: a failed sweep leaves rows that the next sweep takes.
-        let _ = self
-            .lock()
-            .execute("DELETE FROM store_ops WHERE recorded_at < $1", &[&before])
-            .await;
+        // Best effort: a failed sweep leaves rows that the next sweep takes. Batched and bounded, so
+        // the first sweep after a long stop is not one huge delete ahead of an admitted write.
+        for _ in 0..SWEEP_MAX_BATCHES {
+            let removed = self
+                .client()
+                .execute(
+                    "DELETE FROM store_ops WHERE ctid IN
+                         (SELECT ctid FROM store_ops WHERE recorded_at < $1 LIMIT $2)",
+                    &[&before, &SWEEP_BATCH],
+                )
+                .await;
+            if !matches!(removed, Ok(n) if n == SWEEP_BATCH as u64) {
+                break;
+            }
+        }
     }
 
     /// One `op_id`-carrying write in ONE transaction with its dedupe row: a new op runs `apply` and
@@ -183,13 +225,13 @@ impl Session {
     ) -> OpResult<Option<String>> {
         self.sweep_ops().await;
         let mut tx = self
-            .lock()
+            .client()
             .transaction()
             .await
             .map_err(|e| OpRefused::Failed(pg(e)))?;
         let found = claim(&mut tx, op, body).await.map_err(OpRefused::Failed)?;
         if found.is_none() {
-            apply(&mut tx).await?;
+            apply(&mut tx).await.map_err(decided)?;
             tx.commit().await.map_err(|e| OpRefused::Failed(pg(e)))?;
         }
         Ok(found)
@@ -201,6 +243,9 @@ impl Session {
         body: &str,
         record: &busbar_contract::records::PlaneRecord,
     ) -> OpResult<Option<String>> {
+        // Decided before BEGIN: a seq or ts the column cannot hold is refused, nothing written.
+        storable_i64("append_plane_record", "seq", record.seq).map_err(refused)?;
+        storable_i64("append_plane_record", "ts", record.ts).map_err(refused)?;
         self.deduped(op, body, async |tx| {
             if Session::append_plane_record_in(tx, record)
                 .await
@@ -218,7 +263,7 @@ impl Session {
         .await
     }
 
-    /// `record_put` (slot 40): an upsert on `(schema, key)`. An EMPTY value removes the row: it is
+    /// `record_put` (slot 26): an upsert on `(schema, key)`. An EMPTY value removes the row: it is
     /// the host's strike, so `record_get` then answers `None` and
     /// `record_scan` never returns it. Removing a row that is not there is `Ok`.
     async fn v3_record_put(
@@ -229,7 +274,7 @@ impl Session {
     ) -> Result<(), String> {
         if value.is_empty() {
             return self
-                .lock()
+                .client()
                 .execute(
                     "DELETE FROM store_records WHERE schema_id = $1 AND key = $2",
                     &[&schema, &key],
@@ -238,7 +283,7 @@ impl Session {
                 .map(drop)
                 .map_err(pg);
         }
-        self.lock()
+        self.client()
             .execute(
                 "INSERT INTO store_records (schema_id, key, value) VALUES ($1, $2, $3)
                  ON CONFLICT (schema_id, key) DO UPDATE SET value = EXCLUDED.value",
@@ -255,14 +300,14 @@ impl Session {
         key: &[u8],
     ) -> Result<Option<RecordBytes>, String> {
         let row = self
-            .lock()
+            .client()
             .query_opt(
                 "SELECT value FROM store_records WHERE schema_id = $1 AND key = $2",
                 &[&schema, &key],
             )
             .await
             .map_err(pg)?;
-        row.map(|r| record(r.get(0))).transpose()
+        row.map(|r| record(r.try_get(0).map_err(pg)?)).transpose()
     }
 
     async fn v3_record_scan(
@@ -275,19 +320,39 @@ impl Session {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let rows = self
-            .lock()
-            .query(
-                "SELECT key, value FROM store_records
-                 WHERE schema_id = $1
-                   AND substring(key FROM 1 FOR octet_length($2::bytea)) = $2::bytea
-                 ORDER BY key LIMIT $3",
-                &[&schema, &prefix, &i64::from(limit)],
-            )
-            .await
-            .map_err(pg)?;
+        // A key range on the primary key, not a per-row prefix compare.
+        let limit = i64::from(limit);
+        let client = self.client();
+        let rows = match prefix_end(prefix) {
+            Some(end) => {
+                client
+                    .query(
+                        "SELECT key, value FROM store_records
+                         WHERE schema_id = $1 AND key >= $2 AND key < $3
+                         ORDER BY key LIMIT $4",
+                        &[&schema, &prefix, &end, &limit],
+                    )
+                    .await
+            }
+            None => {
+                client
+                    .query(
+                        "SELECT key, value FROM store_records
+                         WHERE schema_id = $1 AND key >= $2
+                         ORDER BY key LIMIT $3",
+                        &[&schema, &prefix, &limit],
+                    )
+                    .await
+            }
+        }
+        .map_err(pg)?;
         rows.iter()
-            .map(|r| Ok((r.get(0), record(r.get(1))?)))
+            .map(|r| {
+                Ok((
+                    r.try_get(0).map_err(pg)?,
+                    record(r.try_get(1).map_err(pg)?)?,
+                ))
+            })
             .collect()
     }
 
@@ -297,8 +362,12 @@ impl Session {
         body: &str,
         cells: &[(String, u64, UsageDelta)],
     ) -> OpResult<Option<String>> {
+        // Key order, whatever the caller's: two nodes' overlapping batches then lock rows in one
+        // order and cannot deadlock (40P01). Stable, so a repeated cell keeps its order.
+        let mut ordered: Vec<&(String, u64, UsageDelta)> = cells.iter().collect();
+        ordered.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
         self.deduped(op, body, async |tx| {
-            for (bucket, window, delta) in cells {
+            for (bucket, window, delta) in ordered {
                 Session::add_usage_in(tx, bucket, *window, delta)
                     .await
                     .map_err(failed)?;
@@ -314,8 +383,15 @@ impl Session {
         body: &str,
         deltas: &[MeteringDelta],
     ) -> OpResult<Option<String>> {
+        for d in deltas {
+            storable_i64("add_metering_batch", "priced_from_ms", d.priced_from_ms)
+                .map_err(refused)?;
+        }
+        // Primary-key order, as the usage batch (stable).
+        let mut ordered: Vec<&MeteringDelta> = deltas.iter().collect();
+        ordered.sort_by_key(|d| (&d.key_id, d.bucket, &d.model, &d.provider, d.priced_from_ms));
         self.deduped(op, body, async |tx| {
-            for d in deltas {
+            for d in ordered {
                 Session::add_metering_in(tx, d).await.map_err(failed)?;
             }
             Ok(())
@@ -332,32 +408,57 @@ fn record(bytes: Vec<u8>) -> Result<RecordBytes, String> {
 /// The store section's settings: its `url`. Shared by `validate` and `open`, so their refusals are
 /// the same words.
 fn settings_url(settings: &[u8]) -> Result<String, String> {
+    const BAD: &str = "invalid postgres plugin config";
     let v: serde_json::Value = if settings.trim_ascii().is_empty() {
         serde_json::Value::Object(Default::default())
     } else {
-        serde_json::from_slice(settings)
-            .map_err(|e| format!("invalid postgres plugin config: {e}"))?
+        serde_json::from_slice(settings).map_err(|e| format!("{BAD}: {e}"))?
     };
-    if let Some(map) = v.as_object() {
-        if let Some(k) = map.keys().find(|k| k.as_str() != "url") {
+    let map = match v {
+        serde_json::Value::Null => serde_json::Map::new(),
+        serde_json::Value::Object(m) => m,
+        other => {
             return Err(format!(
-                "invalid postgres plugin config: unknown setting `{k}` (accepted: url)"
-            ));
+                "{BAD}: expected a JSON object, got {}",
+                json_type(&other)
+            ))
         }
+    };
+    if let Some(k) = map.keys().find(|k| k.as_str() != "url") {
+        return Err(format!("{BAD}: unknown setting `{k}` (accepted: url)"));
     }
-    let url = match v.get("url") {
-        None => None,
+    let url = match map.get("url") {
+        None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(s)) => Some(s.as_str()),
-        Some(_) => {
-            return Err("invalid postgres plugin config: `url` must be a string".to_string());
+        Some(other) => {
+            return Err(format!(
+                "{BAD}: `url` must be a string, got {}",
+                json_type(other)
+            ));
         }
     };
     url.map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| {
-            "postgres plugin config requires a \"url\" (a libpq connection string)".to_string()
-        })
+        .ok_or_else(|| format!("{BAD}: `url` is required (a libpq connection string)"))
+}
+
+/// A JSON value's type, as a phrase (never the value).
+fn json_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+/// The store `settings` name, parsed and not yet connected: `validate` and `open` both run this.
+fn parse_settings(settings: &[u8]) -> Result<PostgresStore, String> {
+    PostgresStore::new(&settings_url(settings)?)
+        .map_err(|e| format!("invalid postgres plugin config: url: {}", e.0))
 }
 
 /// One argument as the slot's body takes it: `:` borrows the owned copy, `=` passes it by value.
@@ -389,7 +490,7 @@ impl StoreSlots for PostgresStore {
     };
 
     fn validate(settings: &[u8]) -> Result<(), String> {
-        settings_url(settings).map(drop)
+        parse_settings(settings).map(drop)
     }
 
     /// Open from the store section's settings:
@@ -400,8 +501,7 @@ impl StoreSlots for PostgresStore {
     ///
     /// The settings are parsed here; the server is reached by the connect step.
     fn open(settings: &[u8], _host: Option<Host>) -> Result<Self, String> {
-        let url = settings_url(settings)?;
-        PostgresStore::new(&url).map_err(|e| e.0)
+        parse_settings(settings)
     }
 
     /// Reach the server and ensure the schema (connect + migrate, at the same moment: the load),

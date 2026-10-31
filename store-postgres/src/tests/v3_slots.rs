@@ -42,22 +42,43 @@ fn store(url: &str) -> TestStore {
     connect_store_with_retry(url).expect("connect")
 }
 
-/// `open` is the settings' judge: the 1.5.5 refusals, in the store's own words.
+/// `open` is the settings' judge: every refusal starts `invalid postgres plugin config: `, a
+/// type error names the type and never the value.
 #[test]
 fn open_refuses_settings_without_a_url() {
-    let want = "postgres plugin config requires a \"url\" (a libpq connection string)";
-    for settings in [&b""[..], &b"  "[..], &b"{}"[..], &br#"{"url": "  "}"#[..]] {
+    let want = "invalid postgres plugin config: `url` is required (a libpq connection string)";
+    for settings in [
+        &b""[..],
+        &b"  "[..],
+        &b"{}"[..],
+        &br#"{"url": "  "}"#[..],
+        &br#"{"url": null}"#[..],
+        &b"null"[..],
+    ] {
         assert_eq!(
             TestStore::open_slot(settings).err().as_deref(),
             Some(want),
             "{settings:?}"
         );
     }
-    // A present url of the wrong type says so, rather than "requires a url".
-    for settings in [&br#"{"url": 5}"#[..], &br#"{"url": null}"#[..]] {
+    // A present url of the wrong type says so, naming the type, rather than "required".
+    assert_eq!(
+        TestStore::open_slot(br#"{"url": 5}"#).err().as_deref(),
+        Some("invalid postgres plugin config: `url` must be a string, got a number")
+    );
+    // A non-object names the JSON type it got.
+    for (settings, ty) in [
+        (&br#""x""#[..], "a string"),
+        (&b"[1]"[..], "an array"),
+        (&b"7"[..], "a number"),
+        (&b"true"[..], "a boolean"),
+    ] {
         assert_eq!(
             TestStore::open_slot(settings).err().as_deref(),
-            Some("invalid postgres plugin config: `url` must be a string"),
+            Some(
+                format!("invalid postgres plugin config: expected a JSON object, got {ty}")
+                    .as_str()
+            ),
             "{settings:?}"
         );
     }
@@ -70,6 +91,41 @@ fn open_refuses_settings_without_a_url() {
     );
     let e = TestStore::open_slot(b"{ not json").err().unwrap();
     assert!(e.starts_with("invalid postgres plugin config:"), "{e}");
+}
+
+/// `validate` runs exactly `open`'s parse, the connection string's included, and connects to
+/// nothing; a URL refusal carries the `url: ` prefix.
+#[test]
+fn validate_refuses_what_open_refuses() {
+    for settings in [
+        &br#"{"url": "postgres://u@h/d?no_such_option=1"}"#[..],
+        &br#"{"url": "postgres://u@h/d?sslmode=bogus"}"#[..],
+        &br#"{"url": "not a connection string"}"#[..],
+        &b"{}"[..],
+        &br#"{"url": 5}"#[..],
+        &b"[1]"[..],
+        &b"{ not json"[..],
+    ] {
+        let opened = TestStore::open_slot(settings).expect_err("open refuses");
+        let validated =
+            <crate::PostgresStore as busbar_contract::abi::sdk::store::StoreSlots>::validate(
+                settings,
+            )
+            .expect_err("validate refuses what open refuses");
+        assert_eq!(validated, opened, "{settings:?}");
+    }
+    let e = TestStore::open_slot(br#"{"url": "postgres://u@h/d?no_such_option=1"}"#)
+        .err()
+        .unwrap();
+    assert!(
+        e.starts_with("invalid postgres plugin config: url: "),
+        "{e}"
+    );
+    // A well-formed URL validates without a server.
+    <crate::PostgresStore as busbar_contract::abi::sdk::store::StoreSlots>::validate(
+        br#"{"url": "postgres://u@127.0.0.1:1/d"}"#,
+    )
+    .expect("a parseable url validates");
 }
 
 /// S1/S2/S3/S4: a replay applies nothing and answers the original, a different body is a
@@ -120,7 +176,7 @@ fn an_op_id_dedupes_durably_across_a_reconnect() {
         id: parent.clone(),
         parent: Some(parent.clone()),
         seq: 1,
-        ts: 1,
+        ts: 5_000_000_000,
         disposition: PlaneDisposition::Active,
         body: format!("{{\"hash\":\"{hash}\"}}").into_bytes(),
     };
@@ -144,6 +200,230 @@ fn an_op_id_dedupes_durably_across_a_reconnect() {
     b.append_plane_record_op(fork, rec("two").view())
         .expect("a failed op was not recorded, so its retry is evaluated afresh");
     clear(&b);
+}
+
+/// S5: a value decided before commit (one a column cannot hold, or a data/integrity error the
+/// server raises) is REFUSED, nothing recorded; the same `op_id` with a valid record applies.
+#[test]
+fn a_write_refused_before_commit_answers_refused_and_records_nothing() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let parent = format!("{ns}-refused");
+    let rec = |seq: u64| PlaneRecord {
+        kind: "refusedkind".into(),
+        id: parent.clone(),
+        parent: Some(parent.clone()),
+        seq,
+        ts: 5_000_000_000,
+        disposition: PlaneDisposition::Active,
+        body: b"{}".to_vec(),
+    };
+    let id = op();
+    assert!(matches!(
+        s.append_plane_record_op(id, rec(u64::MAX).view()),
+        Err(OpRefused::Refused(_))
+    ));
+    let recorded: i64 = s
+        .lock()
+        .query_one(
+            "SELECT COUNT(*) FROM store_ops WHERE op_id = $1",
+            &[&&id.0[..]],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(recorded, 0, "a refused op records nothing");
+    s.append_plane_record_op(id, rec(1).view())
+        .expect("the same op_id with a valid record applies");
+    s.lock()
+        .execute("DELETE FROM plane_chain WHERE kind = 'refusedkind'", &[])
+        .unwrap();
+
+    let mut meter = MeteringDelta {
+        key_id: format!("{ns}-k"),
+        bucket: 1,
+        model: "m".into(),
+        provider: "p".into(),
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: "g".into(),
+        pricing_version: "v".into(),
+        priced_from_ms: u64::MAX,
+        usage_units: Default::default(),
+    };
+    assert!(matches!(
+        s.add_metering_op(op(), &meter),
+        Err(OpRefused::Refused(_))
+    ));
+    meter.priced_from_ms = 0;
+    meter.bucket = 4_000_000_000_000_002;
+    s.add_metering_op(op(), &meter)
+        .expect("a valid delta applies");
+
+    // A NUL in a text value: the server's data exception (class 22) mid-apply, rolled back.
+    let delta = UsageDelta {
+        requests: 1,
+        ..Default::default()
+    };
+    let nul = op();
+    assert!(matches!(
+        s.add_usage_op(nul, &format!("{ns}\0b"), 4_000_000_000_000_003, &delta),
+        Err(OpRefused::Refused(_))
+    ));
+    s.add_usage_op(nul, &format!("{ns}-b"), 4_000_000_000_000_003, &delta)
+        .expect("a refused op was not recorded");
+}
+
+/// A prefix ending in 0xff: its range ends at the byte before (`prefix_end`), not at the next key.
+#[test]
+fn a_scan_prefix_ending_in_0xff_stops_at_the_range_end() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let ns = ns();
+    let s = store(&url);
+    let keys: [&[u8]; 6] = [
+        &[0x01, 0xFE, 0xFF],
+        &[0x01, 0xFF],
+        &[0x01, 0xFF, 0x05],
+        &[0x01, 0xFF, 0xFF, 0xFF],
+        &[0x02],
+        &[0x02, 0x00],
+    ];
+    for (i, k) in keys.iter().enumerate() {
+        s.record_put(&ns, k, &[i as u8 + 1]).unwrap();
+    }
+    let scan = |prefix: &[u8], limit: u32| -> Vec<Vec<u8>> {
+        s.record_scan(&ns, prefix, limit)
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
+    };
+    assert_eq!(
+        scan(&[0x01, 0xFF], 100),
+        vec![vec![1, 0xFF], vec![1, 0xFF, 5], vec![1, 0xFF, 0xFF, 0xFF]]
+    );
+    assert_eq!(
+        scan(&[0x01, 0xFF], 2),
+        vec![vec![1, 0xFF], vec![1, 0xFF, 5]]
+    );
+    assert_eq!(scan(&[0x01], 100).len(), 4);
+    assert_eq!(scan(&[0xFF, 0xFF], 100), Vec::<Vec<u8>>::new());
+}
+
+/// The first sweep after boot removes every `op_id` past retention, across several delete batches.
+#[test]
+fn the_first_sweep_removes_more_rows_than_one_batch() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let tmp = super::TempDb::create(&url, "spg_sweep");
+    let s = store(&tmp.url());
+    s.lock()
+        .batch_execute(
+            "INSERT INTO store_ops (op_id, body, answer, recorded_at)
+             SELECT int4send(g)::bytea || '\\x0000000000000000'::bytea, 'old', '', 1
+             FROM generate_series(1, 25000) g",
+        )
+        .unwrap();
+    let before: i64 = s
+        .lock()
+        .query_one("SELECT COUNT(*) FROM store_ops", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(before, 25_000);
+    // A fresh instance sweeps on its first op.
+    let s2 = store(&tmp.url());
+    let delta = UsageDelta {
+        requests: 1,
+        ..Default::default()
+    };
+    s2.add_usage_op(op(), "sweep-b", 4_000_000_000_000_010, &delta)
+        .unwrap();
+    let left: i64 = s
+        .lock()
+        .query_one("SELECT COUNT(*) FROM store_ops WHERE body = 'old'", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(left, 0);
+}
+
+/// A batch applies its cells and deltas in key order whatever the caller's order, so two nodes
+/// writing overlapping batches take row locks in one order (no 40P01). Fresh heap rows land in
+/// application order, which `ctid` shows.
+#[test]
+fn a_batch_applies_in_key_order() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let tmp = super::TempDb::create(&url, "spg_order");
+    let s = store(&tmp.url());
+    let delta = UsageDelta {
+        requests: 1,
+        ..Default::default()
+    };
+    let cells = [
+        ("b2", 5, delta.clone()),
+        ("b1", 5, delta.clone()),
+        ("b1", 3, delta.clone()),
+    ];
+    s.add_usage_batch_op(op(), &cells).expect("applied");
+    let order: Vec<(String, i64)> = s
+        .lock()
+        .query(
+            "SELECT bucket_id, window_start FROM usage_windows ORDER BY ctid",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            ("b1".to_string(), 3),
+            ("b1".to_string(), 5),
+            ("b2".to_string(), 5)
+        ]
+    );
+
+    let m = |key: &str, model: &str| MeteringDelta {
+        key_id: key.into(),
+        bucket: 7,
+        model: model.into(),
+        provider: "p".into(),
+        tokens_input: 1,
+        tokens_output: 0,
+        tokens_cache_read: 0,
+        tokens_cache_write: 0,
+        requests: 1,
+        billable_requests: 1,
+        key_group_at_use: "g".into(),
+        pricing_version: "v".into(),
+        priced_from_ms: 0,
+        usage_units: Default::default(),
+    };
+    let deltas = [m("k2", "a"), m("k1", "b"), m("k1", "a")];
+    s.add_metering_batch_op(op(), &deltas).expect("applied");
+    let order: Vec<(String, String)> = s
+        .lock()
+        .query(
+            "SELECT key_id, model FROM usage_metering ORDER BY ctid",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    let want = |k: &str, m: &str| (k.to_string(), m.to_string());
+    assert_eq!(order, [want("k1", "a"), want("k1", "b"), want("k2", "a")]);
 }
 
 /// A new op records its body as the SDK's digest (64 hex digits), not a `{:?}` dump.
@@ -255,7 +535,7 @@ fn an_op_recorded_by_an_older_build_replays() {
         id: parent.clone(),
         parent: Some(parent.clone()),
         seq: 1,
-        ts: 1,
+        ts: 5_000_000_000,
         disposition: PlaneDisposition::Active,
         body: format!("{{\"hash\":\"{hash}\"}}").into_bytes(),
     };
@@ -361,7 +641,7 @@ fn record_keys_are_raw_bytes_scanned_in_byte_order() {
     assert!(scan(&[0xC3, 0x29]).is_empty());
 }
 
-/// AN EMPTY PUT REMOVES THE ROW (slot 40's rule, ARCHITECT 2026-10-21): the host writes every
+/// AN EMPTY PUT REMOVES THE ROW (slot 26's rule, ARCHITECT 2026-10-21): the host writes every
 /// strike as an empty `record_put` and reads empty as absent, so the row LEAVES the table:
 /// `record_get` answers `None`, `record_scan` never returns it, and the table shrinks. Removing a
 /// row that is not there is `Ok`.
