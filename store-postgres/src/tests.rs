@@ -1757,6 +1757,26 @@ fn re_minting_a_revoked_slot_takes_the_new_created_at() {
     hard_reset(&store, &id);
 }
 
+/// The redeem sweep (`kind`, `expires_at`) has its index on a fresh database.
+#[test]
+fn plane_tokens_has_its_sweep_index() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_idx");
+    let store = connect_store_with_retry(&tmp.url()).expect("connect");
+    let def: Option<String> = store
+        .lock()
+        .query_opt(
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'plane_tokens_kind_expires'",
+            &[],
+        )
+        .unwrap()
+        .map(|r| r.get(0));
+    assert!(
+        def.is_some_and(|d| d.contains("(kind, expires_at)")),
+        "plane_tokens_kind_expires on (kind, expires_at)"
+    );
+}
+
 /// A database stamped ABOVE this build is refused at open, with the reason: an older binary would
 /// ignore newer rules (the epoch fence among them). An equal version still opens.
 #[test]
