@@ -695,6 +695,28 @@ fn an_oversized_declared_message_length_is_refused() {
     assert!(started.elapsed() < Duration::from_secs(4));
 }
 
+/// P10: the declared length counts its own four bytes, so a message that carries Postgres' largest
+/// value (1 GiB) declares 1 GiB plus its framing: that is a legitimate peer, waited on, not refused.
+#[test]
+fn a_message_declaring_a_maximal_value_plus_framing_is_not_refused() {
+    let port = fake_server(|mut s| {
+        if read_startup(&mut s).is_ok() {
+            let mut m = vec![b'D'];
+            m.extend_from_slice(&((1_u32 << 30) + 4).to_be_bytes());
+            let _ = s.write_all(&m);
+            std::thread::sleep(Duration::from_secs(3));
+        }
+    });
+    let r = open_within(
+        settings_of(&format!("postgres://u:zq9pw@127.0.0.1:{port}/d")),
+        Duration::from_secs(1),
+    );
+    assert!(
+        r.is_none(),
+        "refused at its header instead of awaited: {r:?}"
+    );
+}
+
 /// The scrub uses the password the connection parser read, not a second parser's guess: a quoted
 /// keyword password holding an escaped quote and a space is scrubbed whole from a server's refusal.
 #[test]
