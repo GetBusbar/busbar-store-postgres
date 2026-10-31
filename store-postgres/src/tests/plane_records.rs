@@ -1376,3 +1376,76 @@ fn the_plane_identity_columns_pin_a_byte_exact_collation() {
         );
     }
 }
+
+fn bare(kind: &str, id: &str, parent: Option<&str>, seq: u64, label: &str) -> PlaneRecord {
+    PlaneRecord {
+        kind: kind.into(),
+        id: id.into(),
+        parent: parent.map(str::to_owned),
+        seq,
+        ts: LIVE_TS,
+        disposition: PlaneDisposition::Active,
+        body: label.as_bytes().to_vec(),
+    }
+}
+
+fn wipe_kind(store: &TestStore, kind: &str) {
+    let mut c = store.lock();
+    c.execute("DELETE FROM plane_records WHERE kind=$1", &[&kind])
+        .unwrap();
+    c.execute("DELETE FROM plane_chain WHERE kind=$1", &[&kind])
+        .unwrap();
+}
+
+/// R14: an appended record honours its actual parent. A parentless append is stored by its own
+/// id, reads back through `get_plane_record`, and is NOT listed as a parent (nor as a child of
+/// itself); a record that names itself as its parent is listed as one.
+#[test]
+fn an_appended_record_honours_its_actual_parent() {
+    let url = require_live_url();
+    let store = connect_store_with_retry(&url).expect("connect");
+    let kind = format!("r14_{}", unique_suffix());
+    wipe_kind(&store, &kind);
+
+    store
+        .append_plane_record(bare(&kind, "solo", None, 0, "solo-body").view())
+        .unwrap();
+    store
+        .append_plane_record(bare(&kind, "child", Some("boss"), 1, "child-body").view())
+        .unwrap();
+    store
+        .append_plane_record(bare(&kind, "selfie", Some("selfie"), 1, "selfie-body").view())
+        .unwrap();
+
+    assert_eq!(
+        store.get_plane_record(&kind, "solo").unwrap().as_deref(),
+        Some(&b"solo-body"[..]),
+        "a parentless append reads back by its own id"
+    );
+    assert_eq!(
+        store.list_plane_record_parents(&kind).unwrap(),
+        ["boss", "selfie"],
+        "a parentless append is not a parent"
+    );
+    let under = |p: &str| -> Vec<Vec<u8>> {
+        store
+            .list_plane_records(&kind, &PlaneSelector::Parent(p.to_owned().into()))
+            .unwrap()
+    };
+    assert!(
+        under("solo").is_empty(),
+        "a parentless append has no children"
+    );
+    assert_eq!(under("boss"), [b"child-body".to_vec()]);
+    assert_eq!(under("selfie"), [b"selfie-body".to_vec()]);
+    assert_eq!(
+        store
+            .list_plane_records(&kind, &PlaneSelector::All)
+            .unwrap()
+            .len(),
+        3
+    );
+    store.delete_plane_record(&kind, "solo").unwrap();
+    assert_eq!(store.get_plane_record(&kind, "solo").unwrap(), None);
+    wipe_kind(&store, &kind);
+}
