@@ -1716,7 +1716,11 @@ fn revision_zero_rows_are_in_every_delta() {
         .unwrap();
     for since in [0, 1, u64::MAX / 2] {
         assert!(
-            store.list_keys_since(since).unwrap().iter().any(|k| k.id == id),
+            store
+                .list_keys_since(since)
+                .unwrap()
+                .iter()
+                .any(|k| k.id == id),
             "key at revision 0, since {since}"
         );
         assert!(

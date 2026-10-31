@@ -512,7 +512,10 @@ fn deleting_a_task_deletes_its_event_chain() {
             .unwrap();
     }
     store.delete_plane_record("task", t).unwrap();
-    assert!(chain(&store, "task_event", t).is_empty(), "the chain went with its task");
+    assert!(
+        chain(&store, "task_event", t).is_empty(),
+        "the chain went with its task"
+    );
 }
 
 /// The per-task provenance chain, read back after a reconnect. It never writes the task itself: an

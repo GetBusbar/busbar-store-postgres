@@ -254,7 +254,10 @@ fn a_scan_prefix_ending_in_0xff_stops_at_the_range_end() {
         scan(&[0x01, 0xFF], 100),
         vec![vec![1, 0xFF], vec![1, 0xFF, 5], vec![1, 0xFF, 0xFF, 0xFF]]
     );
-    assert_eq!(scan(&[0x01, 0xFF], 2), vec![vec![1, 0xFF], vec![1, 0xFF, 5]]);
+    assert_eq!(
+        scan(&[0x01, 0xFF], 2),
+        vec![vec![1, 0xFF], vec![1, 0xFF, 5]]
+    );
     assert_eq!(scan(&[0x01], 100).len(), 4);
     assert_eq!(scan(&[0xFF, 0xFF], 100), Vec::<Vec<u8>>::new());
 }
