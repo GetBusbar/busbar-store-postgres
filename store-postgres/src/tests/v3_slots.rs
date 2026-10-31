@@ -262,6 +262,43 @@ fn a_scan_prefix_ending_in_0xff_stops_at_the_range_end() {
     assert_eq!(scan(&[0xFF, 0xFF], 100), Vec::<Vec<u8>>::new());
 }
 
+/// The first sweep after boot removes every `op_id` past retention, across several delete batches.
+#[test]
+fn the_first_sweep_removes_more_rows_than_one_batch() {
+    let Some(url) = live_url() else {
+        return;
+    };
+    let tmp = super::TempDb::create(&url, "spg_sweep");
+    let s = store(&tmp.url());
+    s.lock()
+        .batch_execute(
+            "INSERT INTO store_ops (op_id, body, answer, recorded_at)
+             SELECT int4send(g)::bytea || '\\x0000000000000000'::bytea, 'old', '', 1
+             FROM generate_series(1, 25000) g",
+        )
+        .unwrap();
+    let before: i64 = s
+        .lock()
+        .query_one("SELECT COUNT(*) FROM store_ops", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(before, 25_000);
+    // A fresh instance sweeps on its first op.
+    let s2 = store(&tmp.url());
+    let delta = UsageDelta {
+        requests: 1,
+        ..Default::default()
+    };
+    s2.add_usage_op(op(), "sweep-b", 4_000_000_000_000_010, &delta)
+        .unwrap();
+    let left: i64 = s
+        .lock()
+        .query_one("SELECT COUNT(*) FROM store_ops WHERE body = 'old'", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(left, 0);
+}
+
 /// A batch applies its cells and deltas in key order whatever the caller's order, so two nodes
 /// writing overlapping batches take row locks in one order (no 40P01). Fresh heap rows land in
 /// application order, which `ctid` shows.
