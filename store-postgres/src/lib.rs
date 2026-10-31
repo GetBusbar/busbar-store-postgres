@@ -199,14 +199,16 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
     out
 }
 
-/// Store schema version. A database older than v6 is refused: no release ever wrote one. v6 -> v13
+/// Store schema version. A database older than v6 is refused: no release ever wrote one. v6 -> v14
 /// upgrades in place:
 /// - v10: `keys` gains `idp_subject`/`binding_mode`/`minted_by`/`idp_provider`/
 ///   `allowed_scopes_by_kind`; open usage units get `usage_ledger_units` and `usage_metering_units`;
 ///   `usage_metering.priced_from_ms` joins its key; the kind-tagged `plane_records`, `plane_chain`
 ///   and `plane_tokens`.
 /// - v11-v13: `store_ops` (the durable `op_id` dedupe log) and `store_records`.
-pub const SCHEMA_VERSION: i64 = 13;
+/// - v14: `plane_chain.has_parent` (a parentless append is stored under its own id, unlisted as a
+///   parent).
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// How many times the migration transaction runs when it is chosen as a deadlock victim.
 const MIGRATE_ATTEMPTS: u32 = 3;
@@ -384,6 +386,8 @@ CREATE TABLE IF NOT EXISTS plane_chain (
     ts          BIGINT NOT NULL,
     disposition TEXT NOT NULL CHECK (disposition IN ('active', 'terminal')),
     body        BYTEA NOT NULL,
+    -- FALSE: the record carried no parent and is keyed by its own id (never listed as a parent).
+    has_parent  BOOLEAN NOT NULL DEFAULT TRUE,
     PRIMARY KEY (kind, parent, seq)
 );
 CREATE INDEX IF NOT EXISTS plane_chain_kind_ts_idx ON plane_chain (kind, ts);
@@ -651,6 +655,15 @@ impl Session {
                  DELETE FROM store_ops WHERE position(':' IN body) > 0
                      AND split_part(body, ':', 1) NOT IN
                      ('append_plane_record', 'add_usage_batch', 'add_metering_batch');",
+            )
+            .await
+            .store()?;
+        }
+        // v14: `has_parent`. A row keyed by its own id was written parentless.
+        if version < 14 {
+            tx.batch_execute(
+                "ALTER TABLE plane_chain ADD COLUMN IF NOT EXISTS has_parent BOOLEAN NOT NULL DEFAULT TRUE;
+                 UPDATE plane_chain SET has_parent = FALSE WHERE parent = id;",
             )
             .await
             .store()?;
@@ -1434,10 +1447,16 @@ impl Session {
         // No principal filter, deliberately: caller scoping is ENGINE-side, because an
         // authorization check living in the backend is one an unauthorized reader bypasses by
         // configuring a different backend.
+        // An upserted record, else a parentless append at seq 0 (stored under its own id).
         let row = self
             .client()
             .query_opt(
-                "SELECT body FROM plane_records WHERE kind=$1 AND id=$2",
+                "SELECT body FROM (
+                     SELECT body, 0 AS src FROM plane_records WHERE kind=$1 AND id=$2
+                     UNION ALL
+                     SELECT body, 1 AS src FROM plane_chain
+                      WHERE kind=$1 AND parent=$2 AND seq=0 AND NOT has_parent
+                 ) r ORDER BY src LIMIT 1",
                 &[&kind, &id],
             )
             .await
@@ -1450,45 +1469,41 @@ impl Session {
         kind: &str,
         selector: &PlaneSelector<'_>,
     ) -> RecordStoreResult<Vec<Vec<u8>>> {
-        let client = self.client();
-        // One snapshot across both tables.
-        let mut tx = Self::snapshot_consistent_tx(client).await?;
-        let (records, chain) = match selector {
-            PlaneSelector::All => (
-                tx.query(
-                    "SELECT body FROM plane_records WHERE kind=$1 ORDER BY seq, id",
-                    &[&kind],
-                )
-                .await
-                .store()?,
-                tx.query(
-                    "SELECT body FROM plane_chain WHERE kind=$1 ORDER BY parent, seq",
-                    &[&kind],
-                )
-                .await
-                .store()?,
-            ),
-            // Oldest-first by seq — the order the engine's chain verifier reads a parent's chain.
+        // ONE statement (one snapshot) over both tables, in one order: (seq, identity), the
+        // identity being an upserted record's id and an appended record's chain (its parent, or
+        // its own id when it has none).
+        let rows = match selector {
+            PlaneSelector::All => {
+                self.client()
+                    .query(
+                        "SELECT body FROM (
+                             SELECT body, seq, id AS identity, id FROM plane_records WHERE kind=$1
+                             UNION ALL
+                             SELECT body, seq, parent AS identity, id FROM plane_chain WHERE kind=$1
+                         ) r ORDER BY seq, identity, id",
+                        &[&kind],
+                    )
+                    .await
+            }
+            // Oldest-first by seq: the order the engine's chain verifier reads a parent's chain.
             PlaneSelector::Parent(p) => {
                 let p: &str = p;
-                (
-                    tx.query(
-                        "SELECT body FROM plane_records WHERE kind=$1 AND parent=$2 ORDER BY seq, id",
+                self.client()
+                    .query(
+                        "SELECT body FROM (
+                             SELECT body, seq, id AS identity, id FROM plane_records
+                              WHERE kind=$1 AND parent=$2
+                             UNION ALL
+                             SELECT body, seq, parent AS identity, id FROM plane_chain
+                              WHERE kind=$1 AND parent=$2 AND has_parent
+                         ) r ORDER BY seq, identity, id",
                         &[&kind, &p],
-                    ).await
-                    .store()?,
-                    tx.query(
-                        "SELECT body FROM plane_chain WHERE kind=$1 AND parent=$2 ORDER BY seq",
-                        &[&kind, &p],
-                    ).await
-                    .store()?,
-                )
+                    )
+                    .await
             }
-        };
-        tx.commit().await.store()?;
-        records
-            .iter()
-            .chain(chain.iter())
+        }
+        .store()?;
+        rows.iter()
             .map(|r| r.try_get::<_, Vec<u8>>(0).store())
             .collect()
     }
@@ -1502,7 +1517,7 @@ impl Session {
         let rows = self
             .client()
             .query(
-                "SELECT parent FROM plane_chain WHERE kind=$1
+                "SELECT parent FROM plane_chain WHERE kind=$1 AND has_parent
                  UNION
                  SELECT parent FROM plane_records WHERE kind=$1 AND parent IS NOT NULL
                  ORDER BY 1",
@@ -2170,6 +2185,7 @@ impl Session {
         // The chain a child record hangs off: its parent, or (a parentless append) its own id —
         // the same identity busbar's reference backends key a chain by.
         let parent = record.parent.as_deref().unwrap_or(record.id.as_str());
+        let has_parent = record.parent.is_some();
         let disposition = disposition_to_storage(record.disposition);
         // APPEND-ONLY. A record on an occupied (kind, parent, seq) is IDENTICAL (the write-through
         // retrying: Ok) or DIFFERENT (a forked chain: an error), as any append-only chain settles a
@@ -2178,8 +2194,8 @@ impl Session {
         // success, and the v3 caller turns that into a failure the kernel retries.
         let inserted = tx
             .execute(
-                "INSERT INTO plane_chain (kind, parent, seq, id, ts, disposition, body)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7)
+                "INSERT INTO plane_chain (kind, parent, seq, id, ts, disposition, body, has_parent)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                  ON CONFLICT (kind, parent, seq) DO NOTHING",
                 &[
                     &record.kind,
@@ -2189,6 +2205,7 @@ impl Session {
                     &ts,
                     &disposition,
                     &record.body,
+                    &has_parent,
                 ],
             )
             .await
@@ -2198,7 +2215,7 @@ impl Session {
         }
         let stored = tx
             .query_opt(
-                "SELECT id, ts, disposition, body FROM plane_chain
+                "SELECT id, ts, disposition, body, has_parent FROM plane_chain
                  WHERE kind=$1 AND parent=$2 AND seq=$3 FOR SHARE",
                 &[&record.kind, &parent, &seq],
             )
@@ -2209,7 +2226,8 @@ impl Session {
                 let identical = r.try_get::<_, String>(0).store()? == record.id
                     && r.try_get::<_, i64>(1).store()? == ts
                     && r.try_get::<_, String>(2).store()? == disposition
-                    && r.try_get::<_, Vec<u8>>(3).store()? == record.body;
+                    && r.try_get::<_, Vec<u8>>(3).store()? == record.body
+                    && r.try_get::<_, bool>(4).store()? == has_parent;
                 if identical {
                     return Ok(true);
                 }
