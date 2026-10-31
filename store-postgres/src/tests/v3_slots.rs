@@ -42,22 +42,43 @@ fn store(url: &str) -> TestStore {
     connect_store_with_retry(url).expect("connect")
 }
 
-/// `open` is the settings' judge: the 1.5.5 refusals, in the store's own words.
+/// `open` is the settings' judge: every refusal starts `invalid postgres plugin config: `, a
+/// type error names the type and never the value.
 #[test]
 fn open_refuses_settings_without_a_url() {
-    let want = "postgres plugin config requires a \"url\" (a libpq connection string)";
-    for settings in [&b""[..], &b"  "[..], &b"{}"[..], &br#"{"url": "  "}"#[..]] {
+    let want = "invalid postgres plugin config: `url` is required (a libpq connection string)";
+    for settings in [
+        &b""[..],
+        &b"  "[..],
+        &b"{}"[..],
+        &br#"{"url": "  "}"#[..],
+        &br#"{"url": null}"#[..],
+        &b"null"[..],
+    ] {
         assert_eq!(
             TestStore::open_slot(settings).err().as_deref(),
             Some(want),
             "{settings:?}"
         );
     }
-    // A present url of the wrong type says so, rather than "requires a url".
-    for settings in [&br#"{"url": 5}"#[..], &br#"{"url": null}"#[..]] {
+    // A present url of the wrong type says so, naming the type, rather than "required".
+    assert_eq!(
+        TestStore::open_slot(br#"{"url": 5}"#).err().as_deref(),
+        Some("invalid postgres plugin config: `url` must be a string, got a number")
+    );
+    // A non-object names the JSON type it got.
+    for (settings, ty) in [
+        (&br#""x""#[..], "a string"),
+        (&b"[1]"[..], "an array"),
+        (&b"7"[..], "a number"),
+        (&b"true"[..], "a boolean"),
+    ] {
         assert_eq!(
             TestStore::open_slot(settings).err().as_deref(),
-            Some("invalid postgres plugin config: `url` must be a string"),
+            Some(
+                format!("invalid postgres plugin config: expected a JSON object, got {ty}")
+                    .as_str()
+            ),
             "{settings:?}"
         );
     }
@@ -70,6 +91,41 @@ fn open_refuses_settings_without_a_url() {
     );
     let e = TestStore::open_slot(b"{ not json").err().unwrap();
     assert!(e.starts_with("invalid postgres plugin config:"), "{e}");
+}
+
+/// `validate` runs exactly `open`'s parse, the connection string's included, and connects to
+/// nothing; a URL refusal carries the `url: ` prefix.
+#[test]
+fn validate_refuses_what_open_refuses() {
+    for settings in [
+        &br#"{"url": "postgres://u@h/d?no_such_option=1"}"#[..],
+        &br#"{"url": "postgres://u@h/d?sslmode=bogus"}"#[..],
+        &br#"{"url": "not a connection string"}"#[..],
+        &b"{}"[..],
+        &br#"{"url": 5}"#[..],
+        &b"[1]"[..],
+        &b"{ not json"[..],
+    ] {
+        let opened = TestStore::open_slot(settings).expect_err("open refuses");
+        let validated =
+            <crate::PostgresStore as busbar_contract::abi::sdk::store::StoreSlots>::validate(
+                settings,
+            )
+            .expect_err("validate refuses what open refuses");
+        assert_eq!(validated, opened, "{settings:?}");
+    }
+    let e = TestStore::open_slot(br#"{"url": "postgres://u@h/d?no_such_option=1"}"#)
+        .err()
+        .unwrap();
+    assert!(
+        e.starts_with("invalid postgres plugin config: url: "),
+        "{e}"
+    );
+    // A well-formed URL validates without a server.
+    <crate::PostgresStore as busbar_contract::abi::sdk::store::StoreSlots>::validate(
+        br#"{"url": "postgres://u@127.0.0.1:1/d"}"#,
+    )
+    .expect("a parseable url validates");
 }
 
 /// S1/S2/S3/S4: a replay applies nothing and answers the original, a different body is a
