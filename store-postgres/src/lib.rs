@@ -208,7 +208,8 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 /// - v11-v13: `store_ops` (the durable `op_id` dedupe log) and `store_records`.
 /// - v14: `plane_chain.has_parent` (a parentless append is stored under its own id, unlisted as a
 ///   parent).
-pub const SCHEMA_VERSION: i64 = 14;
+/// - v15: erase historical revoked-credential secrets, preserving revocation metadata.
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// How many times the migration transaction runs when it is chosen as a deadlock victim.
 const MIGRATE_ATTEMPTS: u32 = 3;
@@ -669,6 +670,29 @@ impl Session {
             )
             .await
             .store()?;
+        }
+        if version < 15 {
+            let dirty: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM credentials WHERE revoked_at IS NOT NULL
+                     AND (secret IS NOT NULL OR secret_form <> 'none'))",
+                    &[],
+                )
+                .await
+                .store()?
+                .try_get(0)
+                .store()?;
+            if dirty {
+                let rev = Self::next_revision(&mut tx).await?;
+                tx.execute(
+                    "UPDATE credentials SET secret=NULL, secret_form='none', revision=$1
+                     WHERE revoked_at IS NOT NULL
+                     AND (secret IS NOT NULL OR secret_form <> 'none')",
+                    &[&rev],
+                )
+                .await
+                .store()?;
+            }
         }
         tx.execute(
             "INSERT INTO busbar_schema (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
@@ -1330,8 +1354,8 @@ impl Session {
         }
         let rev = Self::next_revision(&mut tx).await?;
         let now = now_secs();
-        // `AND revoked_at IS NULL` in the UPDATE's own WHERE: a repeat revoke is a true no-op (no
-        // revision bump, no rewritten reason) and, under READ COMMITTED's row-lock re-check, safe
+        // `AND revoked_at IS NULL` in the UPDATE's own WHERE: a clean repeat revoke is a true no-op
+        // (no row revision bump, no rewritten reason) and, under READ COMMITTED's row-lock re-check, safe
         // against a concurrent revoke of the same id.
         let changed = tx
             .execute(
@@ -1343,6 +1367,14 @@ impl Session {
             .await
             .store()?;
         if changed == 0 {
+            tx.execute(
+                "UPDATE credentials SET secret=NULL, secret_form='none', revision=$2
+                 WHERE id=$1 AND revoked_at IS NOT NULL
+                 AND (secret IS NOT NULL OR secret_form <> 'none')",
+                &[&id, &rev],
+            )
+            .await
+            .store()?;
             // Zero rows is ambiguous: a concurrent mint into the freed slot can rewrite this row's
             // PRIMARY KEY (`put_credential_tx` sets `id=EXCLUDED.id`) between the EXISTS above and
             // this UPDATE, and reporting success then is "revoked, yet still authenticating". So ask
@@ -1363,9 +1395,9 @@ impl Session {
                     "revoke_credential: unknown id '{id}'"
                 )));
             }
-            // The row is there and was already revoked: a true idempotent no-op, exactly what the
-            // trait promises. The revision bump above goes unused, which its own doc allows (a
-            // monotonic counter with gaps).
+            // An already-clean revoked row is unchanged; a historical secret is erased without
+            // rewriting its original revocation. A clean row leaves the revision unused (gaps are
+            // allowed in the monotonic counter).
         }
         tx.commit().await.store()?;
         Ok(())
