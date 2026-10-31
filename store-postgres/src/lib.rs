@@ -209,7 +209,7 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 const SCHEMA_VERSION: i64 = 13;
 
 /// How many times the migration transaction runs when it is chosen as a deadlock victim.
-const MIGRATE_ATTEMPTS: u32 = 1;
+const MIGRATE_ATTEMPTS: u32 = 3;
 
 /// The oldest schema any release wrote.
 const FIRST_RELEASED_SCHEMA: i64 = 6;
