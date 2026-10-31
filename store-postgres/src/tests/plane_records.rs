@@ -1478,3 +1478,36 @@ fn list_plane_records_is_one_order_across_upserts_and_appends() {
     assert_eq!(got, ["m1", "b2", "a3", "c3", "u5"]);
     wipe_kind(&store, &kind);
 }
+
+/// P19: a row re-written (upserted) between the purge's subquery and its delete is NOT deleted: the
+/// outer `DELETE` restates the retention predicate, so READ COMMITTED re-checks it on the new
+/// version of the row after the lock wait.
+#[test]
+fn a_purge_spares_a_row_rewritten_while_it_waited() {
+    let url = require_live_url();
+    let store = connect_store_with_retry(&url).expect("connect");
+    let kind = format!("p19_{}", unique_suffix());
+    wipe_kind(&store, &kind);
+    let mut old = bare(&kind, "x", None, 0, "old");
+    old.ts = 100;
+    store.upsert_plane_record(old.view()).unwrap();
+
+    let mut holder = connect_client_with_retry(&url);
+    holder
+        .batch_execute(&format!(
+            "BEGIN; UPDATE plane_records SET ts = 5000 WHERE kind = '{kind}' AND id = 'x'"
+        ))
+        .unwrap();
+    let purged = std::thread::scope(|s| {
+        let purge = s.spawn(|| store.purge_plane_records(&kind, 1000, Retention::Age));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        holder.batch_execute("COMMIT").unwrap();
+        purge.join().unwrap().expect("purge")
+    });
+    assert_eq!(purged, 0, "the rewritten row no longer matched the cutoff");
+    assert!(
+        store.get_plane_record(&kind, "x").unwrap().is_some(),
+        "the rewritten row survived"
+    );
+    wipe_kind(&store, &kind);
+}
