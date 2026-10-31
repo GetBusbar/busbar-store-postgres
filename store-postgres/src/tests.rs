@@ -776,110 +776,53 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
     assert!(store_a.list_credentials(id).unwrap().is_empty());
 }
 
-/// THE actual torn-read proof the previous test's docstring used to promise but never ran: a
-/// concurrent add_usage landing between get_usage's requests-row read and its model-rows read must
-/// not be half-visible. Drives get_usage's own two-step read manually (its real SQL, via the same
-/// `snapshot_consistent_tx` helper it uses internally) so a write can be deliberately interleaved
-/// between the two steps on a SEPARATE connection, then asserts REPEATABLE READ's snapshot held: the
-/// second read still sees the pre-interleave state, not the concurrent writer's new model row.
-///
-/// Non-vacuous: downgrading `snapshot_consistent_tx`'s isolation level to READ COMMITTED makes the
-/// `model_count` assertion below fail, because the second read then observes the interleaved
-/// writer's new model row.
+/// A concurrent `add_usage` landing between `get_usage`'s reads must not be half-visible. A writer
+/// adds one request and one NEW model per call, so any consistent snapshot has exactly as many model
+/// rows as requests; `get_usage` itself is read in a loop against it. Non-vacuous: downgrading
+/// `snapshot_consistent_tx` to READ COMMITTED makes a read observe the counter and the models of
+/// different commits.
 #[test]
-fn get_usage_snapshot_does_not_observe_a_concurrent_add_usage_between_its_two_reads() {
+fn get_usage_never_returns_a_torn_snapshot_under_a_concurrent_writer() {
     let Some(url) = live_url() else { return };
-    let store = connect_store_with_retry(&url).expect("connect");
-    let bucket = "vk_torn_read1";
+    let reader = connect_store_with_retry(&url).expect("connect");
+    let writer = connect_store_with_retry(&url).expect("connect");
+    let bucket = format!("vk_torn_{}", unique_suffix());
     let ws = 20_270_301u64;
-    hard_reset(&store, bucket);
-    let _ = store
-        .lock()
-        .execute("DELETE FROM usage_windows WHERE bucket_id=$1", &[&bucket]);
-    let _ = store
-        .lock()
-        .execute("DELETE FROM usage_ledger WHERE bucket_id=$1", &[&bucket]);
-
-    // Seed one model row so the "before" state is non-empty and distinguishable from "after".
-    store
-        .put_usage(
-            bucket,
-            ws,
-            &UsageLedger {
-                requests: 10,
-                billable_requests: 10,
-                models: vec![mt("seed-model", 1, 1, 0, 0)],
-            },
-        )
-        .unwrap();
-
-    // Open the snapshot and take the FIRST of get_usage's two reads (the requests row) manually.
-    // This SECOND connection is genuinely required (the snapshot must stay open here while `store`
-    // writes on its own connection below), so it can't be reused away like the sibling isolation
-    // test's -- instead its connect is bounded-retried to absorb transient connection-pressure
-    // refusals under the gate's parallel load.
-    let mut client = connect_client_with_retry(&url);
-    // `snapshot_consistent_tx`'s statement, on this independent connection.
-    let mut tx = client
-        .build_transaction()
-        .isolation_level(postgres::IsolationLevel::RepeatableRead)
-        .start()
-        .unwrap();
-    let _requests_row = tx
-        .query_one(
-            "SELECT requests, billable_requests FROM usage_windows WHERE bucket_id=$1 AND window_start=$2",
-            &[&bucket, &clamp(ws)],
-        )
-        .unwrap();
-
-    // Interleave: a SEPARATE connection commits an add_usage that adds a brand-new model row and
-    // bumps requests, fully committed before this transaction's second read runs. `store` is already
-    // an independent connection from the snapshot's `client` (a distinct `Client::connect` above) and
-    // is idle here, so it IS the required separate writer -- reusing it (rather than opening a third
-    // connection) keeps the interleave semantics identical while removing a connect()/migrate() that
-    // could fail under a shared CI Postgres's connection pressure (the observed gate flake: the third
-    // connect's `.expect` panicked, never the isolation assertion below).
-    store
-        .add_usage(
-            bucket,
-            ws,
-            &UsageDelta {
-                requests: 5,
-                billable_requests: 5,
-                models: vec![mtd("concurrent-writer-model", 1, 1, 0, 0)],
-            },
-        )
-        .unwrap();
-
-    // The SECOND read, same transaction/snapshot: under REPEATABLE READ this must still see only
-    // the pre-interleave model row, not the concurrent writer's new one.
-    let model_rows = tx
-        .query(
-            "SELECT model FROM usage_ledger WHERE bucket_id=$1 AND window_start=$2",
-            &[&bucket, &clamp(ws)],
-        )
-        .unwrap();
-    tx.commit().unwrap();
-
-    let models: Vec<String> = model_rows.iter().map(|r| r.get(0)).collect();
-    assert_eq!(
-        models,
-        vec!["seed-model".to_string()],
-        "a REPEATABLE READ snapshot must not observe a model row committed by a concurrent \
-         add_usage after this transaction began; observed: {models:?}"
-    );
-
-    // Sanity: the interleaved write DID land for a fresh read (proves it wasn't silently a no-op).
-    let after = store.get_usage(bucket, ws).unwrap();
-    assert_eq!(
-        after.requests, 15,
-        "the concurrent add_usage must have applied for a fresh read"
-    );
-    assert_eq!(
-        after.models.len(),
-        2,
-        "both models must be present for a fresh read"
-    );
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let reads = std::thread::scope(|s| {
+        let w = s.spawn(|| {
+            for i in 0..400 {
+                writer
+                    .add_usage(
+                        &bucket,
+                        ws,
+                        &UsageDelta {
+                            requests: 1,
+                            billable_requests: 1,
+                            models: vec![mtd(format!("m{i}"), 1, 0, 0, 0)],
+                        },
+                    )
+                    .unwrap();
+            }
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let mut reads = 0;
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            let got = reader.get_usage(&bucket, ws).unwrap();
+            assert_eq!(
+                got.models.len() as u64,
+                got.requests,
+                "a torn read: {} requests beside {} model rows",
+                got.requests,
+                got.models.len()
+            );
+            reads += 1;
+        }
+        w.join().unwrap();
+        reads
+    });
+    assert!(reads > 0);
+    hard_reset(&reader, &bucket);
 }
 
 /// usage_metering round-trip including the new fields (billable_requests, key_group_at_use,
@@ -1540,11 +1483,11 @@ impl Drop for TempDb {
     }
 }
 
-/// `migrate_locked`'s undefined-table bootstrap path AND its legacy-table drop, together, on a
-/// genuinely fresh (separate, disposable) database rather than the shared test database -- which,
-/// once any test has run against it, never again presents an undefined `busbar_schema` or a
-/// version < `SCHEMA_VERSION`, so this code was structurally unreachable from every other test in
-/// this file.
+/// `migrate_locked`'s undefined-table bootstrap path on a genuinely fresh (separate, disposable)
+/// database rather than the shared test database -- which, once any test has run against it, never
+/// again presents an undefined `busbar_schema` or a version < `SCHEMA_VERSION`, so this code was
+/// structurally unreachable from every other test in this file. (The v12 -> v13 drops are
+/// `the_v13_upgrade_drops_the_money_and_dead_slot_tables`.)
 #[test]
 fn migrate_bootstraps_fresh_database() {
     let Some(url) = live_url() else { return };
@@ -1985,6 +1928,30 @@ fn two_nodes_opening_a_fresh_database_together_both_migrate_cleanly() {
     }
 
     let store = opened.into_iter().next().unwrap().unwrap();
+    for table in [
+        "keys",
+        "credentials",
+        "usage_windows",
+        "usage_ledger",
+        "usage_ledger_units",
+        "usage_metering",
+        "usage_metering_units",
+        "audit_log",
+        "denylist",
+        "store_revision",
+        "plane_records",
+        "plane_chain",
+        "plane_tokens",
+        "store_ops",
+        "store_records",
+    ] {
+        let there: bool = store
+            .lock()
+            .query_one("SELECT to_regclass($1) IS NOT NULL", &[&table])
+            .unwrap()
+            .get(0);
+        assert!(there, "{table} must exist after the race");
+    }
     let stamped: i64 = store
         .lock()
         .query_one(
