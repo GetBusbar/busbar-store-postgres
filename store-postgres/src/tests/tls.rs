@@ -271,7 +271,7 @@ fn an_untrusted_server_certificate_fails_the_load_in_the_drivers_words() {
     );
 }
 
-/// STORE-KEEP: every op of one store runs on the same server backend (one kept connection), and
+/// STORE-KEEP: sequential ops of one store run on the same server backend (a kept connection), and
 /// the store holds one connection while idle.
 #[test]
 fn the_store_keeps_one_connection_across_its_ops() {
@@ -783,9 +783,9 @@ fn an_endpoint_that_times_out_hands_over_to_the_next() {
     );
 }
 
-/// D37: `connect_timeout` bounds a NEW connection's dial and handshake, never the wait for the
-/// instance's one kept connection. Op A holds it longer than the timeout (blocked on a row lock);
-/// op B queued behind it still succeeds.
+/// D37: `connect_timeout` bounds a NEW connection's dial and handshake, never the wait for a
+/// kept connection. Op A holds one longer than the timeout (blocked on a row lock); op B waiting
+/// behind it still succeeds.
 #[test]
 fn an_op_held_on_a_lock_past_connect_timeout_is_not_cut() {
     let Some(url) = live_url() else { return };

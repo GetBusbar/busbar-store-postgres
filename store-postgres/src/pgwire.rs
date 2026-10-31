@@ -114,8 +114,9 @@ fn inert(key: &str, value: &str, why: &str) {
     tracing::debug!("postgres connection option {key}={value} has no effect: {why}");
 }
 
-/// Postgres' own ceiling on a message (1 GiB).
-const MAX_MESSAGE_LEN: u32 = 1 << 30;
+/// The most a message may declare: Postgres' own ceiling on a value (1 GiB) plus the four bytes
+/// of the length word, which the declared length counts.
+const MAX_MESSAGE_LEN: u32 = (1 << 30) + 4;
 
 /// The handshake bound when the DSN has no `connect_timeout`.
 const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 30_000;
