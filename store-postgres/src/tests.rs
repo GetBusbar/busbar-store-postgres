@@ -2357,3 +2357,85 @@ fn usage_cleanup_keeps_boundaries_billing_and_rolls_back_every_usage_table() {
         0
     );
 }
+
+#[test]
+fn usage_cleanup_waits_for_a_usage_writer_and_removes_its_complete_old_window() {
+    use busbar_contract::store_calls::StoreCalls;
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_usage_writer");
+    let store = TestStore::open(&tmp.url()).unwrap();
+    let mut writer = connect_client_with_retry(&tmp.url());
+    writer
+        .batch_execute(
+            "BEGIN;
+         INSERT INTO usage_windows (bucket_id,window_start,requests) VALUES ('writer',9,3);
+         INSERT INTO usage_ledger (bucket_id,window_start,model,tokens_input)
+         VALUES ('writer',9,'alpha',5);
+         INSERT INTO usage_ledger_units (bucket_id,window_start,model,unit,count)
+         VALUES ('writer',9,'alpha','audio_seconds',7);",
+        )
+        .unwrap();
+    let worker_url = tmp.url();
+    let (answer, result) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let cleanup = TestStore::open(&worker_url).unwrap();
+        let removed = harness::block_on(StoreCalls::purge_usage_before(&*cleanup, 10));
+        answer.send(removed).unwrap();
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut premature = None;
+    let waited_on_writer = loop {
+        if let Ok(answer) = result.try_recv() {
+            premature = Some(answer);
+            break false;
+        }
+        let waiting: i64 = store
+            .lock()
+            .query_one(
+                "SELECT count(*) FROM pg_locks
+             WHERE database=(SELECT oid FROM pg_database WHERE datname=current_database())
+               AND relation='usage_ledger'::regclass
+               AND mode='ShareRowExclusiveLock' AND NOT granted",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        if waiting != 0 {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    writer.batch_execute("COMMIT").unwrap();
+    let removed = premature.unwrap_or_else(|| {
+        result
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("cleanup finishes after the writer commits")
+    });
+    worker.join().unwrap();
+    assert!(
+        waited_on_writer,
+        "cleanup must synchronize with the in-flight usage transaction"
+    );
+    assert_eq!(removed.unwrap(), 1);
+    let row = store
+        .lock()
+        .query_one(
+            "SELECT (SELECT count(*) FROM usage_windows),
+                (SELECT count(*) FROM usage_ledger),
+                (SELECT count(*) FROM usage_ledger_units)",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        [
+            row.get::<_, i64>(0),
+            row.get::<_, i64>(1),
+            row.get::<_, i64>(2)
+        ],
+        [0, 0, 0],
+        "no child rows from the committed old window survive"
+    );
+}
