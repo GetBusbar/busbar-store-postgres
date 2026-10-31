@@ -410,7 +410,7 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
 
     let err = common::dropped_at(&path, "{}").expect_err("a config missing url must fail to load");
     assert!(
-        err.contains("requires a \"url\""),
+        err.contains("`url` is required"),
         "expected the plugin's own missing-url message, got: {err}"
     );
 
@@ -420,7 +420,8 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
     )
     .expect_err("an unreachable postgres target must fail to load");
     assert!(
-        err.contains("error connecting to server"),
+        err.contains("postgres store: failed to connect: ")
+            && err.contains("error connecting to server"),
         "expected tokio-postgres's own connect-failure message to survive the ABI crossing, got: {err}"
     );
 }

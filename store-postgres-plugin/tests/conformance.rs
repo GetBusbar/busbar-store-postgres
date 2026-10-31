@@ -249,8 +249,8 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
     let refusals = linked["refusals"].as_array().unwrap();
     assert_eq!(
         refusals[0],
-        "plugin 'busbar-store-postgres' open failed: postgres plugin config requires a \"url\" \
-         (a libpq connection string)"
+        "plugin 'busbar-store-postgres' open failed: invalid postgres plugin config: `url` is \
+         required (a libpq connection string)"
     );
     assert_eq!(refusals[1], refusals[0]);
     assert!(
@@ -262,12 +262,13 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
     assert_eq!(
         refusals[3],
         "plugin 'busbar-store-postgres' open failed: invalid postgres plugin config: `url` must be \
-         a string",
+         a string, got a number",
         "a present non-string url says so"
     );
     let unreachable = refusals[4].as_str().unwrap();
     assert!(
-        unreachable.contains("error connecting to server"),
+        unreachable.contains("postgres store: failed to connect: ")
+            && unreachable.contains("error connecting to server"),
         "the unreachable server is refused as a connect failure: {unreachable}"
     );
     assert!(
@@ -306,7 +307,7 @@ fn foreign_bytes_dropped_in_are_not_the_postgres_store() {
     };
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
-        !red.contains("requires a \"url\""),
+        !red.contains("`url` is required"),
         "foreign bytes cannot speak the store's own refusal: {red}"
     );
 }
