@@ -206,7 +206,7 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 ///   `usage_metering.priced_from_ms` joins its key; the kind-tagged `plane_records`, `plane_chain`
 ///   and `plane_tokens`.
 /// - v11-v13: `store_ops` (the durable `op_id` dedupe log) and `store_records`.
-const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// How many times the migration transaction runs when it is chosen as a deadlock victim.
 const MIGRATE_ATTEMPTS: u32 = 3;
