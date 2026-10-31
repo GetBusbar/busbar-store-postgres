@@ -802,7 +802,9 @@ impl Session {
         &mut self,
         since: u64,
     ) -> RecordStoreResult<Vec<VirtualKey>> {
-        let sql = format!("SELECT {KEY_COLUMNS} FROM keys WHERE revision > $1 OR revision = 0 ORDER BY revision");
+        let sql = format!(
+            "SELECT {KEY_COLUMNS} FROM keys WHERE revision > $1 OR revision = 0 ORDER BY revision"
+        );
         let rows = self.lock().query(&sql, &[&clamp(since)]).await.store()?;
         rows.iter().map(row_to_key).collect()
     }

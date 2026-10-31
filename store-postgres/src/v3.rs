@@ -30,7 +30,7 @@ use busbar_contract::abi::host::conn::connector::{
 use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_OCTETS};
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::door::abi_str;
-use busbar_contract::abi::sdk::store::column::storable_i64;
+use busbar_contract::abi::sdk::store::column::{prefix_end, storable_i64};
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::wire::{drive_kept, Body};
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
@@ -303,17 +303,32 @@ impl Session {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let rows = self
-            .lock()
-            .query(
-                "SELECT key, value FROM store_records
-                 WHERE schema_id = $1
-                   AND substring(key FROM 1 FOR octet_length($2::bytea)) = $2::bytea
-                 ORDER BY key LIMIT $3",
-                &[&schema, &prefix, &i64::from(limit)],
-            )
-            .await
-            .map_err(pg)?;
+        // A key range on the primary key, not a per-row prefix compare.
+        let limit = i64::from(limit);
+        let client = self.lock();
+        let rows = match prefix_end(prefix) {
+            Some(end) => {
+                client
+                    .query(
+                        "SELECT key, value FROM store_records
+                         WHERE schema_id = $1 AND key >= $2 AND key < $3
+                         ORDER BY key LIMIT $4",
+                        &[&schema, &prefix, &end, &limit],
+                    )
+                    .await
+            }
+            None => {
+                client
+                    .query(
+                        "SELECT key, value FROM store_records
+                         WHERE schema_id = $1 AND key >= $2
+                         ORDER BY key LIMIT $3",
+                        &[&schema, &prefix, &limit],
+                    )
+                    .await
+            }
+        }
+        .map_err(pg)?;
         rows.iter()
             .map(|r| {
                 Ok((
