@@ -1564,7 +1564,9 @@ impl Session {
         loop {
             let ids: Vec<String> = tx
                 .query(
-                    "DELETE FROM plane_records WHERE (kind, id) IN
+                    "DELETE FROM plane_records
+                     WHERE kind=$1 AND ts < $2 AND (NOT $3 OR disposition = 'terminal')
+                       AND (kind, id) IN
                          (SELECT kind, id FROM plane_records
                           WHERE kind=$1 AND ts < $2 AND (NOT $3 OR disposition = 'terminal')
                           LIMIT $4)
