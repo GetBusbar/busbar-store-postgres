@@ -1017,6 +1017,42 @@ impl Session {
         })
     }
 
+    pub(crate) async fn purge_usage_before(&mut self, before: u64) -> RecordStoreResult<u64> {
+        if before == 0 {
+            return Ok(0);
+        }
+        let above_sql_maximum = before > i64::MAX as u64;
+        let cutoff = clamp(before);
+        let mut tx = self.client().transaction().await.store()?;
+        tx.batch_execute(
+            "LOCK TABLE usage_ledger, usage_ledger_units, usage_windows \
+             IN SHARE ROW EXCLUSIVE MODE",
+        )
+        .await
+        .store()?;
+        tx.execute(
+            "DELETE FROM usage_ledger WHERE window_start > 0 AND ($1 OR window_start < $2)",
+            &[&above_sql_maximum, &cutoff],
+        )
+        .await
+        .store()?;
+        tx.execute(
+            "DELETE FROM usage_ledger_units WHERE window_start > 0 AND ($1 OR window_start < $2)",
+            &[&above_sql_maximum, &cutoff],
+        )
+        .await
+        .store()?;
+        let removed = tx
+            .execute(
+                "DELETE FROM usage_windows WHERE window_start > 0 AND ($1 OR window_start < $2)",
+                &[&above_sql_maximum, &cutoff],
+            )
+            .await
+            .store()?;
+        tx.commit().await.store()?;
+        Ok(removed)
+    }
+
     pub(crate) async fn put_usage(
         &mut self,
         bucket_id: &str,

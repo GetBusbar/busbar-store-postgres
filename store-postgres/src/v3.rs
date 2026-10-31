@@ -602,6 +602,7 @@ impl StoreSlots for PostgresStore {
         list_keys_since(since = u64) -> Vec<VirtualKey>;
         get_usage(bucket_id: &str, window_start = u64) -> UsageLedger;
         put_usage(bucket_id: &str, window_start = u64, ledger: &UsageLedger) -> ();
+        purge_usage_before(before = u64) -> u64;
         list_metering(bucket = u64) -> Vec<MeteringRow>;
         put_credential(secret: &CredentialSecret) -> ();
         put_key_with_credential(key: &VirtualKey, secret: &CredentialSecret) -> ();
