@@ -494,6 +494,61 @@ fn listing_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
     reset(&reopened, "task", &ids);
 }
 
+/// Deleting a task takes its event chain with it (as the purge does): no `task_event` row is left
+/// with the task as its parent.
+#[test]
+fn deleting_a_task_deletes_its_event_chain() {
+    let Some(url) = live_url() else { return };
+    let t = "t_delete_chain_1";
+    let store = connect_store_with_retry(&url).expect("connect");
+    reset(&store, "task_event", &[t]);
+    reset(&store, "task", &[t]);
+    store
+        .upsert_plane_record(task(t, "working", LIVE_TS, PlaneDisposition::Active).view())
+        .unwrap();
+    for seq in 1..=2 {
+        store
+            .append_plane_record(event(t, seq, "task.working", "", "h").view())
+            .unwrap();
+    }
+    store.delete_plane_record("task", t).unwrap();
+    assert!(
+        chain(&store, "task_event", t).is_empty(),
+        "the chain went with its task"
+    );
+}
+
+/// A purge larger than one batch removes every aged row, takes each purged task's event chain,
+/// counts them all, and leaves the active rows.
+#[test]
+fn a_purge_spanning_several_batches_is_whole() {
+    let Some(url) = live_url() else { return };
+    let tmp = super::TempDb::create(&url, "spg_purge");
+    let store = connect_store_with_retry(&tmp.url()).expect("connect");
+    store
+        .lock()
+        .batch_execute(
+            "INSERT INTO plane_records (kind, id, ts, disposition, body)
+               SELECT 'task', 't' || g, 10, 'terminal', '\\x7b7d' FROM generate_series(1, 2500) g;
+             INSERT INTO plane_records (kind, id, ts, disposition, body)
+               SELECT 'task', 'live' || g, 10, 'active', '\\x7b7d' FROM generate_series(1, 5) g;
+             INSERT INTO plane_chain (kind, parent, seq, id, ts, disposition, body)
+               SELECT 'task_event', 't' || g, 1, 't' || g, 10, 'active', '\\x7b7d'
+               FROM generate_series(1, 2500) g;
+             INSERT INTO plane_chain (kind, parent, seq, id, ts, disposition, body)
+               SELECT 'task_event', 'live' || g, 1, 'live' || g, 10, 'active', '\\x7b7d'
+               FROM generate_series(1, 5) g;",
+        )
+        .unwrap();
+    let purged = store
+        .purge_plane_records("task", 100, Retention::TerminalOnly)
+        .unwrap();
+    assert_eq!(purged, 2500);
+    let count = |sql: &str| -> i64 { store.lock().query_one(sql, &[]).unwrap().get(0) };
+    assert_eq!(count("SELECT COUNT(*) FROM plane_records"), 5);
+    assert_eq!(count("SELECT COUNT(*) FROM plane_chain"), 5);
+}
+
 /// The per-task provenance chain, read back after a reconnect. It never writes the task itself: an
 /// event and the first task write are independent write-throughs with no ordering between them, so
 /// appending an event for a task with no row yet has to WORK (no foreign key between the tables).
@@ -881,6 +936,11 @@ fn trust_ns(tag: &str) -> String {
 /// every token here expires ABOVE 1.7e9 (the conformance sweep reaches none of them).
 const TRUST_NOW: u64 = 1_900_000_000;
 
+/// A sweeping redemption reaches every entry of its kind below its `now`, so each sweeping test has
+/// a kind of its own.
+const SWEEP_KIND_EVICT: &str = "ask_sweep_evict";
+const SWEEP_KIND_EDGE: &str = "ask_sweep_edge";
+
 fn demotions(store: &TestStore) -> Vec<serde_json::Value> {
     store
         .list_plane_records("demotion", &PlaneSelector::All)
@@ -1081,24 +1141,24 @@ fn redeeming_evicts_entries_whose_token_can_no_longer_be_presented() {
         trust_ns("nonce-sweeper"),
     );
     let store = connect_store_with_retry(&url).expect("connect");
-    reset_tokens(&store, "ask", &[&short, &long, &other]);
+    reset_tokens(&store, SWEEP_KIND_EVICT, &[&short, &long, &other]);
 
     assert!(store
-        .redeem_plane_token("ask", &short, TRUST_NOW + 10, TRUST_NOW)
+        .redeem_plane_token(SWEEP_KIND_EVICT, &short, TRUST_NOW + 10, TRUST_NOW)
         .unwrap());
     assert!(store
-        .redeem_plane_token("ask", &long, TRUST_NOW + 10_000, TRUST_NOW)
+        .redeem_plane_token(SWEEP_KIND_EVICT, &long, TRUST_NOW + 10_000, TRUST_NOW)
         .unwrap());
     let later = TRUST_NOW + 11;
     assert!(store
-        .redeem_plane_token("ask", &other, later + 900, later)
+        .redeem_plane_token(SWEEP_KIND_EVICT, &other, later + 900, later)
         .unwrap());
 
     let still_there = |nonce: &str| -> bool {
         store
             .lock()
             .query_one(
-                "SELECT COUNT(*) FROM plane_tokens WHERE kind='ask' AND token=$1",
+                "SELECT COUNT(*) FROM plane_tokens WHERE kind='ask_sweep_evict' AND token=$1",
                 &[&nonce],
             )
             .map(|r| r.get::<_, i64>(0) > 0)
@@ -1112,7 +1172,7 @@ fn redeeming_evicts_entries_whose_token_can_no_longer_be_presented() {
         still_there(&long),
         "a token still inside its window must NOT be swept — that is the double redemption"
     );
-    reset_tokens(&store, "ask", &[&short, &long, &other]);
+    reset_tokens(&store, SWEEP_KIND_EVICT, &[&short, &long, &other]);
 }
 
 /// THE SWEEP BOUNDARY IS STRICT: an entry whose `expires_at` EQUALS the sweeping redemption's `now`
@@ -1123,22 +1183,22 @@ fn a_ledger_entry_expiring_exactly_now_is_not_swept() {
     let url = require_live_url();
     let (edge, sweeper) = (trust_ns("nonce-edge"), trust_ns("nonce-edge-sweeper"));
     let store = connect_store_with_retry(&url).expect("connect");
-    reset_tokens(&store, "ask", &[&edge, &sweeper]);
+    reset_tokens(&store, SWEEP_KIND_EDGE, &[&edge, &sweeper]);
 
     let deadline = TRUST_NOW + 10;
     assert!(store
-        .redeem_plane_token("ask", &edge, deadline, TRUST_NOW)
+        .redeem_plane_token(SWEEP_KIND_EDGE, &edge, deadline, TRUST_NOW)
         .unwrap());
     assert!(store
-        .redeem_plane_token("ask", &sweeper, deadline + 900, deadline)
+        .redeem_plane_token(SWEEP_KIND_EDGE, &sweeper, deadline + 900, deadline)
         .unwrap());
     assert!(
         !store
-            .redeem_plane_token("ask", &edge, deadline, TRUST_NOW)
+            .redeem_plane_token(SWEEP_KIND_EDGE, &edge, deadline, TRUST_NOW)
             .unwrap(),
         "an entry expiring exactly at the sweep's `now` was evicted: the sweep must be `<`, not `<=`"
     );
-    reset_tokens(&store, "ask", &[&edge, &sweeper]);
+    reset_tokens(&store, SWEEP_KIND_EDGE, &[&edge, &sweeper]);
 }
 
 /// REFUSED RATHER THAN CLAMPED: a `now` clamped to `i64::MAX` would sweep the kind's entire ledger
@@ -1315,4 +1375,139 @@ fn the_plane_identity_columns_pin_a_byte_exact_collation() {
             "{table}.{column} must pin COLLATE \"C\""
         );
     }
+}
+
+fn bare(kind: &str, id: &str, parent: Option<&str>, seq: u64, label: &str) -> PlaneRecord {
+    PlaneRecord {
+        kind: kind.into(),
+        id: id.into(),
+        parent: parent.map(str::to_owned),
+        seq,
+        ts: LIVE_TS,
+        disposition: PlaneDisposition::Active,
+        body: label.as_bytes().to_vec(),
+    }
+}
+
+fn wipe_kind(store: &TestStore, kind: &str) {
+    let mut c = store.lock();
+    c.execute("DELETE FROM plane_records WHERE kind=$1", &[&kind])
+        .unwrap();
+    c.execute("DELETE FROM plane_chain WHERE kind=$1", &[&kind])
+        .unwrap();
+}
+
+/// R14: an appended record honours its actual parent. A parentless append is stored by its own
+/// id, reads back through `get_plane_record`, and is NOT listed as a parent (nor as a child of
+/// itself); a record that names itself as its parent is listed as one.
+#[test]
+fn an_appended_record_honours_its_actual_parent() {
+    let url = require_live_url();
+    let store = connect_store_with_retry(&url).expect("connect");
+    let kind = format!("r14_{}", unique_suffix());
+    wipe_kind(&store, &kind);
+
+    store
+        .append_plane_record(bare(&kind, "solo", None, 0, "solo-body").view())
+        .unwrap();
+    store
+        .append_plane_record(bare(&kind, "child", Some("boss"), 1, "child-body").view())
+        .unwrap();
+    store
+        .append_plane_record(bare(&kind, "selfie", Some("selfie"), 1, "selfie-body").view())
+        .unwrap();
+
+    assert_eq!(
+        store.get_plane_record(&kind, "solo").unwrap().as_deref(),
+        Some(&b"solo-body"[..]),
+        "a parentless append reads back by its own id"
+    );
+    assert_eq!(
+        store.list_plane_record_parents(&kind).unwrap(),
+        ["boss", "selfie"],
+        "a parentless append is not a parent"
+    );
+    let under = |p: &str| -> Vec<Vec<u8>> {
+        store
+            .list_plane_records(&kind, &PlaneSelector::Parent(p.to_owned().into()))
+            .unwrap()
+    };
+    assert!(
+        under("solo").is_empty(),
+        "a parentless append has no children"
+    );
+    assert_eq!(under("boss"), [b"child-body".to_vec()]);
+    assert_eq!(under("selfie"), [b"selfie-body".to_vec()]);
+    assert_eq!(
+        store
+            .list_plane_records(&kind, &PlaneSelector::All)
+            .unwrap()
+            .len(),
+        3
+    );
+    store.delete_plane_record(&kind, "solo").unwrap();
+    assert_eq!(store.get_plane_record(&kind, "solo").unwrap(), None);
+    wipe_kind(&store, &kind);
+}
+
+/// R15: `list_plane_records` returns ONE order, (seq, identity) ascending, across the upserted and
+/// the appended rows together.
+#[test]
+fn list_plane_records_is_one_order_across_upserts_and_appends() {
+    let url = require_live_url();
+    let store = connect_store_with_retry(&url).expect("connect");
+    let kind = format!("r15_{}", unique_suffix());
+    wipe_kind(&store, &kind);
+
+    for (id, seq, label) in [("u", 5, "u5"), ("a", 3, "a3"), ("b", 2, "b2")] {
+        store
+            .upsert_plane_record(bare(&kind, id, None, seq, label).view())
+            .unwrap();
+    }
+    for (parent, seq, label) in [("m", 1, "m1"), ("c", 3, "c3")] {
+        store
+            .append_plane_record(bare(&kind, parent, Some(parent), seq, label).view())
+            .unwrap();
+    }
+    let got: Vec<String> = store
+        .list_plane_records(&kind, &PlaneSelector::All)
+        .unwrap()
+        .iter()
+        .map(|b| String::from_utf8(b.clone()).unwrap())
+        .collect();
+    assert_eq!(got, ["m1", "b2", "a3", "c3", "u5"]);
+    wipe_kind(&store, &kind);
+}
+
+/// P19: a row re-written (upserted) between the purge's subquery and its delete is NOT deleted: the
+/// outer `DELETE` restates the retention predicate, so READ COMMITTED re-checks it on the new
+/// version of the row after the lock wait.
+#[test]
+fn a_purge_spares_a_row_rewritten_while_it_waited() {
+    let url = require_live_url();
+    let store = connect_store_with_retry(&url).expect("connect");
+    let kind = format!("p19_{}", unique_suffix());
+    wipe_kind(&store, &kind);
+    let mut old = bare(&kind, "x", None, 0, "old");
+    old.ts = 100;
+    store.upsert_plane_record(old.view()).unwrap();
+
+    let mut holder = connect_client_with_retry(&url);
+    holder
+        .batch_execute(&format!(
+            "BEGIN; UPDATE plane_records SET ts = 5000 WHERE kind = '{kind}' AND id = 'x'"
+        ))
+        .unwrap();
+    let purged = std::thread::scope(|s| {
+        let purge = s.spawn(|| store.purge_plane_records(&kind, 1000, Retention::Age));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        holder.batch_execute("COMMIT").unwrap();
+        purge.join().unwrap().expect("purge")
+    });
+    assert_eq!(purged, 0, "the rewritten row no longer matched the cutoff");
+    assert!(
+        store.get_plane_record(&kind, "x").unwrap().is_some(),
+        "the rewritten row survived"
+    );
+    wipe_kind(&store, &kind);
 }

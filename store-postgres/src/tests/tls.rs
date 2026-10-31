@@ -16,7 +16,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use busbar_contract::records::RecordStore;
@@ -29,9 +29,15 @@ use crate::pgwire::Config;
 /// The host's TLS for the test table ([`TcpConns::with_tls`]): rustls trusting `ca_der` alone,
 /// verifying the certificate and the name; the handshake runs to completion on the blocking socket
 /// the table hands it.
-struct Trusting(Arc<rustls::ClientConfig>);
+type TlsFailure = Arc<Mutex<Option<String>>>;
+
+struct Trusting(Arc<rustls::ClientConfig>, Option<TlsFailure>);
 
 fn trusting(ca_der: &[u8]) -> Arc<dyn SecureDial> {
+    trusting_report(ca_der, None)
+}
+
+fn trusting_report(ca_der: &[u8], failure: Option<TlsFailure>) -> Arc<dyn SecureDial> {
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(rustls_pki_types::CertificateDer::from(ca_der.to_vec()))
@@ -43,7 +49,7 @@ fn trusting(ca_der: &[u8]) -> Arc<dyn SecureDial> {
     .expect("the default protocol versions")
     .with_root_certificates(roots)
     .with_no_client_auth();
-    Arc::new(Trusting(Arc::new(config)))
+    Arc::new(Trusting(Arc::new(config), failure))
 }
 
 impl SecureDial for Trusting {
@@ -58,7 +64,11 @@ impl SecureDial for Trusting {
         let mut tls = rustls::ClientConnection::new(Arc::clone(&self.0), name)
             .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
         while tls.is_handshaking() {
-            tls.complete_io(&mut tcp)?;
+            tls.complete_io(&mut tcp).inspect_err(|e| {
+                if let Some(failure) = &self.1 {
+                    *failure.lock().unwrap() = Some(format!("{e:?}"));
+                }
+            })?;
         }
         Ok(Box::new(Secured(rustls::StreamOwned::new(tls, tcp))))
     }
@@ -95,16 +105,24 @@ impl SecuredSock for Secured {
 
 /// A CA and a `localhost` server config it signed: (ca_der, server config).
 fn minted() -> (Vec<u8>, Arc<rustls::ServerConfig>) {
+    minted_by("store-postgres test CA")
+}
+
+fn minted_by(ca_name: &str) -> (Vec<u8>, Arc<rustls::ServerConfig>) {
     let ca_key = rcgen::KeyPair::generate().expect("ca key");
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, ca_name);
     let ca = ca_params.self_signed(&ca_key).expect("ca");
     let issuer = rcgen::Issuer::from_params(&ca_params, ca_key);
     let key = rcgen::KeyPair::generate().expect("key");
-    let leaf = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-        .expect("params")
-        .signed_by(&key, &issuer)
-        .expect("leaf");
+    let leaf =
+        rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("params")
+            .signed_by(&key, &issuer)
+            .expect("leaf");
     let server = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -211,12 +229,12 @@ fn tls_proxy(upstream: String, server: Arc<rustls::ServerConfig>) -> u16 {
     port
 }
 
-/// The live server's settings with the proxy in front: `postgres://...@localhost:<port>/...?sslmode=verify-full`.
+/// The live server's settings with the proxy's one listening address in front.
 fn through_proxy(url: &str, port: u16) -> (String, String) {
     let c = Config::parse(url).expect("the live url parses");
     let upstream = c.targets()[0].1.clone();
     let tls = format!(
-        "postgres://{}:{}@localhost:{port}/{}?sslmode=verify-full",
+        "postgres://{}:{}@127.0.0.1:{port}/{}?sslmode=verify-full",
         c.user,
         c.password.clone().unwrap_or_default(),
         c.dbname.clone().unwrap_or_default()
@@ -253,21 +271,39 @@ fn verify_full_secures_the_connection_through_the_host() {
 #[test]
 fn an_untrusted_server_certificate_fails_the_load_in_the_drivers_words() {
     let Some(url) = live_url() else { return };
-    let (_, server) = minted();
+    let (_, server) = minted_by("store-postgres untrusted issuer");
+    // A TLS-capable table trusting a DIFFERENT CA than the one that signed the server's certificate.
+    let (other_ca, _) = minted_by("store-postgres trusted issuer");
     let (upstream, _) = through_proxy(&url, 0);
     let port = tls_proxy(upstream, server);
     let (_, tls_url) = through_proxy(&url, port);
     let settings = serde_json::json!({ "url": tls_url }).to_string();
-    // A table with no trust: every upgrade refused.
-    let e = open_loaded_over(&settings, |d| Arc::new(TcpConns::new(d.conn_waker())))
-        .expect_err("no TLS without trust");
+    let failure: TlsFailure = Arc::new(Mutex::new(None));
+    let e = open_loaded_over(&settings, |d| {
+        Arc::new(TcpConns::with_tls(
+            d.conn_waker(),
+            trusting_report(&other_ca, Some(Arc::clone(&failure))),
+        ))
+    })
+    .expect_err("a certificate from an unknown CA is refused");
     assert!(
-        e.contains("open failed: error performing TLS handshake"),
-        "the driver's words: {e}"
+        e.contains(
+            "open failed: postgres store: failed to connect: error performing TLS handshake"
+        ),
+        "the verification failure, in the driver's words: {e}"
+    );
+    // The host test table maps a SecureDial error to ConnError::Refused. Prove the underlying
+    // verification cause as well, so a generic dial failure cannot satisfy this test.
+    let failure = failure.lock().unwrap();
+    assert!(
+        failure
+            .as_deref()
+            .is_some_and(|text| text.to_lowercase().contains("unknownissuer")),
+        "the host's TLS verifier must have refused the issuing CA: {failure:?}"
     );
 }
 
-/// STORE-KEEP: every op of one store runs on the same server backend (one kept connection), and
+/// STORE-KEEP: sequential ops of one store run on the same server backend (a kept connection), and
 /// the store holds one connection while idle.
 #[test]
 fn the_store_keeps_one_connection_across_its_ops() {
@@ -557,6 +593,181 @@ fn a_server_that_declines_tls_fails_the_open() {
     assert!(e.contains("server does not support TLS"), "{e}");
 }
 
+/// `sslmode=prefer` asks with an SSLRequest and, on the server's `N`, goes on to the startup in
+/// plaintext (libpq); the open then fails only on the server's own refusal.
+#[test]
+fn prefer_continues_in_plaintext_when_the_server_answers_n() {
+    let port = fake_server(|mut s| {
+        let mut req = [0_u8; 8];
+        if s.read_exact(&mut req).is_ok() && req == [0, 0, 0, 8, 4, 210, 22, 47] {
+            let _ = s.write_all(b"N");
+            if read_startup(&mut s).is_ok() {
+                let _ = s.write_all(&fatal("3D000", "no such database"));
+            }
+        }
+    });
+    let e = open_loaded(&settings_of(&format!(
+        "postgres://u:zq9pw@127.0.0.1:{port}/d?sslmode=prefer"
+    )))
+    .expect_err("the fake server refuses the startup");
+    assert!(e.contains("3D000"), "plaintext startup followed the N: {e}");
+}
+
+/// `sslmode=allow` is plaintext: no SSLRequest is sent, the first message is the startup.
+#[test]
+fn allow_sends_no_sslrequest() {
+    let first = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let seen = first.clone();
+    let port = fake_server(move |mut s| {
+        let mut head = [0_u8; 8];
+        if s.read_exact(&mut head).is_ok() {
+            seen.store(
+                u32::from_be_bytes([head[4], head[5], head[6], head[7]]),
+                Ordering::SeqCst,
+            );
+            let _ = s.write_all(&fatal("3D000", "no such database"));
+        }
+    });
+    let e = open_loaded(&settings_of(&format!(
+        "postgres://u:zq9pw@127.0.0.1:{port}/d?sslmode=allow"
+    )))
+    .expect_err("the fake server refuses the startup");
+    assert!(e.contains("3D000"), "{e}");
+    assert_eq!(
+        first.load(Ordering::SeqCst),
+        196_608,
+        "a v3.0 startup, not an SSLRequest"
+    );
+}
+
+/// `sslmode=prefer` against a server that answers `S` secures the connection.
+#[test]
+fn prefer_secures_the_connection_when_the_server_answers_s() {
+    let Some(url) = live_url() else { return };
+    let (ca_der, server) = minted();
+    let (upstream, _) = through_proxy(&url, 0);
+    let port = tls_proxy(upstream, server);
+    let (_, tls_url) = through_proxy(&url, port);
+    let tls_url = tls_url.replace("sslmode=verify-full", "sslmode=prefer");
+    let settings = serde_json::json!({ "url": tls_url }).to_string();
+    let store = open_loaded_over(&settings, |d| {
+        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&ca_der)))
+    })
+    .expect("prefer upgrades over the proxy's S");
+    RecordStore::list_denylist(&store).expect("a read over TLS");
+}
+
+/// The startup options a plaintext client sends a server that refuses it.
+fn startup_options(dsn_query: &str) -> String {
+    let seen = Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = seen.clone();
+    let port = fake_server(move |mut s| {
+        let mut len = [0_u8; 4];
+        if s.read_exact(&mut len).is_err() {
+            return;
+        }
+        let mut rest = vec![0_u8; (u32::from_be_bytes(len) as usize).saturating_sub(4)];
+        if s.read_exact(&mut rest).is_err() {
+            return;
+        }
+        let parts: Vec<&[u8]> = rest[4..].split(|b| *b == 0).collect();
+        for kv in parts.chunks(2) {
+            if kv[0] == b"options" {
+                *sink.lock().unwrap() = String::from_utf8_lossy(kv[1]).into_owned();
+            }
+        }
+        let _ = s.write_all(&fatal("3D000", "no such database"));
+    });
+    let e = open_loaded(&settings_of(&format!(
+        "postgres://u:zq9pw@127.0.0.1:{port}/d{dsn_query}"
+    )))
+    .expect_err("the fake server refuses the startup");
+    assert!(e.contains("3D000"), "{e}");
+    let got = seen.lock().unwrap().clone();
+    got
+}
+
+/// A pooler-fronted server (pgbouncer and kin) refuses the startup `options` parameter, so the
+/// store sends none of its own; a DSN's own `options` still goes through untouched.
+#[test]
+fn startup_carries_no_options_of_the_stores_own() {
+    assert_eq!(
+        startup_options(""),
+        "",
+        "no `options` in the startup message"
+    );
+    assert_eq!(
+        startup_options("?options=-c%20statement_timeout%3D5000"),
+        "-c statement_timeout=5000"
+    );
+}
+
+/// A peer that is not Postgres (an HTTP error page) declares a message length of ~1.3 GiB; the
+/// client refuses it by its header, naming the length, rather than waiting to buffer it.
+#[test]
+fn an_oversized_declared_message_length_is_refused() {
+    let port = fake_server(|mut s| {
+        let mut b = [0_u8; 1024];
+        if s.read(&mut b).is_ok() {
+            let _ = s.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    });
+    let started = Instant::now();
+    let e = open_within(
+        settings_of(&format!("postgres://u:zq9pw@127.0.0.1:{port}/d")),
+        Duration::from_secs(4),
+    )
+    .expect("the open returned promptly")
+    .expect_err("not a Postgres server");
+    assert!(
+        e.contains("protocol error") && e.contains("1414811695"),
+        "{e}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+/// P10: the declared length counts its own four bytes, so a message that carries Postgres' largest
+/// value (1 GiB) declares 1 GiB plus its framing: that is a legitimate peer, waited on, not refused.
+#[test]
+fn a_message_declaring_a_maximal_value_plus_framing_is_not_refused() {
+    let port = fake_server(|mut s| {
+        if read_startup(&mut s).is_ok() {
+            let mut m = vec![b'D'];
+            m.extend_from_slice(&((1_u32 << 30) + 4).to_be_bytes());
+            let _ = s.write_all(&m);
+            std::thread::sleep(Duration::from_secs(3));
+        }
+    });
+    let r = open_within(
+        settings_of(&format!("postgres://u:zq9pw@127.0.0.1:{port}/d")),
+        Duration::from_secs(1),
+    );
+    assert!(
+        r.is_none(),
+        "refused at its header instead of awaited: {r:?}"
+    );
+}
+
+/// The scrub uses the password the connection parser read, not a second parser's guess: a quoted
+/// keyword password holding an escaped quote and a space is scrubbed whole from a server's refusal.
+#[test]
+fn a_quoted_password_with_an_escaped_quote_is_scrubbed_whole() {
+    let port = fake_server(|mut s| {
+        if read_startup(&mut s).is_ok() {
+            let _ = s.write_all(&fatal("28P01", "bad password it's tail-of-secret for u"));
+        }
+    });
+    let dsn =
+        format!("host=127.0.0.1 port={port} user=u dbname=d password='it\\'s tail-of-secret'");
+    let e = open_loaded(&settings_of(&dsn)).expect_err("the server refuses");
+    assert!(e.contains("28P01"), "{e}");
+    assert!(
+        !e.contains("tail-of-secret") && !e.contains("it's"),
+        "no part of the password survives: {e}"
+    );
+}
+
 /// D37 (RED before: `connect_timeout` was ignored, `Wire::bound` never called, and a server that
 /// accepts TCP and never answers held the instance's one connection forever): the dial AND the
 /// handshake are bounded, and the failure is the connection's timeout.
@@ -604,11 +815,11 @@ fn an_endpoint_that_times_out_hands_over_to_the_next() {
     );
 }
 
-/// D37: `connect_timeout` bounds a NEW connection's dial and handshake, never the wait for the
-/// instance's one kept connection. Op A holds it longer than the timeout (blocked on a row lock);
-/// op B queued behind it still succeeds.
+/// D37: `connect_timeout` bounds a NEW connection's dial and handshake, never the wait for a
+/// kept connection. Op A holds one longer than the timeout (blocked on a row lock); op B waiting
+/// behind it still succeeds.
 #[test]
-fn an_op_queued_behind_a_long_one_is_not_cut_by_connect_timeout() {
+fn an_op_held_on_a_lock_past_connect_timeout_is_not_cut() {
     let Some(url) = live_url() else { return };
     let sep = if url.contains('?') { '&' } else { '?' };
     let store = TestStore::open(&format!("{url}{sep}connect_timeout=1")).expect("the store opens");
@@ -622,15 +833,22 @@ fn an_op_queued_behind_a_long_one_is_not_cut_by_connect_timeout() {
     )
     .expect("hold the row");
     std::thread::scope(|scope| {
-        let a = scope.spawn(|| RecordStore::add_denylist(&*store, &sub, "blocked behind the lock"));
+        let a = scope.spawn(|| {
+            let started = Instant::now();
+            let r = RecordStore::add_denylist(&*store, &sub, "blocked behind the lock");
+            (r, started.elapsed())
+        });
         std::thread::sleep(Duration::from_millis(300));
         let b = scope.spawn(|| RecordStore::list_denylist(&*store));
         std::thread::sleep(Duration::from_millis(2500));
         raw.batch_execute("COMMIT").expect("release the row");
-        a.join().unwrap().expect("op A finished");
-        b.join()
-            .unwrap()
-            .expect("op B, queued longer than connect_timeout, still ran");
+        let (a, took) = a.join().unwrap();
+        a.expect("op A finished");
+        assert!(
+            took > Duration::from_secs(2),
+            "op A was held on a real row lock for longer than connect_timeout=1: {took:?}"
+        );
+        b.join().unwrap().expect("op B ran");
     });
     raw.batch_execute(&format!("DELETE FROM denylist WHERE sub = '{sub}'"))
         .expect("cleanup");
@@ -649,7 +867,7 @@ fn a_startup_refusal_moves_on_to_the_next_endpoint() {
     let (host, port) = live_endpoint(&url);
     let dsn = dsn_at(&url, &[("127.0.0.1", starting), (&host, port)], "");
     open_loaded(&settings_of(&dsn)).expect("the second endpoint accepted the connection");
-    // All endpoints refusing: the LAST refusal is the error (the driver's).
+    // All endpoints refusing: every endpoint's failure is in the error, host and port named.
     let a = fake_server(|mut s| {
         if read_startup(&mut s).is_ok() {
             let _ = s.write_all(&fatal("57P03", "first starting up"));
@@ -665,9 +883,11 @@ fn a_startup_refusal_moves_on_to_the_next_endpoint() {
     )))
     .expect_err("every endpoint refused");
     assert!(
-        e.contains("53300") && !e.contains("57P03"),
-        "the last error: {e}"
+        e.contains(&format!("127.0.0.1:{a}: 57P03"))
+            && e.contains(&format!("127.0.0.1:{b}: 53300")),
+        "every endpoint's error: {e}"
     );
+    assert!(!e.contains("zq9pw"), "{e}");
 }
 
 /// D10 (RED before: `target_session_attrs` was ignored): `read-write` refuses a server that is

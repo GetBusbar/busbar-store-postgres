@@ -190,6 +190,11 @@ fn scenario(store: &dyn RecordStore, ns: &str) -> serde_json::Value {
         .redeem_plane_token("conformance_token", &token, 2_000_000_000, 1_900_000_000)
         .expect("redeem again");
     store.delete_plane_record(kind, &id).expect("delete");
+    // The events hang off the task by parent, in their own kind: delete_plane_record of that kind
+    // takes the chain, so the run leaves no rows behind.
+    store
+        .delete_plane_record(child, &id)
+        .expect("delete the event chain");
     let gone = text(store.get_plane_record(kind, &id).expect("get after delete"));
     serde_json::json!({
         "after_upsert": got,
@@ -244,8 +249,8 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
     let refusals = linked["refusals"].as_array().unwrap();
     assert_eq!(
         refusals[0],
-        "plugin 'busbar-store-postgres' open failed: postgres plugin config requires a \"url\" \
-         (a libpq connection string)"
+        "plugin 'busbar-store-postgres' open failed: invalid postgres plugin config: `url` is \
+         required (a libpq connection string)"
     );
     assert_eq!(refusals[1], refusals[0]);
     assert!(
@@ -257,13 +262,18 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
     assert_eq!(
         refusals[3],
         "plugin 'busbar-store-postgres' open failed: invalid postgres plugin config: `url` must be \
-         a string",
+         a string, got a number",
         "a present non-string url says so"
     );
     let unreachable = refusals[4].as_str().unwrap();
     assert!(
-        !unreachable.contains("s3cret-conf") && !unreachable.starts_with("opened"),
-        "the unreachable server must refuse, and never echo the password: {unreachable}"
+        unreachable.contains("postgres store: failed to connect: ")
+            && unreachable.contains("error connecting to server"),
+        "the unreachable server is refused as a connect failure: {unreachable}"
+    );
+    assert!(
+        !unreachable.contains("s3cret-conf"),
+        "the refusal never echoes the DSN password: {unreachable}"
     );
     if live.is_some() {
         assert_eq!(
@@ -283,7 +293,7 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
 /// from, whatever order the tests in this target run in.
 #[test]
 fn foreign_bytes_dropped_in_are_not_the_postgres_store() {
-    let lib = common::cdylib();
+    let lib = common::plugin_path();
     let mut foreign = std::fs::read(&lib).expect("read the cdylib");
     foreign[..4].copy_from_slice(b"XXXX");
     let dir = std::env::temp_dir().join(format!("store-postgres-conf-red-{}", std::process::id()));
@@ -297,7 +307,7 @@ fn foreign_bytes_dropped_in_are_not_the_postgres_store() {
     };
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
-        !red.contains("requires a \"url\""),
+        !red.contains("`url` is required"),
         "foreign bytes cannot speak the store's own refusal: {red}"
     );
 }
@@ -305,7 +315,7 @@ fn foreign_bytes_dropped_in_are_not_the_postgres_store() {
 /// RED: the store's library asked for as another kind is refused before any slot runs.
 #[test]
 fn the_postgres_store_library_loaded_as_another_kind_is_refused() {
-    let lib = common::cdylib();
+    let lib = common::plugin_path();
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let bind = Bind {
         instance: Arc::from("store-postgres-as-secret"),

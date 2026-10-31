@@ -124,6 +124,22 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// Removes the work directory and the minted key on drop, including when an assertion panics.
+struct RunCleanup {
+    url: String,
+    work: std::path::PathBuf,
+    minted_id: Option<String>,
+}
+
+impl Drop for RunCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.work);
+        if let Some(id) = &self.minted_id {
+            cleanup(&self.url, id);
+        }
+    }
+}
+
 fn cleanup(url: &str, id: &str) {
     if let Ok(mut client) = postgres::Client::connect(url, postgres::NoTls) {
         let _ = client.execute("DELETE FROM credentials WHERE key_id=$1", &[&id]);
@@ -192,6 +208,11 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             .unwrap()
             .as_nanos()
     ));
+    let mut run_cleanup = RunCleanup {
+        url: url.clone(),
+        work: work.clone(),
+        minted_id: None,
+    };
     let plugins_dir = work.join("plugins");
     std::fs::create_dir_all(&plugins_dir).unwrap();
 
@@ -496,6 +517,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         .as_str()
         .expect("minted key response has an id")
         .to_string();
+    run_cleanup.minted_id = Some(minted_id.clone());
     let access_key_id = mint_json["aws_access_key_id"]
         .as_str()
         .expect("issue_aws_credential:true must return an aws_access_key_id")
@@ -536,6 +558,4 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
 
     drop(guard2);
     drop(raw);
-    let _ = std::fs::remove_dir_all(&work);
-    cleanup(&url, &minted_id);
 }

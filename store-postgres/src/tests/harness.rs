@@ -199,9 +199,8 @@ impl std::ops::Deref for TestStore {
 fn op_refused(f: StoreFailure) -> OpRefused {
     match f {
         StoreFailure::Conflict => OpRefused::Conflict,
-        StoreFailure::Failed(t) | StoreFailure::Refused(t) | StoreFailure::Fault(t) => {
-            OpRefused::Failed(t)
-        }
+        StoreFailure::Refused(t) => OpRefused::Refused(t),
+        StoreFailure::Failed(t) | StoreFailure::Fault(t) => OpRefused::Failed(t),
         other => OpRefused::Failed(other.to_string()),
     }
 }
@@ -247,6 +246,22 @@ impl TestStore {
     ) -> Result<(), OpRefused> {
         let cells = [(bucket, window_start, delta.clone())];
         block_on(StoreCalls::add_usage_batch(&self.store, op, &cells)).map_err(op_refused)
+    }
+
+    pub(crate) fn add_usage_batch_op(
+        &self,
+        op: OpId,
+        cells: &[(&str, u64, UsageDelta)],
+    ) -> Result<(), OpRefused> {
+        block_on(StoreCalls::add_usage_batch(&self.store, op, cells)).map_err(op_refused)
+    }
+
+    pub(crate) fn add_metering_batch_op(
+        &self,
+        op: OpId,
+        deltas: &[MeteringDelta],
+    ) -> Result<(), OpRefused> {
+        block_on(StoreCalls::add_metering_batch(&self.store, op, deltas)).map_err(op_refused)
     }
 
     pub(crate) fn add_metering_op(&self, op: OpId, delta: &MeteringDelta) -> Result<(), OpRefused> {

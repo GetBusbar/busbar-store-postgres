@@ -112,26 +112,28 @@ fn what_this_client_cannot_honour_is_refused_not_ignored() {
     assert!(e.to_string().contains("sslrootcert"), "{e}");
 }
 
-/// A downgrade nobody asked for is refused: `prefer` and `allow` would fall back to plaintext
-/// silently, so they are errors that say what to use; `disable` is plaintext on request, and
-/// an ABSENT `sslmode` is plaintext too (documented in the README), not a refused request.
-/// The message never echoes the password.
+/// libpq's `prefer` and `allow` parse (1.5.5 accepted them); the password is never echoed by a
+/// later refusal.
 #[test]
-fn sslmode_prefer_and_allow_are_refused_not_downgraded() {
+fn sslmode_prefer_and_allow_parse() {
     for mode in ["prefer", "allow"] {
         for dsn in [
             format!("host=db user=u password=zq9pw sslmode={mode}"),
             format!("postgres://u:zq9pw@db/d?sslmode={mode}"),
         ] {
-            let e = Config::parse(&dsn).unwrap_err().to_string();
-            assert!(
-                e.contains(&format!("sslmode={mode} is not supported"))
-                    && e.contains("never falls back silently")
-                    && e.contains("verify-full")
-                    && !e.contains("zq9pw"),
-                "{dsn}: {e}"
-            );
+            Config::parse(&dsn).unwrap_or_else(|e| panic!("{dsn}: {e}"));
         }
+    }
+}
+
+/// Each `sslmode` maps to its libpq behaviour: `disable` and `allow` are plaintext, `prefer` asks
+/// for TLS and takes plaintext on `N`, the `require` family insists. An ABSENT `sslmode` is
+/// plaintext too (documented in the README).
+#[test]
+fn sslmode_values_map_to_their_modes() {
+    for (mode, want) in [("allow", SslMode::Plain), ("prefer", SslMode::Prefer)] {
+        let c = Config::parse(&format!("host=db user=u sslmode={mode}")).unwrap();
+        assert_eq!(c.ssl, want, "{mode}");
     }
     assert_eq!(
         Config::parse("host=db user=u sslmode=disable").unwrap().ssl,
@@ -282,9 +284,20 @@ fn connect_timeout_is_whole_seconds() {
             .unwrap()
             .connect_timeout_ms
     };
-    assert_eq!((ms("5"), ms("0"), ms("-1")), (Some(5000), None, None));
+    assert_eq!((ms("5"), ms("0"), ms("-1")), (Some(5000), Some(0), Some(0)));
     let e = Config::parse("host=db user=u connect_timeout=soon").unwrap_err();
     assert!(e.to_string().contains("whole number of seconds"), "{e}");
+}
+
+/// A DSN without `connect_timeout` still bounds the handshake (30 s); the DSN's value wins, and 0
+/// is the explicit "no bound".
+#[test]
+fn an_unset_connect_timeout_defaults_to_thirty_seconds() {
+    let bound = |dsn: &str| Config::parse(dsn).unwrap().connect_bound_ms();
+    assert_eq!(bound("host=db user=u"), 30_000);
+    assert_eq!(bound("host=db user=u connect_timeout=5"), 5_000);
+    assert_eq!(bound("host=db user=u connect_timeout=0"), 0);
+    assert_eq!(bound("host=db user=u connect_timeout=-1"), 0);
 }
 
 /// D26 (RED before: the unparsed fragment was echoed): a configuration error never repeats a
@@ -375,16 +388,22 @@ fn a_data_row_short_of_its_columns_is_an_error_not_a_panic() {
     };
     assert_eq!(row.try_get::<_, &str>(0).unwrap(), "ab");
     let e = row.try_get::<_, &str>(1).unwrap_err();
-    assert!(e.to_string().contains("column 1"), "{e}");
+    assert!(e.to_string().contains("column `b`"), "{e}");
 }
 
 #[test]
 fn a_snapshot_transaction_begins_repeatable_read() {
     assert_eq!(
         begin_sql(Some(IsolationLevel::RepeatableRead)),
-        "BEGIN ISOLATION LEVEL REPEATABLE READ"
+        "BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL lock_timeout = '30s'; \
+         SET LOCAL idle_in_transaction_session_timeout = '60s'"
     );
-    assert_eq!(begin_sql(None), "BEGIN");
+    assert_eq!(
+        begin_sql(None),
+        "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = '30s'; \
+         SET LOCAL idle_in_transaction_session_timeout = '60s'",
+        "a DSN's default_transaction_isolation must not change the store's reasoning"
+    );
 }
 
 /// The connection's prepared statements stay bounded: past `STATEMENTS_KEPT` the least recently

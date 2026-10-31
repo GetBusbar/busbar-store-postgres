@@ -366,9 +366,10 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
         .query_one("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[])
         .expect("the boot must have created busbar_schema")
         .get(0);
-    assert!(
-        version > 0,
-        "the plugin-loaded boot must have written a schema version, got {version}"
+    assert_eq!(
+        version,
+        busbar_store_postgres::SCHEMA_VERSION,
+        "the plugin-loaded boot must have landed the current schema version"
     );
     // And the process is still alive, serving on that store, rather than having created the schema
     // and died: a crashed child is exactly what the poll above cannot distinguish on its own.
@@ -409,7 +410,7 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
 
     let err = common::dropped_at(&path, "{}").expect_err("a config missing url must fail to load");
     assert!(
-        err.contains("requires a \"url\""),
+        err.contains("`url` is required"),
         "expected the plugin's own missing-url message, got: {err}"
     );
 
@@ -419,7 +420,8 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
     )
     .expect_err("an unreachable postgres target must fail to load");
     assert!(
-        err.contains("error connecting to server"),
+        err.contains("postgres store: failed to connect: ")
+            && err.contains("error connecting to server"),
         "expected tokio-postgres's own connect-failure message to survive the ABI crossing, got: {err}"
     );
 }
@@ -472,14 +474,9 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
     let cfg = cfg(&url);
 
-    // Start from an EMPTY call log. The parent enumeration and the purge are GLOBAL per kind, so
-    // against a re-used database a leftover chain from an earlier run would make their exact
-    // assertions below meaningless. A purge at the top of the range is the store's own
-    // contract-level wipe, so this needs no raw-SQL knowledge of the schema. No other test in this
-    // binary touches the `call` kind.
-    let direct = common::linked(&cfg).expect("connect directly to clean up and verify");
-    RecordStore::purge_plane_records_before(&direct, "call", i64::MAX as u64)
-        .expect("wipe the call log before this run");
+    // A kind of this run's own: the parent enumeration and the purge are GLOBAL per kind, so
+    // exact assertions on them need a kind no other test or run writes.
+    let direct = common::linked(&cfg).expect("connect directly to verify");
 
     // Per-run principal ids: a read that only THIS run's writes can answer. Two of them, because one
     // principal's chain leaking into another's is a real defect class.
@@ -491,11 +488,12 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
             .unwrap()
             .as_nanos()
     );
+    let kind = format!("call_abi_{stamp}");
     let p_main = format!("vk_abi_main_{stamp}");
     let p_other = format!("vk_abi_other_{stamp}");
 
     let call = |principal: &str, seq: u64, prev: &str, hash: &str| PlaneRecord {
-        kind: "call".into(),
+        kind: kind.clone(),
         id: principal.into(),
         parent: Some(principal.into()),
         seq,
@@ -517,7 +515,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
     let chain = |store: &dyn RecordStore, principal: &str| -> Vec<serde_json::Value> {
         store
-            .list_plane_records("call", &PlaneSelector::Parent(principal.to_string().into()))
+            .list_plane_records(&kind, &PlaneSelector::Parent(principal.to_string().into()))
             .expect("list_plane_records over the ABI")
             .iter()
             .map(|b| plane_decode(b))
@@ -588,7 +586,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     );
 
     let principals = store
-        .list_plane_record_parents("call")
+        .list_plane_record_parents(&kind)
         .expect("list_plane_record_parents");
     assert_eq!(
         principals,
@@ -600,7 +598,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     // because a relay that dropped the return value would read as 0 and look like a no-op sweep.
     assert_eq!(
         store
-            .purge_plane_records_before("call", 2_002)
+            .purge_plane_records_before(&kind, 2_002)
             .expect("purge"),
         2,
         "both records at ts 2001 go (one per principal); the one sitting exactly at the cutoff stays"
@@ -609,7 +607,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     assert!(chain(&store, &p_other).is_empty());
     assert_eq!(
         store
-            .list_plane_record_parents("call")
+            .list_plane_record_parents(&kind)
             .expect("list_plane_record_parents"),
         vec![p_main.clone()],
         "a principal whose chain the sweep emptied must leave the enumeration, or a boot keeps \
@@ -630,7 +628,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     );
     assert_eq!(direct_calls[1]["hash"], "h3");
 
-    RecordStore::purge_plane_records_before(&direct, "call", i64::MAX as u64)
+    RecordStore::purge_plane_records_before(&direct, &kind, i64::MAX as u64)
         .expect("clean up this run's records");
 }
 
@@ -924,6 +922,8 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let nonce_fleet = format!("nonce_abi_fleet_{stamp}");
     let nonce_fresh = format!("nonce_abi_fresh_{stamp}");
     const NOW: u64 = 4_000_000_000;
+    // A redemption sweeps every entry of its kind below its `now`: a kind of this run's own.
+    let ask_kind = format!("ask_abi_{stamp}");
 
     let demotion = |server: &str, reason: &str, at: u64| PlaneRecord {
         kind: "demotion".into(),
@@ -969,7 +969,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
             .expect("a later agreeing observation clears the quarantine");
         assert!(
             store
-                .redeem_plane_token("ask", &nonce_restart, NOW + 900, NOW)
+                .redeem_plane_token(&ask_kind, &nonce_restart, NOW + 900, NOW)
                 .expect("redeem_plane_token"),
             "the FIRST redemption must be answered `true`, or nothing below is about single use"
         );
@@ -993,7 +993,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 
     assert!(
         !store
-            .redeem_plane_token("ask", &nonce_restart, NOW + 900, NOW + 1)
+            .redeem_plane_token(&ask_kind, &nonce_restart, NOW + 900, NOW + 1)
             .expect("redeem_plane_token"),
         "a restart handed a spent approval back over the plugin ABI"
     );
@@ -1002,18 +1002,18 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let node_b = common::dropped_at(&path, &cfg)
         .expect("a second node loads the same plugin against the same database");
     assert!(store
-        .redeem_plane_token("ask", &nonce_fleet, NOW + 900, NOW + 2)
+        .redeem_plane_token(&ask_kind, &nonce_fleet, NOW + 900, NOW + 2)
         .expect("redeem_plane_token"));
     assert!(
         !node_b
-            .redeem_plane_token("ask", &nonce_fleet, NOW + 900, NOW + 3)
+            .redeem_plane_token(&ask_kind, &nonce_fleet, NOW + 900, NOW + 3)
             .expect("redeem_plane_token"),
         "a second node redeemed an approval the first already spent"
     );
     // THE CONTROL: a ledger that refused everything would satisfy both cases above.
     assert!(
         node_b
-            .redeem_plane_token("ask", &nonce_fresh, NOW + 900, NOW + 4)
+            .redeem_plane_token(&ask_kind, &nonce_fresh, NOW + 900, NOW + 4)
             .expect("redeem_plane_token"),
         "a freshly minted approval is not the one that was spent"
     );
@@ -1027,7 +1027,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "the demotion must be physically present in Postgres, not merely cached in the plugin"
     );
     assert!(
-        !RecordStore::redeem_plane_token(&direct, "ask", &nonce_restart, NOW + 900, NOW + 5)
+        !RecordStore::redeem_plane_token(&direct, &ask_kind, &nonce_restart, NOW + 900, NOW + 5)
             .expect("redeem_plane_token via the direct connection"),
         "the spent-token row must be physically present in Postgres"
     );
