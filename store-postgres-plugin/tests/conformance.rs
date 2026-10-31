@@ -47,6 +47,7 @@ busbar_test_kit::conformance_suite! {
     host: host,
     tls: conformance_host::anchors(),
     namespace: (create_fold_schema, drop_fold_schema),
+    newer_schema: stamp_newer_schema,
 }
 
 /// The live Postgres's address (`BUSBAR_TEST_POSTGRES_URL`'s authority; the service container's
@@ -97,6 +98,15 @@ fn fold_client(settings: &[u8]) -> postgres::Client {
         .replace("sslmode=require", "sslmode=disable");
     postgres::Client::connect(&url, postgres::NoTls)
         .expect("the live Postgres accepts the test client")
+}
+
+fn stamp_newer_schema(_: &str, settings: &[u8]) {
+    fold_client(settings)
+        .execute(
+            "INSERT INTO busbar_schema (version) VALUES ($1)",
+            &[&i64::MAX],
+        )
+        .expect("stamp a newer schema in the fold's private schema");
 }
 
 /// The suite's namespace hook: the fold's schema, made before its open.
