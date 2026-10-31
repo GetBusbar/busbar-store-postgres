@@ -641,7 +641,7 @@ fn record_keys_are_raw_bytes_scanned_in_byte_order() {
     assert!(scan(&[0xC3, 0x29]).is_empty());
 }
 
-/// AN EMPTY PUT REMOVES THE ROW (slot 40's rule, ARCHITECT 2026-10-21): the host writes every
+/// AN EMPTY PUT REMOVES THE ROW (slot 26's rule, ARCHITECT 2026-10-21): the host writes every
 /// strike as an empty `record_put` and reads empty as absent, so the row LEAVES the table:
 /// `record_get` answers `None`, `record_scan` never returns it, and the table shrinks. Removing a
 /// row that is not there is `Ok`.
