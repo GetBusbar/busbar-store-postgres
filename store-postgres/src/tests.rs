@@ -1558,6 +1558,43 @@ fn migrate_bootstraps_fresh_database() {
     drop(check);
 }
 
+/// The v13 drops belong to a pre-release v11/v12 database only: on a fresh database or a released
+/// v6-v10 upgrade, a table of that name on a shared database is some other application's.
+#[test]
+fn the_v13_drops_never_touch_a_fresh_or_a_released_database() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_v13keep");
+    let iso_url = tmp.url();
+    let other_apps =
+        "CREATE TABLE store_sessions (session TEXT); CREATE TABLE money_slots (slot TEXT);";
+    postgres::Client::connect(&iso_url, postgres::NoTls)
+        .unwrap()
+        .batch_execute(other_apps)
+        .unwrap();
+    drop(connect_store_with_retry(&iso_url).expect("fresh open"));
+    let kept = |c: &mut postgres::Client| -> bool {
+        c.query_one(
+            "SELECT to_regclass('store_sessions') IS NOT NULL AND to_regclass('money_slots') IS NOT NULL",
+            &[],
+        )
+        .unwrap()
+        .get(0)
+    };
+    let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+    assert!(
+        kept(&mut c),
+        "a fresh open dropped another application's table"
+    );
+
+    c.batch_execute("DELETE FROM busbar_schema; INSERT INTO busbar_schema (version) VALUES (10);")
+        .unwrap();
+    drop(connect_store_with_retry(&iso_url).expect("v10 upgrade"));
+    assert!(
+        kept(&mut c),
+        "a v10 upgrade dropped another application's table"
+    );
+}
+
 /// Schema v13 drops the pre-release money/journal tables and their `op_id` rows (README); the kept
 /// slots' rows and every other table survive.
 #[test]
