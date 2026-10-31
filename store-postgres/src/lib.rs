@@ -485,9 +485,12 @@ impl PostgresStore {
     /// The store on the connection string `conn_str`: parsed here, connected by the connect step. A
     /// string the driver refuses is refused in its words, scrubbed of the DSN password.
     pub fn new(conn_str: &str) -> RecordStoreResult<Self> {
-        let secret = dsn_password(conn_str);
-        let config = pgwire::Config::parse(conn_str)
-            .map_err(|e| RecordStoreError(scrub(e.to_string(), secret.as_deref())))?;
+        // The password is the one the connection parser read; the independent scan below is only
+        // the guess for a string the parser refuses.
+        let config = pgwire::Config::parse(conn_str).map_err(|e| {
+            RecordStoreError(scrub(e.to_string(), dsn_password(conn_str).as_deref()))
+        })?;
+        let secret = config.password.clone();
         Ok(Self {
             shared: std::sync::Arc::new(Shared {
                 config,
