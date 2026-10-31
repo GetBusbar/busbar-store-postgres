@@ -936,6 +936,11 @@ fn trust_ns(tag: &str) -> String {
 /// every token here expires ABOVE 1.7e9 (the conformance sweep reaches none of them).
 const TRUST_NOW: u64 = 1_900_000_000;
 
+/// A sweeping redemption reaches every entry of its kind below its `now`, so each sweeping test has
+/// a kind of its own.
+const SWEEP_KIND_EVICT: &str = "ask_sweep_evict";
+const SWEEP_KIND_EDGE: &str = "ask_sweep_edge";
+
 fn demotions(store: &TestStore) -> Vec<serde_json::Value> {
     store
         .list_plane_records("demotion", &PlaneSelector::All)
@@ -1136,24 +1141,24 @@ fn redeeming_evicts_entries_whose_token_can_no_longer_be_presented() {
         trust_ns("nonce-sweeper"),
     );
     let store = connect_store_with_retry(&url).expect("connect");
-    reset_tokens(&store, "ask", &[&short, &long, &other]);
+    reset_tokens(&store, SWEEP_KIND_EVICT, &[&short, &long, &other]);
 
     assert!(store
-        .redeem_plane_token("ask", &short, TRUST_NOW + 10, TRUST_NOW)
+        .redeem_plane_token(SWEEP_KIND_EVICT, &short, TRUST_NOW + 10, TRUST_NOW)
         .unwrap());
     assert!(store
-        .redeem_plane_token("ask", &long, TRUST_NOW + 10_000, TRUST_NOW)
+        .redeem_plane_token(SWEEP_KIND_EVICT, &long, TRUST_NOW + 10_000, TRUST_NOW)
         .unwrap());
     let later = TRUST_NOW + 11;
     assert!(store
-        .redeem_plane_token("ask", &other, later + 900, later)
+        .redeem_plane_token(SWEEP_KIND_EVICT, &other, later + 900, later)
         .unwrap());
 
     let still_there = |nonce: &str| -> bool {
         store
             .lock()
             .query_one(
-                "SELECT COUNT(*) FROM plane_tokens WHERE kind='ask' AND token=$1",
+                "SELECT COUNT(*) FROM plane_tokens WHERE kind='ask_sweep_evict' AND token=$1",
                 &[&nonce],
             )
             .map(|r| r.get::<_, i64>(0) > 0)
@@ -1167,7 +1172,7 @@ fn redeeming_evicts_entries_whose_token_can_no_longer_be_presented() {
         still_there(&long),
         "a token still inside its window must NOT be swept — that is the double redemption"
     );
-    reset_tokens(&store, "ask", &[&short, &long, &other]);
+    reset_tokens(&store, SWEEP_KIND_EVICT, &[&short, &long, &other]);
 }
 
 /// THE SWEEP BOUNDARY IS STRICT: an entry whose `expires_at` EQUALS the sweeping redemption's `now`
@@ -1178,22 +1183,22 @@ fn a_ledger_entry_expiring_exactly_now_is_not_swept() {
     let url = require_live_url();
     let (edge, sweeper) = (trust_ns("nonce-edge"), trust_ns("nonce-edge-sweeper"));
     let store = connect_store_with_retry(&url).expect("connect");
-    reset_tokens(&store, "ask", &[&edge, &sweeper]);
+    reset_tokens(&store, SWEEP_KIND_EDGE, &[&edge, &sweeper]);
 
     let deadline = TRUST_NOW + 10;
     assert!(store
-        .redeem_plane_token("ask", &edge, deadline, TRUST_NOW)
+        .redeem_plane_token(SWEEP_KIND_EDGE, &edge, deadline, TRUST_NOW)
         .unwrap());
     assert!(store
-        .redeem_plane_token("ask", &sweeper, deadline + 900, deadline)
+        .redeem_plane_token(SWEEP_KIND_EDGE, &sweeper, deadline + 900, deadline)
         .unwrap());
     assert!(
         !store
-            .redeem_plane_token("ask", &edge, deadline, TRUST_NOW)
+            .redeem_plane_token(SWEEP_KIND_EDGE, &edge, deadline, TRUST_NOW)
             .unwrap(),
         "an entry expiring exactly at the sweep's `now` was evicted: the sweep must be `<`, not `<=`"
     );
-    reset_tokens(&store, "ask", &[&edge, &sweeper]);
+    reset_tokens(&store, SWEEP_KIND_EDGE, &[&edge, &sweeper]);
 }
 
 /// REFUSED RATHER THAN CLAMPED: a `now` clamped to `i64::MAX` would sweep the kind's entire ledger
