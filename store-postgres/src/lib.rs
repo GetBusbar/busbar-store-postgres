@@ -389,6 +389,7 @@ CREATE TABLE IF NOT EXISTS plane_tokens (
     expires_at BIGINT NOT NULL,
     PRIMARY KEY (kind, token)
 );
+CREATE INDEX IF NOT EXISTS plane_tokens_kind_expires ON plane_tokens (kind, expires_at);
 
 -- The durable op_id dedupe log (abi::store S1-S4). Every u64 is kept bit-for-bit in a BIGINT.
 CREATE TABLE IF NOT EXISTS store_ops (
