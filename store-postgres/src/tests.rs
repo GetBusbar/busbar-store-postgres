@@ -223,13 +223,19 @@ fn connect_store_with_retry(url: &str) -> Result<TestStore, String> {
 /// `deleted_at` from a previous run's tombstone would violate `keys_tombstone_disabled`).
 fn hard_reset(store: &TestStore, id: &str) {
     let mut client = store.lock();
-    let _ = client.execute("DELETE FROM credentials WHERE key_id=$1", &[&id]);
-    let _ = client.execute("DELETE FROM keys WHERE id=$1", &[&id]);
-    let _ = client.execute("DELETE FROM usage_metering WHERE key_id=$1", &[&id]);
-    let _ = client.execute("DELETE FROM usage_windows WHERE bucket_id=$1", &[&id]);
-    let _ = client.execute("DELETE FROM usage_ledger WHERE bucket_id=$1", &[&id]);
-    let _ = client.execute("DELETE FROM usage_ledger_units WHERE bucket_id=$1", &[&id]);
-    let _ = client.execute("DELETE FROM usage_metering_units WHERE key_id=$1", &[&id]);
+    for sql in [
+        "DELETE FROM credentials WHERE key_id=$1",
+        "DELETE FROM keys WHERE id=$1",
+        "DELETE FROM usage_metering WHERE key_id=$1",
+        "DELETE FROM usage_windows WHERE bucket_id=$1",
+        "DELETE FROM usage_ledger WHERE bucket_id=$1",
+        "DELETE FROM usage_ledger_units WHERE bucket_id=$1",
+        "DELETE FROM usage_metering_units WHERE key_id=$1",
+    ] {
+        client
+            .execute(sql, &[&id])
+            .unwrap_or_else(|e| panic!("hard_reset `{sql}`: {e}"));
+    }
 }
 
 fn sample_key(id: &str) -> VirtualKey {
@@ -275,14 +281,18 @@ fn sample_cred(key_id: &str, slot: u8, public_id: &str) -> CredentialSecret {
 fn key_roundtrip_new_fields() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    hard_reset(&store, "vk_rt1");
-    hard_reset(&store, "vk_rt2");
+    let (rt1, rt2) = (
+        format!("vk_rt1_{}", unique_suffix()),
+        format!("vk_rt2_{}", unique_suffix()),
+    );
+    hard_reset(&store, &rt1);
+    hard_reset(&store, &rt2);
 
-    let mut k = sample_key("vk_rt1");
+    let mut k = sample_key(&rt1);
     k.expires_at = Some(999);
     k.allowed_scopes = Some(vec![]); // explicit empty grant, must NOT read back as None
     store.put_key(&k).unwrap();
-    let back = store.get_key("vk_rt1").unwrap().unwrap();
+    let back = store.get_key(&rt1).unwrap().unwrap();
     assert_eq!(back.generation_hash, "binding:x:g1");
     assert_eq!(back.expires_at, Some(999));
     assert_eq!(back.deleted_at, None);
@@ -293,10 +303,10 @@ fn key_roundtrip_new_fields() {
     );
     assert!(back.revision > 0, "put_key must stamp a nonzero revision");
 
-    let mut k2 = sample_key("vk_rt2");
+    let mut k2 = sample_key(&rt2);
     k2.allowed_scopes = None; // omitted grant = all pools
     store.put_key(&k2).unwrap();
-    let back2 = store.get_key("vk_rt2").unwrap().unwrap();
+    let back2 = store.get_key(&rt2).unwrap().unwrap();
     assert_eq!(
         back2.allowed_scopes, None,
         "omitted grant must round-trip as None, not Some([])"
@@ -310,11 +320,12 @@ fn key_roundtrip_new_fields() {
 fn delete_key_is_a_tombstone_not_a_hard_delete() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_tombstone1";
+    let id_owned = format!("vk_tombstone1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
 
     let key = sample_key(id);
-    let cred = sample_cred(id, 0, "AKIA_TOMBSTONE1");
+    let cred = sample_cred(id, 0, &format!("AKIA_TOMBSTONE1_{id}"));
     store.put_key_with_credential(&key, &cred).unwrap();
     assert_eq!(store.list_credentials(id).unwrap().len(), 1);
 
@@ -360,7 +371,8 @@ fn delete_key_is_a_tombstone_not_a_hard_delete() {
 fn delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_deleted_at_clock1";
+    let id_owned = format!("vk_deleted_at_clock1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
     store.put_key(&sample_key(id)).unwrap();
 
@@ -411,11 +423,12 @@ fn delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision() {
 fn put_key_with_credential_refuses_to_remint_over_a_tombstone() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_remint_over_tombstone1";
+    let id_owned = format!("vk_remint_over_tombstone1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
 
     let key = sample_key(id);
-    let cred = sample_cred(id, 0, "AKIA_REMINT1");
+    let cred = sample_cred(id, 0, &format!("AKIA_REMINT1_{id}"));
     store.put_key_with_credential(&key, &cred).unwrap();
     store.delete_key(id).unwrap();
     let tombstoned = store.get_key(id).unwrap().unwrap();
@@ -427,7 +440,7 @@ fn put_key_with_credential_refuses_to_remint_over_a_tombstone() {
     let mut remint = sample_key(id);
     remint.enabled = true;
     remint.deleted_at = None;
-    let remint_cred = sample_cred(id, 0, "AKIA_REMINT1_NEW");
+    let remint_cred = sample_cred(id, 0, &format!("AKIA_REMINT1_NEW_{id}"));
     let err = store
         .put_key_with_credential(&remint, &remint_cred)
         .expect_err("re-minting over a tombstoned id must be refused, not silently resurrected");
@@ -462,20 +475,21 @@ fn put_key_with_credential_refuses_to_remint_over_a_tombstone() {
 fn credential_slot_guard_rejects_clobbering_a_live_credential() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_slotguard1";
+    let id_owned = format!("vk_slotguard1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
     store.put_key(&sample_key(id)).unwrap();
 
-    let c0 = sample_cred(id, 0, "AKIA_SLOT0_A");
+    let c0 = sample_cred(id, 0, &format!("AKIA_SLOT0_A_{id}"));
     store.put_credential(&c0).unwrap();
 
     // Same slot, different public_id, while c0 is still LIVE -- must be rejected.
-    let c0b = sample_cred(id, 0, "AKIA_SLOT0_B");
+    let c0b = sample_cred(id, 0, &format!("AKIA_SLOT0_B_{id}"));
     let err = store.put_credential(&c0b);
     assert!(err.is_err(), "minting into an occupied LIVE slot must fail");
     // The original credential must be untouched.
     let live = store
-        .lookup_credential_secret("sigv4", "AKIA_SLOT0_A")
+        .lookup_credential_secret("sigv4", &format!("AKIA_SLOT0_A_{id}"))
         .unwrap();
     assert!(
         live.is_some(),
@@ -483,17 +497,17 @@ fn credential_slot_guard_rejects_clobbering_a_live_credential() {
     );
 
     // Slot 1 is free -- overlap-window rotation must succeed.
-    let c1 = sample_cred(id, 1, "AKIA_SLOT1_A");
+    let c1 = sample_cred(id, 1, &format!("AKIA_SLOT1_A_{id}"));
     store.put_credential(&c1).unwrap();
     assert_eq!(store.list_credentials(id).unwrap().len(), 2);
 
     // Revoke slot 0, then re-minting into it must succeed (revoked slots are reusable).
     let cred0_id = c0.meta.id.clone();
     store.revoke_credential(&cred0_id, "rotated").unwrap();
-    let c0c = sample_cred(id, 0, "AKIA_SLOT0_C");
+    let c0c = sample_cred(id, 0, &format!("AKIA_SLOT0_C_{id}"));
     store.put_credential(&c0c).unwrap();
     let resolved = store
-        .lookup_credential_secret("sigv4", "AKIA_SLOT0_C")
+        .lookup_credential_secret("sigv4", &format!("AKIA_SLOT0_C_{id}"))
         .unwrap()
         .expect("re-mint into a revoked slot must succeed");
     assert_eq!(resolved.meta.slot, 0);
@@ -509,11 +523,12 @@ fn credential_slot_guard_rejects_clobbering_a_live_credential() {
 fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_updated_at1";
+    let id_owned = format!("vk_updated_at1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
     store.put_key(&sample_key(id)).unwrap();
 
-    let mut cred = sample_cred(id, 0, "AKIA_UPDATEDAT1");
+    let mut cred = sample_cred(id, 0, &format!("AKIA_UPDATEDAT1_{id}"));
     cred.meta.created_at = 100;
     cred.meta.updated_at = 200;
     store.put_credential(&cred).unwrap();
@@ -522,7 +537,7 @@ fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
         .list_credentials(id)
         .unwrap()
         .into_iter()
-        .find(|m| m.public_id == "AKIA_UPDATEDAT1")
+        .find(|m| m.public_id == format!("AKIA_UPDATEDAT1_{id}"))
         .expect("the minted credential must be listed");
     assert_eq!(got.created_at, 100, "created_at must round-trip untouched");
     assert_eq!(
@@ -540,11 +555,12 @@ fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
 fn revoke_credential_is_independent_of_the_key_and_other_slots() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_revoke1";
+    let id_owned = format!("vk_revoke1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
     store.put_key(&sample_key(id)).unwrap();
-    let c0 = sample_cred(id, 0, "AKIA_REVOKE1_A");
-    let c1 = sample_cred(id, 1, "AKIA_REVOKE1_B");
+    let c0 = sample_cred(id, 0, &format!("AKIA_REVOKE1_A_{id}"));
+    let c1 = sample_cred(id, 1, &format!("AKIA_REVOKE1_B_{id}"));
     store.put_credential(&c0).unwrap();
     store.put_credential(&c1).unwrap();
 
@@ -577,7 +593,7 @@ fn revoke_credential_is_independent_of_the_key_and_other_slots() {
     // `revoked_at.is_some()` has been asserted above, so it would pass no matter what this lookup
     // returned.
     let resolved = store
-        .lookup_credential_secret("sigv4", "AKIA_REVOKE1_A")
+        .lookup_credential_secret("sigv4", &format!("AKIA_REVOKE1_A_{id}"))
         .unwrap()
         .expect("the verify path must still resolve a revoked credential, not report it unknown");
     assert!(
@@ -595,7 +611,7 @@ fn revoke_credential_is_independent_of_the_key_and_other_slots() {
     // the case that must come back LIVE, and it is the only thing here that can fail if liveness
     // stops discriminating.
     let untouched = store
-        .lookup_credential_secret("sigv4", "AKIA_REVOKE1_B")
+        .lookup_credential_secret("sigv4", &format!("AKIA_REVOKE1_B_{id}"))
         .unwrap()
         .expect("the other slot's credential must still resolve");
     assert!(
@@ -623,7 +639,8 @@ fn revoke_credential_is_independent_of_the_key_and_other_slots() {
 fn revoke_credential_errors_on_an_unknown_id_but_stays_idempotent_on_a_revoked_one() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_revoke_unknown1";
+    let id_owned = format!("vk_revoke_unknown1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
     store.put_key(&sample_key(id)).unwrap();
 
@@ -639,7 +656,7 @@ fn revoke_credential_errors_on_an_unknown_id_but_stays_idempotent_on_a_revoked_o
     // The idempotent half. Asserting only that the second call returns Ok pins almost nothing:
     // deleting the `AND revoked_at IS NULL` guard, or the whole UPDATE, leaves both calls
     // returning Ok. A no-op means the row is UNCHANGED, so read it back on both sides.
-    let cred = sample_cred(id, 0, "AKIA_REVOKE_UNKNOWN1");
+    let cred = sample_cred(id, 0, &format!("AKIA_REVOKE_UNKNOWN1_{id}"));
     store.put_credential(&cred).unwrap();
     store.revoke_credential(&cred.meta.id, "leaked").unwrap();
     let after_first = store
@@ -693,11 +710,12 @@ fn revoke_credential_errors_on_an_unknown_id_but_stays_idempotent_on_a_revoked_o
 fn hydration_delta_makes_credential_deletion_observable_via_the_key_tombstone() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let id = "vk_hydrate1";
+    let id_owned = format!("vk_hydrate1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store, id);
 
     let key = sample_key(id);
-    let cred = sample_cred(id, 0, "AKIA_HYDRATE1");
+    let cred = sample_cred(id, 0, &format!("AKIA_HYDRATE1_{id}"));
     store.put_key_with_credential(&key, &cred).unwrap();
 
     // Establish a watermark AFTER the mint (so the delete is the only thing after it).
@@ -748,10 +766,11 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
     // other delete does not pay, so the two deletes ran one after the other and the race this test
     // names never happened.
     let store_c = connect_store_with_retry(&url).expect("connect c");
-    let id = "vk_concurrent_del1";
+    let id_owned = format!("vk_concurrent_del1_{}", unique_suffix());
+    let id = id_owned.as_str();
     hard_reset(&store_a, id);
     store_a.put_key(&sample_key(id)).unwrap();
-    let cred = sample_cred(id, 0, "AKIA_CONCURRENT1");
+    let cred = sample_cred(id, 0, &format!("AKIA_CONCURRENT1_{id}"));
     store_a.put_credential(&cred).unwrap();
 
     let start = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -832,10 +851,11 @@ fn metering_roundtrip_new_fields() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
     let bucket = 20_270_101u64;
-    hard_reset(&store, "vk_meter_new1");
+    let meter_key = format!("vk_meter_new1_{}", unique_suffix());
+    hard_reset(&store, &meter_key);
     store
         .add_metering(&busbar_contract::records::MeteringDelta {
-            key_id: "vk_meter_new1".into(),
+            key_id: meter_key.clone(),
             bucket,
             model: "m".into(),
             provider: "p".into(),
@@ -852,7 +872,7 @@ fn metering_roundtrip_new_fields() {
         })
         .unwrap();
     let rows = store.list_metering(bucket).unwrap();
-    let row = rows.iter().find(|r| r.key_id == "vk_meter_new1").unwrap();
+    let row = rows.iter().find(|r| r.key_id == meter_key).unwrap();
     assert_eq!(row.tokens_cache_write, 2);
     assert_eq!(row.billable_requests, 2);
     assert_eq!(row.key_group_at_use, "growth");
@@ -921,15 +941,16 @@ fn is_undefined_table_matches_only_the_real_sqlstate() {
 fn labels_round_trip_non_empty_map() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    hard_reset(&store, "vk_labels_rt");
+    let labels_id = format!("vk_labels_rt_{}", unique_suffix());
+    hard_reset(&store, &labels_id);
 
-    let mut k = sample_key("vk_labels_rt");
+    let mut k = sample_key(&labels_id);
     k.labels = std::collections::BTreeMap::from([
         ("team".to_string(), "growth".to_string()),
         ("env".to_string(), "prod".to_string()),
     ]);
     store.put_key(&k).unwrap();
-    let back = store.get_key("vk_labels_rt").unwrap().unwrap();
+    let back = store.get_key(&labels_id).unwrap().unwrap();
     assert_eq!(back.labels.get("team").map(String::as_str), Some("growth"));
     assert_eq!(back.labels.get("env").map(String::as_str), Some("prod"));
     assert_eq!(back.labels.len(), 2);
@@ -970,7 +991,8 @@ fn secret_form_storage_round_trip_all_variants() {
 fn put_usage_and_add_usage_batch_multiple_models_correctly() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let bucket = "vk_multi_model_batch";
+    let bucket_owned = format!("vk_multi_model_batch_{}", unique_suffix());
+    let bucket = bucket_owned.as_str();
     let ws = 20_270_401u64;
     let ws2 = ws + 1;
     for w in [ws, ws2] {
