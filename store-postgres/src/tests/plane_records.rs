@@ -549,6 +549,90 @@ fn a_purge_spanning_several_batches_is_whole() {
     assert_eq!(count("SELECT COUNT(*) FROM plane_chain"), 5);
 }
 
+#[test]
+fn plane_purge_keeps_strict_cutoffs_above_the_signed_timestamp_boundary() {
+    let Some(url) = live_url() else { return };
+    let max = i64::MAX as u64;
+    for retention in [Retention::Age, Retention::TerminalOnly] {
+        let tmp = super::TempDb::create(&url, "spg_purge_max");
+        let store = connect_store_with_retry(&tmp.url()).expect("connect");
+        for (id, disposition, ts) in [
+            ("terminal-old", PlaneDisposition::Terminal, max - 1),
+            ("terminal-max", PlaneDisposition::Terminal, max),
+            ("active-old", PlaneDisposition::Active, max - 1),
+            ("active-max", PlaneDisposition::Active, max),
+        ] {
+            store
+                .upsert_plane_record(task(id, "opaque", ts, disposition).view())
+                .unwrap();
+            store
+                .append_plane_record(event(id, 1, "opaque", "", "h").view())
+                .unwrap();
+        }
+        let age = retention == Retention::Age;
+        assert_eq!(store.purge_plane_records("task", 0, retention).unwrap(), 0);
+        assert_eq!(
+            store.purge_plane_records("task", max, retention).unwrap(),
+            if age { 2 } else { 1 }
+        );
+        assert!(store
+            .get_plane_record("task", "terminal-max")
+            .unwrap()
+            .is_some());
+        assert!(store
+            .get_plane_record("task", "active-max")
+            .unwrap()
+            .is_some());
+        assert!(chain(&store, "task_event", "terminal-old").is_empty());
+        assert_eq!(chain(&store, "task_event", "terminal-max").len(), 1);
+        assert_eq!(
+            store
+                .purge_plane_records("task", max + 1, retention)
+                .unwrap(),
+            if age { 2 } else { 1 },
+            "the signed maximum is strictly below this unsigned cutoff"
+        );
+        assert!(store
+            .get_plane_record("task", "terminal-max")
+            .unwrap()
+            .is_none());
+        assert!(chain(&store, "task_event", "terminal-max").is_empty());
+        if age {
+            assert!(store
+                .get_plane_record("task", "active-max")
+                .unwrap()
+                .is_none());
+            assert!(chain(&store, "task_event", "active-max").is_empty());
+        } else {
+            assert!(store
+                .get_plane_record("task", "active-old")
+                .unwrap()
+                .is_some());
+            assert!(store
+                .get_plane_record("task", "active-max")
+                .unwrap()
+                .is_some());
+            assert_eq!(chain(&store, "task_event", "active-old").len(), 1);
+            assert_eq!(chain(&store, "task_event", "active-max").len(), 1);
+        }
+        assert_eq!(
+            store
+                .purge_plane_records("task", u64::MAX, retention)
+                .unwrap(),
+            0
+        );
+
+        let mut opaque = task("edge", "opaque", max, PlaneDisposition::Active);
+        opaque.kind = "opaque".into();
+        store.upsert_plane_record(opaque.view()).unwrap();
+        assert_eq!(store.purge_plane_records_before("opaque", max).unwrap(), 0);
+        assert_eq!(
+            store.purge_plane_records_before("opaque", max + 1).unwrap(),
+            1
+        );
+    }
+}
+
 /// The per-task provenance chain, read back after a reconnect. It never writes the task itself: an
 /// event and the first task write are independent write-throughs with no ordering between them, so
 /// appending an event for a task with no row yet has to WORK (no foreign key between the tables).
