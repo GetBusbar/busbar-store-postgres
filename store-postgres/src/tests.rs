@@ -1811,6 +1811,38 @@ fn revoking_a_credential_deleted_underneath_says_unknown_id() {
     hard_reset(&store, &id);
 }
 
+/// A rolling-upgrade migration chosen as a deadlock victim (40P01) against a node holding locks
+/// in the other order is retried, not failed.
+#[test]
+fn a_migration_deadlock_victim_is_retried() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_dead");
+    let iso_url = tmp.url();
+    drop(connect_store_with_retry(&iso_url).expect("fresh open"));
+    let mut node = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
+    node.batch_execute(
+        "DELETE FROM busbar_schema; INSERT INTO busbar_schema (version) VALUES (12);",
+    )
+    .unwrap();
+    // The old node holds `store_ops` (late in the schema's order) ...
+    node.batch_execute(
+        "BEGIN; INSERT INTO store_ops (op_id, body, answer, recorded_at)
+         VALUES ('\\xdead', 'x', '', 1)",
+    )
+    .unwrap();
+    let opening = {
+        let iso_url = iso_url.clone();
+        std::thread::spawn(move || TestStore::open(&iso_url).map(drop))
+    };
+    // ... while the migration holds earlier tables and waits on it; the node then wants one of those.
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let wanted = node.batch_execute("LOCK TABLE credentials IN ROW EXCLUSIVE MODE");
+    node.batch_execute("COMMIT").ok();
+    let _ = wanted;
+    let opened = opening.join().unwrap();
+    assert!(opened.is_ok(), "the migration was retried: {opened:?}");
+}
+
 /// A database stamped ABOVE this build is refused at open, with the reason: an older binary would
 /// ignore newer rules (the epoch fence among them). An equal version still opens.
 #[test]
