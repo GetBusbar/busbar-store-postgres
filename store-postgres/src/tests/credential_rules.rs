@@ -22,6 +22,35 @@ fn store_revision(store: &TestStore) -> i64 {
         .get(0)
 }
 
+struct IsolatedSchema {
+    client: postgres::Client,
+    name: String,
+}
+
+impl Drop for IsolatedSchema {
+    fn drop(&mut self) {
+        let _ = self
+            .client
+            .batch_execute(&format!("DROP SCHEMA \"{}\" CASCADE", self.name));
+    }
+}
+
+// Revision assertions need a private counter: unrelated tests mutate the shared database.
+fn isolated(tag: &str) -> (TestStore, String, IsolatedSchema) {
+    let url = live_url().expect("callers return early without a live url");
+    let name = format!("credential_{tag}_{}", unique_suffix());
+    let mut client = connect_client_with_retry(&url);
+    client
+        .batch_execute(&format!("CREATE SCHEMA \"{name}\""))
+        .expect("create private schema");
+    let schema = IsolatedSchema { client, name };
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let url = format!("{url}{sep}options=-csearch_path%3D{}", schema.name);
+    let store = connect_store_with_retry(&url).expect("connect to private schema");
+    let id = format!("vk_{tag}_{}", unique_suffix());
+    (store, id, schema)
+}
+
 /// R3: a revoked credential id is never minted again; a NEW id into the revoked occupant's slot
 /// reclaims the slot, its `created_at` the new credential's.
 #[test]
@@ -62,7 +91,7 @@ fn reputting_a_live_credential_is_ok_when_identical_and_refused_when_different()
     if live_url().is_none() {
         return;
     }
-    let (store, id) = fresh("r4");
+    let (store, id, _schema) = isolated("r4");
     store.put_key(&sample_key(&id)).unwrap();
     let c = sample_cred(&id, 0, &format!("AKIA_R4_{id}"));
     store.put_credential(&c).unwrap();
@@ -92,7 +121,7 @@ fn put_key_with_credential_refuses_up_front_and_upserts_over_a_live_key() {
     if live_url().is_none() {
         return;
     }
-    let (store, id) = fresh("r5");
+    let (store, id, _schema) = isolated("r5");
 
     let mut carrying = sample_key(&id);
     carrying.deleted_at = Some(5);

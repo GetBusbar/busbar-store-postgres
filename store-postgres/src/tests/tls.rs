@@ -16,7 +16,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use busbar_contract::records::RecordStore;
@@ -29,9 +29,15 @@ use crate::pgwire::Config;
 /// The host's TLS for the test table ([`TcpConns::with_tls`]): rustls trusting `ca_der` alone,
 /// verifying the certificate and the name; the handshake runs to completion on the blocking socket
 /// the table hands it.
-struct Trusting(Arc<rustls::ClientConfig>);
+type TlsFailure = Arc<Mutex<Option<String>>>;
+
+struct Trusting(Arc<rustls::ClientConfig>, Option<TlsFailure>);
 
 fn trusting(ca_der: &[u8]) -> Arc<dyn SecureDial> {
+    trusting_report(ca_der, None)
+}
+
+fn trusting_report(ca_der: &[u8], failure: Option<TlsFailure>) -> Arc<dyn SecureDial> {
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(rustls_pki_types::CertificateDer::from(ca_der.to_vec()))
@@ -43,7 +49,7 @@ fn trusting(ca_der: &[u8]) -> Arc<dyn SecureDial> {
     .expect("the default protocol versions")
     .with_root_certificates(roots)
     .with_no_client_auth();
-    Arc::new(Trusting(Arc::new(config)))
+    Arc::new(Trusting(Arc::new(config), failure))
 }
 
 impl SecureDial for Trusting {
@@ -58,7 +64,11 @@ impl SecureDial for Trusting {
         let mut tls = rustls::ClientConnection::new(Arc::clone(&self.0), name)
             .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
         while tls.is_handshaking() {
-            tls.complete_io(&mut tcp)?;
+            tls.complete_io(&mut tcp).inspect_err(|e| {
+                if let Some(failure) = &self.1 {
+                    *failure.lock().unwrap() = Some(format!("{e:?}"));
+                }
+            })?;
         }
         Ok(Box::new(Secured(rustls::StreamOwned::new(tls, tcp))))
     }
@@ -101,10 +111,11 @@ fn minted() -> (Vec<u8>, Arc<rustls::ServerConfig>) {
     let ca = ca_params.self_signed(&ca_key).expect("ca");
     let issuer = rcgen::Issuer::from_params(&ca_params, ca_key);
     let key = rcgen::KeyPair::generate().expect("key");
-    let leaf = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-        .expect("params")
-        .signed_by(&key, &issuer)
-        .expect("leaf");
+    let leaf =
+        rcgen::CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("params")
+            .signed_by(&key, &issuer)
+            .expect("leaf");
     let server = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -211,12 +222,12 @@ fn tls_proxy(upstream: String, server: Arc<rustls::ServerConfig>) -> u16 {
     port
 }
 
-/// The live server's settings with the proxy in front: `postgres://...@localhost:<port>/...?sslmode=verify-full`.
+/// The live server's settings with the proxy's one listening address in front.
 fn through_proxy(url: &str, port: u16) -> (String, String) {
     let c = Config::parse(url).expect("the live url parses");
     let upstream = c.targets()[0].1.clone();
     let tls = format!(
-        "postgres://{}:{}@localhost:{port}/{}?sslmode=verify-full",
+        "postgres://{}:{}@127.0.0.1:{port}/{}?sslmode=verify-full",
         c.user,
         c.password.clone().unwrap_or_default(),
         c.dbname.clone().unwrap_or_default()
@@ -260,14 +271,28 @@ fn an_untrusted_server_certificate_fails_the_load_in_the_drivers_words() {
     let port = tls_proxy(upstream, server);
     let (_, tls_url) = through_proxy(&url, port);
     let settings = serde_json::json!({ "url": tls_url }).to_string();
+    let failure: TlsFailure = Arc::new(Mutex::new(None));
     let e = open_loaded_over(&settings, |d| {
-        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&other_ca)))
+        Arc::new(TcpConns::with_tls(
+            d.conn_waker(),
+            trusting_report(&other_ca, Some(Arc::clone(&failure))),
+        ))
     })
     .expect_err("a certificate from an unknown CA is refused");
     assert!(
-        e.contains("open failed: error performing TLS handshake")
-            && e.to_lowercase().contains("unknownissuer"),
+        e.contains(
+            "open failed: postgres store: failed to connect: error performing TLS handshake"
+        ),
         "the verification failure, in the driver's words: {e}"
+    );
+    // The host test table maps a SecureDial error to ConnError::Refused. Prove the underlying
+    // verification cause as well, so a generic dial failure cannot satisfy this test.
+    let failure = failure.lock().unwrap();
+    assert!(
+        failure
+            .as_deref()
+            .is_some_and(|text| text.to_lowercase().contains("unknownissuer")),
+        "the host's TLS verifier must have refused the issuing CA: {failure:?}"
     );
 }
 
