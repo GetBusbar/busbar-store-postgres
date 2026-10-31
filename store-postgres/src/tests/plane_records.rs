@@ -518,6 +518,37 @@ fn deleting_a_task_deletes_its_event_chain() {
     );
 }
 
+/// A purge larger than one batch removes every aged row, takes each purged task's event chain,
+/// counts them all, and leaves the active rows.
+#[test]
+fn a_purge_spanning_several_batches_is_whole() {
+    let Some(url) = live_url() else { return };
+    let tmp = super::TempDb::create(&url, "spg_purge");
+    let store = connect_store_with_retry(&tmp.url()).expect("connect");
+    store
+        .lock()
+        .batch_execute(
+            "INSERT INTO plane_records (kind, id, ts, disposition, body)
+               SELECT 'task', 't' || g, 10, 'terminal', '\\x7b7d' FROM generate_series(1, 2500) g;
+             INSERT INTO plane_records (kind, id, ts, disposition, body)
+               SELECT 'task', 'live' || g, 10, 'active', '\\x7b7d' FROM generate_series(1, 5) g;
+             INSERT INTO plane_chain (kind, parent, seq, id, ts, disposition, body)
+               SELECT 'task_event', 't' || g, 1, 't' || g, 10, 'active', '\\x7b7d'
+               FROM generate_series(1, 2500) g;
+             INSERT INTO plane_chain (kind, parent, seq, id, ts, disposition, body)
+               SELECT 'task_event', 'live' || g, 1, 'live' || g, 10, 'active', '\\x7b7d'
+               FROM generate_series(1, 5) g;",
+        )
+        .unwrap();
+    let purged = store
+        .purge_plane_records("task", 100, Retention::TerminalOnly)
+        .unwrap();
+    assert_eq!(purged, 2500);
+    let count = |sql: &str| -> i64 { store.lock().query_one(sql, &[]).unwrap().get(0) };
+    assert_eq!(count("SELECT COUNT(*) FROM plane_records"), 5);
+    assert_eq!(count("SELECT COUNT(*) FROM plane_chain"), 5);
+}
+
 /// The per-task provenance chain, read back after a reconnect. It never writes the task itself: an
 /// event and the first task write are independent write-throughs with no ordering between them, so
 /// appending an event for a task with no row yet has to WORK (no foreign key between the tables).
