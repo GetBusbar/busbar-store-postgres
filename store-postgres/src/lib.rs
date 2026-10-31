@@ -216,6 +216,9 @@ const FIRST_RELEASED_SCHEMA: i64 = 6;
 /// still longest). Every other kind drops any row older than the cutoff.
 const TERMINAL_ONLY_RETENTION_KINDS: [&str; 1] = ["task"];
 
+/// Rows one purge statement removes (and the ids it holds).
+const PURGE_BATCH: i64 = 1000;
+
 /// `(parent kind, child kind)`: purging a parent takes the child CHAIN hanging off it in the same
 /// transaction (a task's event chain has no retention path of its own).
 const PLANE_CHILD_KINDS: [(&str, &str); 1] = [("task", "task_event")];
@@ -1476,42 +1479,62 @@ impl Session {
         let terminal_only = retention == Retention::TerminalOnly;
         let client = self.lock();
         let mut tx = client.transaction().await.store()?;
-        let purged: Vec<String> = tx
-            .query(
-                "DELETE FROM plane_records
-                 WHERE kind=$1 AND ts < $2 AND (NOT $3 OR disposition = 'terminal')
-                 RETURNING id",
-                &[&kind, &cutoff, &terminal_only],
-            )
-            .await
-            .store()?
-            .iter()
-            .map(|r| r.try_get(0).store())
-            .collect::<RecordStoreResult<_>>()?;
-        let chain = tx
-            .execute(
-                "DELETE FROM plane_chain
-                 WHERE kind=$1 AND ts < $2 AND (NOT $3 OR disposition = 'terminal')",
-                &[&kind, &cutoff, &terminal_only],
-            )
-            .await
-            .store()?;
-        // CASCADE, in the SAME transaction: a purged parent's child chain goes with it, and only
-        // the chains under a record that actually went — so this can never be a second, wider
-        // retention rule in disguise.
-        if !purged.is_empty() {
-            for (_, child) in PLANE_CHILD_KINDS.iter().filter(|(p, _)| *p == kind) {
-                tx.execute(
-                    "DELETE FROM plane_chain WHERE kind=$1 AND parent = ANY($2)",
-                    &[child, &purged],
+        // In batches, so no more than `PURGE_BATCH` ids are ever held or bound at once; each
+        // batch takes its own child chains.
+        let mut purged = 0_u64;
+        loop {
+            let ids: Vec<String> = tx
+                .query(
+                    "DELETE FROM plane_records WHERE (kind, id) IN
+                         (SELECT kind, id FROM plane_records
+                          WHERE kind=$1 AND ts < $2 AND (NOT $3 OR disposition = 'terminal')
+                          LIMIT $4)
+                     RETURNING id",
+                    &[&kind, &cutoff, &terminal_only, &PURGE_BATCH],
+                )
+                .await
+                .store()?
+                .iter()
+                .map(|r| r.try_get(0).store())
+                .collect::<RecordStoreResult<_>>()?;
+            // CASCADE, in the SAME transaction: a purged parent's child chain goes with it, and
+            // only the chains under a record that actually went, so this can never be a second,
+            // wider retention rule in disguise.
+            if !ids.is_empty() {
+                for (_, child) in PLANE_CHILD_KINDS.iter().filter(|(p, _)| *p == kind) {
+                    tx.execute(
+                        "DELETE FROM plane_chain WHERE kind=$1 AND parent = ANY($2)",
+                        &[child, &ids],
+                    )
+                    .await
+                    .store()?;
+                }
+            }
+            purged += ids.len() as u64;
+            if (ids.len() as i64) < PURGE_BATCH {
+                break;
+            }
+        }
+        let mut chain = 0_u64;
+        loop {
+            let n = tx
+                .execute(
+                    "DELETE FROM plane_chain WHERE ctid IN
+                         (SELECT ctid FROM plane_chain
+                          WHERE kind=$1 AND ts < $2 AND (NOT $3 OR disposition = 'terminal')
+                          LIMIT $4)",
+                    &[&kind, &cutoff, &terminal_only, &PURGE_BATCH],
                 )
                 .await
                 .store()?;
+            chain += n;
+            if (n as i64) < PURGE_BATCH {
+                break;
             }
         }
         tx.commit().await.store()?;
         // `execute`/`RETURNING` report the rows actually removed, so the count is one performed.
-        Ok(purged.len() as u64 + chain)
+        Ok(purged + chain)
     }
 
     pub(crate) async fn delete_plane_record(
