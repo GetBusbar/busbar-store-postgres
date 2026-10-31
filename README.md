@@ -143,9 +143,12 @@ comma-separated list of several endpoints, tried in order), `user`,
 absent means `disable`) and `connect_timeout` (whole seconds; it bounds a new
 connection's dial and handshake and defaults to 30 when absent; `0` or less
 means no bound, as in libpq; a value that is not a whole number is refused).
-The store also asks the server, at startup, for `lock_timeout=30s` and
-`idle_in_transaction_session_timeout=60s` unless `options` sets them, and
-begins every transaction `READ COMMITTED` or `REPEATABLE READ` explicitly.
+The store sends no startup `options` of its own (a pooler such as pgbouncer
+refuses them; a DSN's `options` goes through as written). Every transaction
+begins with one simple-query batch that states its isolation level and bounds
+it server-side: `BEGIN ISOLATION LEVEL READ COMMITTED` (or `REPEATABLE READ`);
+`SET LOCAL lock_timeout = '30s'`; `SET LOCAL idle_in_transaction_session_timeout
+= '60s'`.
 
 **Socket options, accepted as 1.5.5's driver accepted them.** busbar's
 connector owns the sockets: it dials every connection with TCP keepalive on,

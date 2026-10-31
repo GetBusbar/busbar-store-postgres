@@ -114,39 +114,17 @@ fn inert(key: &str, value: &str, why: &str) {
     tracing::debug!("postgres connection option {key}={value} has no effect: {why}");
 }
 
-/// Server-side bounds the store asks for at startup unless the DSN's `options` set them: a peer
-/// stalled while holding a lock (the `store_revision` row, say) must not block the fleet forever.
 /// Postgres' own ceiling on a message (1 GiB).
 const MAX_MESSAGE_LEN: u32 = 1 << 30;
 
 /// The handshake bound when the DSN has no `connect_timeout`.
 const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 30_000;
 
-const DEFAULT_SERVER_SETTINGS: [(&str, &str); 2] = [
-    ("lock_timeout", "30s"),
-    ("idle_in_transaction_session_timeout", "60s"),
-];
-
 impl Config {
     /// The bound on a new connection's dial and handshake, in milliseconds (0 = none).
     fn connect_bound_ms(&self) -> u32 {
         self.connect_timeout_ms
             .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS)
-    }
-
-    /// The startup `options` value: the DSN's, plus each of [`DEFAULT_SERVER_SETTINGS`] it does not
-    /// name.
-    fn startup_options(&self) -> Option<String> {
-        let mut out = self.options.clone().unwrap_or_default();
-        for (name, value) in DEFAULT_SERVER_SETTINGS {
-            if !out.contains(name) {
-                if !out.is_empty() {
-                    out.push(' ');
-                }
-                out.push_str(&format!("-c {name}={value}"));
-            }
-        }
-        (!out.is_empty()).then_some(out)
     }
 
     /// Parse a libpq connection string: `postgres[ql]://user:pass@host:port/db?key=value&...` or
@@ -1069,8 +1047,7 @@ impl Client {
         if let Some(db) = &cfg.dbname {
             params.push(("database", db));
         }
-        let options = cfg.startup_options();
-        if let Some(o) = &options {
+        if let Some(o) = &cfg.options {
             params.push(("options", o));
         }
         if let Some(a) = &cfg.application_name {
@@ -1555,13 +1532,22 @@ pub enum IsolationLevel {
     RepeatableRead,
 }
 
-/// The statement that begins a transaction at `isolation` (`None` = READ COMMITTED, stated, so a
-/// DSN's `default_transaction_isolation` cannot change what the store's statements assume).
+/// The one simple-query batch that begins a transaction at `isolation` (`None` = READ COMMITTED,
+/// stated, so a DSN's `default_transaction_isolation` cannot change what the store's statements
+/// assume). It also bounds the transaction server-side with `SET LOCAL`, which a pooler passes
+/// where a startup `options` parameter is refused: a peer stalled while holding a lock (the
+/// `store_revision` row, say) must not block the fleet forever.
 #[must_use]
 pub fn begin_sql(isolation: Option<IsolationLevel>) -> &'static str {
     match isolation {
-        None => "BEGIN ISOLATION LEVEL READ COMMITTED",
-        Some(IsolationLevel::RepeatableRead) => "BEGIN ISOLATION LEVEL REPEATABLE READ",
+        None => {
+            "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = '30s'; \
+             SET LOCAL idle_in_transaction_session_timeout = '60s'"
+        }
+        Some(IsolationLevel::RepeatableRead) => {
+            "BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL lock_timeout = '30s'; \
+             SET LOCAL idle_in_transaction_session_timeout = '60s'"
+        }
     }
 }
 
