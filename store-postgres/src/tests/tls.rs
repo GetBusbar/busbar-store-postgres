@@ -703,9 +703,8 @@ fn a_quoted_password_with_an_escaped_quote_is_scrubbed_whole() {
             let _ = s.write_all(&fatal("28P01", "bad password it's tail-of-secret for u"));
         }
     });
-    let dsn = format!(
-        "host=127.0.0.1 port={port} user=u dbname=d password='it\\'s tail-of-secret'"
-    );
+    let dsn =
+        format!("host=127.0.0.1 port={port} user=u dbname=d password='it\\'s tail-of-secret'");
     let e = open_loaded(&settings_of(&dsn)).expect_err("the server refuses");
     assert!(e.contains("28P01"), "{e}");
     assert!(
