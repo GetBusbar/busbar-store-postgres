@@ -859,7 +859,7 @@ impl Session {
         // Deliberately UNFILTERED (tombstoned rows included) -- see the trait doc: this serves both
         // the admin-listing caller (which filters deleted_at.is_none() itself) and list_keys_since's
         // default fallback, which needs tombstones visible to drive credential eviction downstream.
-        let sql = format!("SELECT {KEY_COLUMNS} FROM keys ORDER BY created_at");
+        let sql = format!("SELECT {KEY_COLUMNS} FROM keys ORDER BY created_at, id");
         let rows = self.client().query(&sql, &[]).await.store()?;
         rows.iter().map(row_to_key).collect()
     }
@@ -869,7 +869,7 @@ impl Session {
         since: u64,
     ) -> RecordStoreResult<Vec<VirtualKey>> {
         let sql = format!(
-            "SELECT {KEY_COLUMNS} FROM keys WHERE revision > $1 OR revision = 0 ORDER BY revision"
+            "SELECT {KEY_COLUMNS} FROM keys WHERE revision > $1 OR revision = 0 ORDER BY revision, id"
         );
         let rows = self.client().query(&sql, &[&clamp(since)]).await.store()?;
         rows.iter().map(row_to_key).collect()
@@ -1191,8 +1191,9 @@ impl Session {
     ) -> RecordStoreResult<()> {
         let client = self.client();
         let mut tx = client.transaction().await.store()?;
-        Self::put_credential_tx(&mut tx, secret).await?;
-        tx.commit().await.store()?;
+        if Self::put_credential_tx(&mut tx, "put_credential", secret).await? {
+            tx.commit().await.store()?;
+        }
         Ok(())
     }
 
@@ -1202,7 +1203,22 @@ impl Session {
         secret: &CredentialSecret,
     ) -> RecordStoreResult<()> {
         // ATOMIC mint: the bearer key and its credential commit together or not at all. A mint
-        // supplies no tombstone (`deleted_at` NULL).
+        // supplies no tombstone, and the credential hangs off this key: refused up front, nothing
+        // written.
+        if key.deleted_at.is_some() {
+            return Err(RecordStoreError(format!(
+                "put_key_with_credential: key '{}' is tombstoned; a credential is never minted \
+                 onto it",
+                key.id
+            )));
+        }
+        if secret.meta.key_id != key.id {
+            return Err(RecordStoreError(format!(
+                "put_key_with_credential: the credential names key '{}', not the key '{}' being \
+                 minted with it",
+                secret.meta.key_id, key.id
+            )));
+        }
         let cols = KeyColumns::of(key, None);
         let client = self.client();
         let mut tx = client.transaction().await.store()?;
@@ -1220,7 +1236,7 @@ impl Session {
                 key.id
             )));
         }
-        Self::put_credential_tx(&mut tx, secret).await?;
+        Self::put_credential_tx(&mut tx, "put_key_with_credential", secret).await?;
         tx.commit().await.store()?;
         Ok(())
     }
@@ -1229,7 +1245,9 @@ impl Session {
         &mut self,
         key_id: &str,
     ) -> RecordStoreResult<Vec<CredentialMeta>> {
-        let sql = format!("SELECT {CRED_META_COLUMNS} FROM credentials WHERE key_id=$1");
+        let sql = format!(
+            "SELECT {CRED_META_COLUMNS} FROM credentials WHERE key_id=$1 ORDER BY kind, slot"
+        );
         let rows = self.client().query(&sql, &[&key_id]).await.store()?;
         rows.iter().map(row_to_cred_meta).collect()
     }
@@ -1256,7 +1274,7 @@ impl Session {
             // earlier `list_credentials` can stop resolving; success there would leave the credential
             // authenticating with the audit trail saying it was revoked.
             return Err(RecordStoreError(format!(
-                "revoke_credential: unknown credential id {id}; nothing was revoked"
+                "revoke_credential: unknown id '{id}'"
             )));
         }
         let rev = Self::next_revision(&mut tx).await?;
@@ -1266,7 +1284,8 @@ impl Session {
         // against a concurrent revoke of the same id.
         let changed = tx
             .execute(
-                "UPDATE credentials SET revoked_at=$2, revoke_reason=$3, updated_at=$2, revision=$4
+                "UPDATE credentials SET revoked_at=$2, revoke_reason=$3, updated_at=$2, revision=$4,
+                    secret=NULL, secret_form='none'
                  WHERE id=$1 AND revoked_at IS NULL",
                 &[&id, &clamp(now), &reason, &rev],
             )
@@ -1290,7 +1309,7 @@ impl Session {
                 // Deleted (a `delete_key` cascade) or re-keyed by a mint since the check above:
                 // no row answers to this id any more.
                 return Err(RecordStoreError(format!(
-                    "revoke_credential: unknown credential id {id}; nothing was revoked"
+                    "revoke_credential: unknown id '{id}'"
                 )));
             }
             // The row is there and was already revoked: a true idempotent no-op, exactly what the
@@ -1306,7 +1325,7 @@ impl Session {
         since: u64,
     ) -> RecordStoreResult<Vec<CredentialSecret>> {
         let sql = format!(
-            "SELECT {CRED_META_COLUMNS},secret FROM credentials WHERE revision > $1 OR revision = 0 ORDER BY revision"
+            "SELECT {CRED_META_COLUMNS},secret FROM credentials WHERE revision > $1 OR revision = 0 ORDER BY revision, id"
         );
         let rows = self.client().query(&sql, &[&clamp(since)]).await.store()?;
         rows.iter()
@@ -1703,20 +1722,24 @@ fn row_to_audit(r: &Row) -> RecordStoreResult<AuditRecord> {
 }
 
 impl Session {
-    /// Shared body of `put_credential`/`put_key_with_credential`: upsert on `(key_id, kind, slot)`.
-    /// Minting into an OCCUPIED LIVE slot must fail rather than destroy a working credential
-    /// mid-overlap-window: the `DO UPDATE`'s `WHERE credentials.revoked_at IS NOT NULL` makes the
-    /// upsert not apply, and the `changed` check turns that into an error.
+    /// Shared body of `put_credential`/`put_key_with_credential` (`op` names the caller in every
+    /// refusal): upsert on `(key_id, kind, slot)`. `Ok(true)` once a row was written, `Ok(false)`
+    /// for an identical live credential put again (nothing written; the caller drops the
+    /// transaction). Refused: a revoked id (never re-minted), a live occupant of the slot with
+    /// other content (revoke it first), a `public_id` another credential holds. A REVOKED occupant
+    /// of the slot is replaced.
     async fn put_credential_tx(
         tx: &mut Transaction<'_>,
+        op: &str,
         secret: &CredentialSecret,
-    ) -> RecordStoreResult<()> {
+    ) -> RecordStoreResult<bool> {
         let m = &secret.meta;
         let rev = Self::next_revision(tx).await?;
         // The owning key must EXIST and be LIVE. Checked AFTER `next_revision`, which is what makes it
         // atomic: every mutating transaction takes the single `store_revision` row lock first, so a
         // concurrent `delete_key` has either committed before this read (and this sees the tombstone)
-        // or cannot start its cascade until this mint commits (and then removes it).
+        // or cannot start its cascade until this mint commits (and then removes it). The same lock
+        // makes the credential checks below race-free.
         let owner_live: Option<bool> = tx
             .query_opt(
                 "SELECT deleted_at IS NULL FROM keys WHERE id=$1",
@@ -1729,15 +1752,14 @@ impl Session {
         match owner_live {
             None => {
                 return Err(RecordStoreError(format!(
-                    "put_credential: owning key '{}' does not exist; refusing a credential that \
-                     hangs off nothing",
+                    "{op}: key '{}' does not exist; a credential must hang off a real key",
                     m.key_id
                 )))
             }
             Some(false) => {
                 return Err(RecordStoreError(format!(
-                    "put_credential: owning key '{}' is tombstoned; refusing to mint a credential \
-                     under a revoked key",
+                    "{op}: key '{}' is tombstoned; its credentials were revoked with it and are \
+                     never reissued",
                     m.key_id
                 )))
             }
@@ -1749,58 +1771,117 @@ impl Session {
         } else {
             Some(secret.secret.as_str())
         };
+        let slot = m.slot as i16;
+        let created = clamp(m.created_at);
+        let updated = clamp(m.updated_at);
         let expires = m.expires_at.map(clamp);
-        let changed = tx
-            .execute(
-                "INSERT INTO credentials
-                    (id,key_id,kind,slot,public_id,secret,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,NULL,$11)
-                 ON CONFLICT (key_id, kind, slot) DO UPDATE SET
-                    id=EXCLUDED.id, public_id=EXCLUDED.public_id, secret=EXCLUDED.secret,
-                    secret_form=EXCLUDED.secret_form, created_at=EXCLUDED.created_at,
-                    updated_at=EXCLUDED.updated_at,
-                    expires_at=EXCLUDED.expires_at, revoked_at=NULL, revoke_reason=NULL,
-                    revision=EXCLUDED.revision
-                 WHERE credentials.revoked_at IS NOT NULL",
-                &[
-                    &m.id,
-                    &m.key_id,
-                    &m.kind,
-                    &(m.slot as i16),
-                    &m.public_id,
-                    &secret_val,
-                    &form,
-                    &clamp(m.created_at),
-                    &clamp(m.updated_at),
-                    &expires,
-                    &rev,
-                ],
-            ).await
-            .store()?;
-        if changed == 0 {
-            // The conflict branch matched and its WHERE refused: the slot's credential is live, or
-            // (rarely) it was removed since. Existence tells them apart.
-            let exists: bool = tx
-                .query_one(
-                    "SELECT EXISTS(SELECT 1 FROM credentials WHERE key_id=$1 AND kind=$2 AND slot=$3)",
-                    &[&m.key_id, &m.kind, &(m.slot as i16)],
-                ).await
-                .store()?
-                .try_get(0)
-                .store()?;
-            if exists {
+        let live_refused = |key_id: &str, kind: &str, slot: i16| {
+            RecordStoreError(format!(
+                "{op}: slot {slot} for key '{key_id}' kind '{kind}' holds a live credential; \
+                 revoke it first"
+            ))
+        };
+        // This id, wherever it sits: revoked is never re-minted; live is a retry when identical.
+        if let Some(r) = tx
+            .query_opt(
+                "SELECT key_id, kind, slot, public_id, secret, secret_form, created_at, updated_at,
+                        expires_at, revoked_at IS NOT NULL
+                 FROM credentials WHERE id=$1",
+                &[&m.id],
+            )
+            .await
+            .store()?
+        {
+            if r.try_get::<_, bool>(9).store()? {
                 return Err(RecordStoreError(format!(
-                    "put_credential: slot {} for key {} kind {} holds a LIVE credential; revoke it first",
-                    m.slot, m.key_id, m.kind
+                    "{op}: credential '{}' is revoked; a revoked credential is never re-minted",
+                    m.id
                 )));
             }
-            // No row in the slot any more (removed between the upsert and this check): nothing was
-            // written. A UNIQUE(kind, public_id) clash raises its own error rather than landing here.
-            return Err(RecordStoreError(
-                "put_credential: insert did not apply (the slot's credential was removed concurrently; retry)".to_string(),
-            ));
+            let stored: (String, String, i16, String, Option<String>, String) = (
+                r.try_get(0).store()?,
+                r.try_get(1).store()?,
+                r.try_get(2).store()?,
+                r.try_get(3).store()?,
+                r.try_get(4).store()?,
+                r.try_get(5).store()?,
+            );
+            let same = stored
+                == (
+                    m.key_id.clone(),
+                    m.kind.clone(),
+                    slot,
+                    m.public_id.clone(),
+                    secret_val.map(str::to_owned),
+                    form.to_owned(),
+                )
+                && r.try_get::<_, i64>(6).store()? == created
+                && r.try_get::<_, i64>(7).store()? == updated
+                && r.try_get::<_, Option<i64>>(8).store()? == expires;
+            if same {
+                return Ok(false);
+            }
+            return Err(live_refused(&stored.0, &stored.1, stored.2));
         }
-        Ok(())
+        // The slot: a live occupant (another id) is refused; a revoked one is replaced below.
+        let occupant: Option<bool> = tx
+            .query_opt(
+                "SELECT revoked_at IS NOT NULL FROM credentials
+                 WHERE key_id=$1 AND kind=$2 AND slot=$3",
+                &[&m.key_id, &m.kind, &slot],
+            )
+            .await
+            .store()?
+            .map(|r| r.try_get(0).store())
+            .transpose()?;
+        if occupant == Some(false) {
+            return Err(live_refused(&m.key_id, &m.kind, slot));
+        }
+        // UNIQUE (kind, public_id), across keys; the revoked occupant being replaced holds no clash.
+        let holder = tx
+            .query_opt(
+                "SELECT key_id, slot FROM credentials WHERE kind=$1 AND public_id=$2",
+                &[&m.kind, &m.public_id],
+            )
+            .await
+            .store()?;
+        if let Some(h) = holder {
+            let (hk, hs): (String, i16) = (h.try_get(0).store()?, h.try_get(1).store()?);
+            if !(hk == m.key_id && hs == slot) {
+                return Err(RecordStoreError(format!(
+                    "{op}: public_id '{}' is already in use for kind '{}'",
+                    m.public_id, m.kind
+                )));
+            }
+        }
+        tx.execute(
+            "INSERT INTO credentials
+                (id,key_id,kind,slot,public_id,secret,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL,NULL,$11)
+             ON CONFLICT (key_id, kind, slot) DO UPDATE SET
+                id=EXCLUDED.id, public_id=EXCLUDED.public_id, secret=EXCLUDED.secret,
+                secret_form=EXCLUDED.secret_form, created_at=EXCLUDED.created_at,
+                updated_at=EXCLUDED.updated_at,
+                expires_at=EXCLUDED.expires_at, revoked_at=NULL, revoke_reason=NULL,
+                revision=EXCLUDED.revision
+             WHERE credentials.revoked_at IS NOT NULL",
+            &[
+                &m.id,
+                &m.key_id,
+                &m.kind,
+                &slot,
+                &m.public_id,
+                &secret_val,
+                &form,
+                &created,
+                &updated,
+                &expires,
+                &rev,
+            ],
+        )
+        .await
+        .store()?;
+        Ok(true)
     }
 }
 
