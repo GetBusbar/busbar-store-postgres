@@ -1025,7 +1025,7 @@ impl Session {
         let cutoff = clamp(before);
         let mut tx = self.client().transaction().await.store()?;
         tx.batch_execute(
-            "LOCK TABLE usage_ledger, usage_ledger_units, usage_windows \
+            "LOCK TABLE usage_windows, usage_ledger, usage_ledger_units \
              IN SHARE ROW EXCLUSIVE MODE",
         )
         .await
