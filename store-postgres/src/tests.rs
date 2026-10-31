@@ -2239,3 +2239,121 @@ mod v3_slots;
 
 // ── TLS through the host (the connector's TLS wrap; ARCHITECT ruling 2026-10-03) ─────────────
 mod tls;
+
+#[test]
+fn usage_cleanup_keeps_boundaries_billing_and_rolls_back_every_usage_table() {
+    use busbar_contract::store_calls::StoreCalls;
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_usage_cleanup");
+    let store = TestStore::open(&tmp.url()).expect("isolated store opens");
+    store
+        .lock()
+        .batch_execute(
+            "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
+         SELECT bucket, stamp, 3, 2
+         FROM unnest(ARRAY['first','second']) AS bucket
+         CROSS JOIN unnest(ARRAY[0,9,10,11,9223372036854775807]::bigint[]) AS stamp;
+         INSERT INTO usage_ledger (bucket_id,window_start,model,tokens_input)
+         SELECT bucket_id,window_start,model,5 FROM usage_windows
+         CROSS JOIN unnest(ARRAY['alpha','beta']) AS model;
+         INSERT INTO usage_ledger_units (bucket_id,window_start,model,unit,count)
+         SELECT bucket_id,window_start,model,'audio_seconds',7 FROM usage_ledger;
+         INSERT INTO usage_metering (key_id,bucket,model,provider,requests)
+         VALUES ('billed',9,'alpha','provider',17);
+         INSERT INTO usage_metering_units (key_id,bucket,model,provider,unit,count)
+         VALUES ('billed',9,'alpha','provider','audio_seconds',19);",
+        )
+        .unwrap();
+    let counts = || {
+        let row = store
+            .lock()
+            .query_one(
+                "SELECT (SELECT count(*) FROM usage_windows),
+                    (SELECT count(*) FROM usage_ledger),
+                    (SELECT count(*) FROM usage_ledger_units)",
+                &[],
+            )
+            .unwrap();
+        [
+            row.get::<_, i64>(0),
+            row.get::<_, i64>(1),
+            row.get::<_, i64>(2),
+        ]
+    };
+    let purge = |before| harness::block_on(StoreCalls::purge_usage_before(&*store, before));
+    assert_eq!(purge(0).unwrap(), 0);
+    assert_eq!(counts(), [10, 20, 20]);
+    assert_eq!(
+        purge(10).unwrap(),
+        2,
+        "count windows, never models or open units"
+    );
+    assert_eq!(counts(), [8, 16, 16]);
+    assert_eq!(purge(10).unwrap(), 0);
+    let at_cutoff = store.get_usage("first", 10).unwrap();
+    assert_eq!(at_cutoff.requests, 3);
+    assert_eq!(at_cutoff.models.len(), 2);
+    assert!(at_cutoff
+        .models
+        .iter()
+        .all(|model| model.usage_units.get("audio_seconds") == Some(&7)));
+    store
+        .lock()
+        .batch_execute(
+            "CREATE FUNCTION reject_usage_cleanup() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'usage cleanup rollback fixture'; END $$;
+         CREATE TRIGGER reject_usage_cleanup BEFORE DELETE ON usage_ledger_units
+         FOR EACH ROW EXECUTE FUNCTION reject_usage_cleanup();",
+        )
+        .unwrap();
+    let refusal = purge(11).unwrap_err().to_string();
+    assert!(
+        refusal.contains("usage cleanup rollback fixture"),
+        "{refusal}"
+    );
+    assert_eq!(
+        store.get_usage("first", 10).unwrap(),
+        at_cutoff,
+        "a later delete failure rolls the whole usage ledger back"
+    );
+    assert_eq!(counts(), [8, 16, 16]);
+    store
+        .lock()
+        .batch_execute("DROP TRIGGER reject_usage_cleanup ON usage_ledger_units")
+        .unwrap();
+    assert_eq!(
+        purge(i64::MAX as u64).unwrap(),
+        4,
+        "the exact cutoff is retained"
+    );
+    assert_eq!(counts(), [4, 8, 8]);
+    assert_eq!(
+        purge(i64::MAX as u64 + 1).unwrap(),
+        2,
+        "an unsigned cutoff beyond the SQL maximum includes the maximum stored window"
+    );
+    assert_eq!(purge(u64::MAX).unwrap(), 0);
+    assert_eq!(counts(), [2, 4, 4], "window zero is permanent");
+    let row = store
+        .lock()
+        .query_one(
+            "SELECT (SELECT requests FROM usage_metering WHERE key_id='billed'),
+                (SELECT count FROM usage_metering_units WHERE key_id='billed')",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        (row.get::<_, i64>(0), row.get::<_, i64>(1)),
+        (17, 19),
+        "billing history and its open units are untouched"
+    );
+    let reopened = TestStore::open(&tmp.url()).unwrap();
+    assert_eq!(reopened.get_usage("first", 0).unwrap().requests, 3);
+    assert_eq!(
+        reopened
+            .get_usage("first", i64::MAX as u64)
+            .unwrap()
+            .requests,
+        0
+    );
+}
