@@ -1777,6 +1777,40 @@ fn plane_tokens_has_its_sweep_index() {
     );
 }
 
+/// A credential deleted (a `delete_key` cascade) between the revoke's existence check and its
+/// write names no row any more: the unknown-id error, not a story about a concurrent mint.
+#[test]
+fn revoking_a_credential_deleted_underneath_says_unknown_id() {
+    let Some(url) = live_url() else { return };
+    let store = connect_store_with_retry(&url).expect("connect");
+    let id = format!("vk_revdel_{}", unique_suffix());
+    hard_reset(&store, &id);
+    store.put_key(&sample_key(&id)).unwrap();
+    let cred = sample_cred(&id, 0, &format!("AKIA_RD_{id}"));
+    store.put_credential(&cred).unwrap();
+    let mut holder = connect_client_with_retry(&url);
+    holder
+        .batch_execute(&format!(
+            "BEGIN; SELECT 1 FROM credentials WHERE id = '{}' FOR UPDATE",
+            cred.meta.id
+        ))
+        .unwrap();
+    let err = std::thread::scope(|s| {
+        let revoke = s.spawn(|| store.revoke_credential(&cred.meta.id, "r"));
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        holder
+            .batch_execute(&format!(
+                "DELETE FROM credentials WHERE id = '{}'; COMMIT",
+                cred.meta.id
+            ))
+            .unwrap();
+        revoke.join().unwrap().expect_err("the row is gone")
+    });
+    assert!(err.0.contains("unknown credential id"), "{err:?}");
+    assert!(!err.0.contains("concurrent mint"), "{err:?}");
+    hard_reset(&store, &id);
+}
+
 /// A database stamped ABOVE this build is refused at open, with the reason: an older binary would
 /// ignore newer rules (the epoch fence among them). An equal version still opens.
 #[test]
