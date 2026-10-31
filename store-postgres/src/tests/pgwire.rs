@@ -395,11 +395,13 @@ fn a_data_row_short_of_its_columns_is_an_error_not_a_panic() {
 fn a_snapshot_transaction_begins_repeatable_read() {
     assert_eq!(
         begin_sql(Some(IsolationLevel::RepeatableRead)),
-        "BEGIN ISOLATION LEVEL REPEATABLE READ"
+        "BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL lock_timeout = '30s'; \
+         SET LOCAL idle_in_transaction_session_timeout = '60s'"
     );
     assert_eq!(
         begin_sql(None),
-        "BEGIN ISOLATION LEVEL READ COMMITTED",
+        "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = '30s'; \
+         SET LOCAL idle_in_transaction_session_timeout = '60s'",
         "a DSN's default_transaction_isolation must not change the store's reasoning"
     );
 }

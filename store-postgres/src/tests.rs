@@ -1505,6 +1505,31 @@ impl Drop for TempDb {
     }
 }
 
+/// Every store transaction opens with `SET LOCAL lock_timeout` and
+/// `idle_in_transaction_session_timeout` (no startup `options`, which poolers refuse): a trigger
+/// on `keys` reports what the transaction sees.
+#[test]
+fn a_store_transaction_runs_with_the_lock_and_idle_timeouts() {
+    let Some(url) = live_url() else { return };
+    let tmp = TempDb::create(&url, "spg_txto");
+    let iso_url = tmp.url();
+    let store = connect_store_with_retry(&iso_url).expect("fresh open");
+    store
+        .lock()
+        .batch_execute(
+            "CREATE FUNCTION probe_timeouts() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+                 RAISE EXCEPTION 'probe lock_timeout=% idle=%',
+                     current_setting('lock_timeout'),
+                     current_setting('idle_in_transaction_session_timeout');
+             END $$;
+             CREATE TRIGGER probe BEFORE INSERT ON keys
+                 FOR EACH ROW EXECUTE FUNCTION probe_timeouts();",
+        )
+        .unwrap();
+    let e = store.put_key(&sample_key("txto")).unwrap_err().to_string();
+    assert!(e.contains("probe lock_timeout=30s idle=1min"), "{e}");
+}
+
 /// `migrate_locked`'s undefined-table bootstrap path on a genuinely fresh (separate, disposable)
 /// database rather than the shared test database -- which, once any test has run against it, never
 /// again presents an undefined `busbar_schema` or a version < `SCHEMA_VERSION`, so this code was

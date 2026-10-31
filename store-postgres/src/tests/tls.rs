@@ -655,22 +655,19 @@ fn startup_options(dsn_query: &str) -> String {
     got
 }
 
-/// A stalled peer holding a row lock must not block the fleet forever: the store asks for a lock
-/// timeout and an idle-in-transaction timeout at startup, unless the DSN sets its own.
+/// A pooler-fronted server (pgbouncer and kin) refuses the startup `options` parameter, so the
+/// store sends none of its own; a DSN's own `options` still goes through untouched.
 #[test]
-fn startup_asks_for_lock_and_idle_in_transaction_timeouts() {
-    let o = startup_options("");
-    assert!(o.contains("-c lock_timeout=30s"), "{o}");
-    assert!(
-        o.contains("-c idle_in_transaction_session_timeout=60s"),
-        "{o}"
+fn startup_carries_no_options_of_the_stores_own() {
+    assert_eq!(
+        startup_options(""),
+        "",
+        "no `options` in the startup message"
     );
-    let o = startup_options("?options=-c%20lock_timeout%3D5s");
-    assert!(
-        o.contains("lock_timeout=5s") && !o.contains("lock_timeout=30s"),
-        "{o}"
+    assert_eq!(
+        startup_options("?options=-c%20statement_timeout%3D5000"),
+        "-c statement_timeout=5000"
     );
-    assert!(o.contains("idle_in_transaction_session_timeout=60s"), "{o}");
 }
 
 /// A peer that is not Postgres (an HTTP error page) declares a message length of ~1.3 GiB; the
@@ -1094,19 +1091,11 @@ fn the_oracle_url_options_cell_dials_and_fails_with_the_servers_refusal() {
         ("client_encoding", "UTF8"),
         ("user", "oracle"),
         ("database", "busbar"),
-        (
-            "options",
-            "-c statement_timeout=5000 -c lock_timeout=30s \
-             -c idle_in_transaction_session_timeout=60s",
-        ),
+        ("options", "-c statement_timeout=5000"),
         ("application_name", "busbar-oracle"),
     ]
     .iter()
     .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
     .collect();
-    assert_eq!(
-        *sent.lock().unwrap(),
-        want,
-        "the StartupMessage 1.5.5 sent, plus the store's own server timeouts"
-    );
+    assert_eq!(*sent.lock().unwrap(), want, "the StartupMessage 1.5.5 sent");
 }
