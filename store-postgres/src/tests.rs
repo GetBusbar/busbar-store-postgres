@@ -1796,7 +1796,11 @@ fn revoking_a_credential_deleted_underneath_says_unknown_id() {
             .unwrap();
         revoke.join().unwrap().expect_err("the row is gone")
     });
-    assert!(err.0.contains("unknown credential id"), "{err:?}");
+    assert_eq!(
+        err.0,
+        format!("revoke_credential: unknown id '{}'", cred.meta.id),
+        "{err:?}"
+    );
     assert!(!err.0.contains("concurrent mint"), "{err:?}");
     hard_reset(&store, &id);
 }
@@ -2189,6 +2193,9 @@ mod plane_records;
 
 // ── THE 1.6.0 RECORD SHAPES AND THE IN-PLACE v6 -> v10 UPGRADE ─────────────────────────────────
 mod v160_shapes;
+
+// ── THE FAMILY'S CREDENTIAL RULES (R3, R4, R5, R7, W2, W5) ────────────────────────────────────
+mod credential_rules;
 
 // ── THE STORE v3 SLOTS (the door's table beyond the 1.5.5 op set) ──────────────────────────────
 mod v3_slots;
