@@ -120,7 +120,7 @@ fn an_op_id_dedupes_durably_across_a_reconnect() {
         id: parent.clone(),
         parent: Some(parent.clone()),
         seq: 1,
-        ts: 1,
+        ts: 5_000_000_000,
         disposition: PlaneDisposition::Active,
         body: format!("{{\"hash\":\"{hash}\"}}").into_bytes(),
     };
@@ -479,7 +479,7 @@ fn an_op_recorded_by_an_older_build_replays() {
         id: parent.clone(),
         parent: Some(parent.clone()),
         seq: 1,
-        ts: 1,
+        ts: 5_000_000_000,
         disposition: PlaneDisposition::Active,
         body: format!("{{\"hash\":\"{hash}\"}}").into_bytes(),
     };
