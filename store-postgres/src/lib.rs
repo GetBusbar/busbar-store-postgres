@@ -208,6 +208,9 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 /// - v11-v13: `store_ops` (the durable `op_id` dedupe log) and `store_records`.
 const SCHEMA_VERSION: i64 = 13;
 
+/// How many times the migration transaction runs when it is chosen as a deadlock victim.
+const MIGRATE_ATTEMPTS: u32 = 1;
+
 /// The oldest schema any release wrote.
 const FIRST_RELEASED_SCHEMA: i64 = 6;
 
@@ -601,6 +604,18 @@ impl Session {
                  oldest released schema; refusing to open"
             )));
         }
+        // A rolling upgrade can deadlock (40P01) this DDL against an old node's `delete_key`, which
+        // takes its locks in the other order: the victim is this transaction, and it is retried.
+        let mut attempt = 1;
+        loop {
+            match Self::migrate_tx(client, version).await {
+                Err(e) if attempt < MIGRATE_ATTEMPTS && e.0.starts_with("40P01") => attempt += 1,
+                result => return result,
+            }
+        }
+    }
+
+    async fn migrate_tx(client: &mut Client, version: i64) -> RecordStoreResult<()> {
         let mut tx = client.transaction().await.store()?;
         tx.batch_execute(SCHEMA).await.store()?;
         // v10: `SCHEMA`'s `CREATE TABLE IF NOT EXISTS` never alters an existing table, so on a v6
