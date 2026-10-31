@@ -694,6 +694,26 @@ fn an_oversized_declared_message_length_is_refused() {
     assert!(started.elapsed() < Duration::from_secs(4));
 }
 
+/// The scrub uses the password the connection parser read, not a second parser's guess: a quoted
+/// keyword password holding an escaped quote and a space is scrubbed whole from a server's refusal.
+#[test]
+fn a_quoted_password_with_an_escaped_quote_is_scrubbed_whole() {
+    let port = fake_server(|mut s| {
+        if read_startup(&mut s).is_ok() {
+            let _ = s.write_all(&fatal("28P01", "bad password it's tail-of-secret for u"));
+        }
+    });
+    let dsn = format!(
+        "host=127.0.0.1 port={port} user=u dbname=d password='it\\'s tail-of-secret'"
+    );
+    let e = open_loaded(&settings_of(&dsn)).expect_err("the server refuses");
+    assert!(e.contains("28P01"), "{e}");
+    assert!(
+        !e.contains("tail-of-secret") && !e.contains("it's"),
+        "no part of the password survives: {e}"
+    );
+}
+
 /// D37 (RED before: `connect_timeout` was ignored, `Wire::bound` never called, and a server that
 /// accepts TCP and never answers held the instance's one connection forever): the dial AND the
 /// handshake are bounded, and the failure is the connection's timeout.
