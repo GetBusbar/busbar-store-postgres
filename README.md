@@ -39,7 +39,7 @@ interface this crate implements: the kind-tagged plane-record verbs, the
 name-keyed usage ledger and the dated metering rows). Pin both versions
 explicitly in production; do not assume they move together.
 
-### Upgrading from a 1.5.x deployment
+### Upgrading an existing database
 
 The first connect of this build upgrades an existing database **in place**
 (schema v6 → this build's current schema, inside one transaction, under the same advisory lock every
@@ -62,7 +62,13 @@ meaning:
   derives money from the counts and its rate card.
 - Schema v13 drops the tables a pre-release v11/v12 build created for the
   deleted store slots (`money_slots`, `money_slices`, `money_epoch`,
-  `store_journal`, `store_sessions`) and their op-id dedupe rows.
+  `store_journal`, `store_sessions`) and their op-id dedupe rows, and only when
+  upgrading from such a v11/v12 database: a fresh database or a released
+  v6-v10 one never loses a table of those names.
+- Schema v14 adds `plane_chain.has_parent`: a record appended without a parent
+  is stored under its own id, read back by `get_plane_record`, and never listed
+  as a parent. Rows already keyed by their own id are marked parentless. A
+  build older than v14 refuses a v14 database.
 
 A database a pre-release dev build took to schema v7–v9 keeps its
 `mcp_calls`/`tasks`/`task_events`/`mcp_demotions`/`spent_ask_states` tables
@@ -132,8 +138,14 @@ thin `cdylib` adapter around it.
 |---|---|---|---|
 | `url` | yes | — | A libpq connection string, URL (`postgres://user:pass@host:5432/busbar?sslmode=require`) or keyword form (`host=... user=... password=... dbname=...`). Connections go through busbar's connector. See the lists below. |
 
-The only setting is `url`; any other top-level key is refused
-(`unknown setting`), and a `url` that is not a string is refused.
+The only setting is `url`; every refusal starts
+`invalid postgres plugin config: `. Any other top-level key is refused
+(`unknown setting`), a settings value that is not a JSON object is refused
+naming its type, a `url` that is not a string is refused naming the type it
+is, and a missing or `null` `url` is refused as required. A connection string
+the parser refuses is refused at `validate` as at `open`, as
+`invalid postgres plugin config: url: ...`; only the connect is left to `open`.
+A failed connect reads `postgres store: failed to connect: ...`.
 
 **Connection-string options honoured:** `host`, `hostaddr`, `port` (a
 comma-separated list of several endpoints, tried in order), `user`,
@@ -148,7 +160,7 @@ refuses them; a DSN's `options` goes through as written). Every transaction
 begins with one simple-query batch that states its isolation level and bounds
 it server-side: `BEGIN ISOLATION LEVEL READ COMMITTED` (or `REPEATABLE READ`);
 `SET LOCAL lock_timeout = '30s'`; `SET LOCAL idle_in_transaction_session_timeout
-= '60s'`.
+= '60s'`. A single statement run outside a transaction carries no such bound.
 
 **Socket options, accepted as 1.5.5's driver accepted them.** busbar's
 connector owns the sockets: it dials every connection with TCP keepalive on,
