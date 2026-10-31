@@ -12,7 +12,7 @@ First-party signed kind:store plugin cdylib: the Postgres backend for busbar's d
 
 ## What it is for
 
-**This plugin's version: v1.0.0.** (Independently versioned from busbar
+**This plugin's version: v1.6.0.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
 
 [![CI](https://github.com/GetBusbar/busbar-store-postgres/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/busbar-store-postgres/actions/workflows/ci.yml)
@@ -32,7 +32,7 @@ node.
 
 ### Versioning
 
-This plugin is versioned **independently of busbar** — `v1.0.0` here says
+This plugin is versioned **independently of busbar** — `v1.6.0` here says
 nothing about which busbar release it is. Compatibility with busbar is
 stated separately: **requires busbar 1.6.0+** (the release whose store
 interface this crate implements: the kind-tagged plane-record verbs, the
@@ -95,27 +95,29 @@ that crate and exports its `door` through `export_door!`.
   against the assumption that the two are byte-identical.
 - **A few error cases differ across backends.** Revoking a credential
   id that names no row is an error here and on MySQL, and a silent
-  success on SQLite and Valkey. Appending an audit entry whose `seq`
-  already exists is an error here, where the other backends overwrite
-  or ignore. Tooling that treats a store error as fatal should not
-  assume the same input produces the same outcome on every backend.
+  success on SQLite and Valkey. Tooling that treats a store error as
+  fatal should not assume the same input produces the same outcome on
+  every backend.
 
 ### Known limitations (documented honestly, not papered over)
 
 - **The store opens no socket of its own.** It reaches Postgres through
   busbar's connector (the store declares one outbound `tcp` need in the
   `operator-infrastructure` egress class).
-- **One kept connection, as 1.5.x.** The store connects and authenticates
-  once and keeps that connection; operations take turns on it. A
+- **Up to eight kept connections.** (1.5.x kept one.) The store connects and
+  authenticates on demand and keeps up to eight idle connections; an
+  operation that finds none free waits for one. A
   connection that fails (or is left inside a transaction) is closed, and
   the next operation connects afresh rather than needing a restart.
 - **TLS through busbar.** `sslmode=require`, `verify-ca` and
   `verify-full` secure the connection through busbar's connector and its
   trust anchors (always verifying the certificate and name); `disable`
-  connects in plaintext, as 1.5.x (`NoTls`) did. `allow` and `prefer` are
-  refused, never downgraded silently. An ABSENT `sslmode` is plaintext (the
-  same as `disable`; libpq's default of `prefer` is not applied, because this
-  store never falls back silently): set `sslmode` explicitly. A Unix-socket
+  connects in plaintext, as 1.5.x (`NoTls`) did. `allow` is plaintext (no
+  `SSLRequest`); `prefer` sends the `SSLRequest`, secures the connection on
+  the server's `S` WITHOUT verifying its certificate, and goes on in plaintext
+  on `N` (libpq's behaviour). An ABSENT `sslmode` is plaintext (the same as
+  `disable`; libpq's default of `prefer` is not applied): set `sslmode`
+  explicitly. A Unix-socket
   `host` is refused: the store reaches its server over TCP.
 
 See the doc comments at the top of
@@ -137,10 +139,13 @@ The only setting is `url`; any other top-level key is refused
 comma-separated list of several endpoints, tried in order), `user`,
 `password`, `dbname`, `application_name`, `options`, `target_session_attrs`
 (`any`, `read-write`, `read-only`), `channel_binding` (`disable` or `prefer`),
-`sslmode` (`disable`, `require`, `verify-ca`, `verify-full`; absent means
-`disable`) and `connect_timeout` (whole seconds; it bounds a new connection's
-dial and handshake; `0` or less means no bound, as in libpq; a value that is
-not a whole number is refused).
+`sslmode` (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`;
+absent means `disable`) and `connect_timeout` (whole seconds; it bounds a new
+connection's dial and handshake and defaults to 30 when absent; `0` or less
+means no bound, as in libpq; a value that is not a whole number is refused).
+The store also asks the server, at startup, for `lock_timeout=30s` and
+`idle_in_transaction_session_timeout=60s` unless `options` sets them, and
+begins every transaction `READ COMMITTED` or `REPEATABLE READ` explicitly.
 
 **Socket options, accepted as 1.5.5's driver accepted them.** busbar's
 connector owns the sockets: it dials every connection with TCP keepalive on,
@@ -160,8 +165,7 @@ setting. So:
   asked for with an `SSLRequest` (`sslmode` still decides whether it is used).
 - A value 1.5.5's driver refused (not a number, an unknown keyword) is refused.
 
-**Refused, with an explanation (never silently ignored):** `sslmode=allow`
-and `sslmode=prefer`, `channel_binding=require` (no SCRAM-PLUS), `sslrootcert`
+**Refused, with an explanation (never silently ignored):** `channel_binding=require` (no SCRAM-PLUS), `sslrootcert`
 (trust is busbar's), a Unix-socket `host`, `keepalives=0`, and any unknown
 option.
 
@@ -271,9 +275,9 @@ in busbar for the full reference. In short:
 BUSBAR_SIGN_KEY=<signing key> busbar-plugin-pack pack \
     --lib target/release/libbusbar_store_postgres_plugin.so \
     --name busbar-store-postgres-plugin --alias postgres --kind store \
-    --version 1.0.0 --publisher busbar \
+    --version 1.6.0 --publisher busbar \
     --license Apache-2.0 \
-    --out busbar-store-postgres-plugin-1.0.0-x86_64-linux.tar.gz
+    --out busbar-store-postgres-plugin-1.6.0-x86_64-linux.tar.gz
 ```
 
 For local development without a signing key, `busbar-plugin-pack pack

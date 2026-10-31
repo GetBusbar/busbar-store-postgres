@@ -26,7 +26,7 @@ postgres-types = { workspace = true }
 bytes = { workspace = true }
 fallible-iterator = { workspace = true }
 serde_json = { workspace = true }
-# `ReserveRefused::Unavailable` has no payload; the reason is logged (captured into the plugin's own log).
+# Logs, at debug, the connection options accepted but without effect (`pgwire::inert`).
 tracing = { workspace = true }
 
 [dev-dependencies]

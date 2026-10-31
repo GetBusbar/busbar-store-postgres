@@ -79,11 +79,14 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
 ]);
 
+/// How many ops of this store the host may have in flight at once.
+const MAX_INFLIGHT: u32 = 64;
+
 busbar_contract::store_door!(
     PostgresStore,
     NAME,
     env!("CARGO_PKG_VERSION"),
-    64,
+    MAX_INFLIGHT,
     needs: NEEDS,
     extensions: EXTENSIONS
 );
@@ -198,7 +201,7 @@ impl Session {
         // the first sweep after a long stop is not one huge delete ahead of an admitted write.
         for _ in 0..SWEEP_MAX_BATCHES {
             let removed = self
-                .lock()
+                .client()
                 .execute(
                     "DELETE FROM store_ops WHERE ctid IN
                          (SELECT ctid FROM store_ops WHERE recorded_at < $1 LIMIT $2)",
@@ -222,7 +225,7 @@ impl Session {
     ) -> OpResult<Option<String>> {
         self.sweep_ops().await;
         let mut tx = self
-            .lock()
+            .client()
             .transaction()
             .await
             .map_err(|e| OpRefused::Failed(pg(e)))?;
@@ -271,7 +274,7 @@ impl Session {
     ) -> Result<(), String> {
         if value.is_empty() {
             return self
-                .lock()
+                .client()
                 .execute(
                     "DELETE FROM store_records WHERE schema_id = $1 AND key = $2",
                     &[&schema, &key],
@@ -280,7 +283,7 @@ impl Session {
                 .map(drop)
                 .map_err(pg);
         }
-        self.lock()
+        self.client()
             .execute(
                 "INSERT INTO store_records (schema_id, key, value) VALUES ($1, $2, $3)
                  ON CONFLICT (schema_id, key) DO UPDATE SET value = EXCLUDED.value",
@@ -297,7 +300,7 @@ impl Session {
         key: &[u8],
     ) -> Result<Option<RecordBytes>, String> {
         let row = self
-            .lock()
+            .client()
             .query_opt(
                 "SELECT value FROM store_records WHERE schema_id = $1 AND key = $2",
                 &[&schema, &key],
@@ -319,7 +322,7 @@ impl Session {
         }
         // A key range on the primary key, not a per-row prefix compare.
         let limit = i64::from(limit);
-        let client = self.lock();
+        let client = self.client();
         let rows = match prefix_end(prefix) {
             Some(end) => {
                 client
