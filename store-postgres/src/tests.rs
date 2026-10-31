@@ -2447,3 +2447,93 @@ fn usage_cleanup_waits_for_a_usage_writer_and_removes_its_complete_old_window() 
         "no child rows from the committed old window survive"
     );
 }
+
+#[test]
+fn legacy_revoked_secrets_are_scrubbed_on_upgrade_and_on_repeated_revoke() {
+    let Some(url) = live_url() else { return };
+    for upgrade in [false, true] {
+        let tmp = TempDb::create(&url, "spg_revoked_scrub");
+        let store = TestStore::open(&tmp.url()).unwrap();
+        store.put_key(&sample_key("owner")).unwrap();
+        let credential = sample_cred("owner", 0, "LEGACY_REVOKED");
+        store.put_credential(&credential).unwrap();
+        // Older revocation kept secret material. Seed that historical row through SQL, rather
+        // than depending on the current revoker to reproduce an already-fixed write path.
+        store
+            .lock()
+            .execute(
+                "UPDATE credentials SET revoked_at=123, revoke_reason='original', updated_at=123
+             WHERE id=$1",
+                &[&credential.meta.id],
+            )
+            .unwrap();
+        let before = store
+            .list_credentials_since(0)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.meta.id == credential.meta.id)
+            .unwrap();
+        assert!(!before.secret.is_empty());
+        let owner = store.get_key("owner").unwrap();
+        if upgrade {
+            let mut conn = store.lock();
+            conn.execute("DELETE FROM busbar_schema", &[]).unwrap();
+            conn.execute(
+                "INSERT INTO busbar_schema(version) VALUES ($1)",
+                &[&(SCHEMA_VERSION - 1)],
+            )
+            .unwrap();
+        }
+        drop(store);
+        let store = TestStore::open(&tmp.url()).unwrap();
+        if !upgrade {
+            store
+                .revoke_credential(&credential.meta.id, "replacement reason")
+                .unwrap();
+        }
+        let after = store
+            .list_credentials_since(0)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.meta.id == credential.meta.id)
+            .unwrap();
+        assert!(
+            after.secret.is_empty(),
+            "historically revoked credentials must not retain secret material"
+        );
+        assert_eq!(after.meta.secret_form, SecretForm::None);
+        assert!(
+            after.meta.revision > before.meta.revision,
+            "scrubbing is observable in hydration deltas"
+        );
+        let mut expected = before.meta;
+        expected.secret_form = SecretForm::None;
+        expected.revision = after.meta.revision;
+        assert_eq!(
+            after.meta, expected,
+            "preserve original revocation and identity metadata"
+        );
+        assert_eq!(store.get_key("owner").unwrap(), owner);
+        assert!(store
+            .lock()
+            .query_one(
+                "SELECT secret IS NULL FROM credentials WHERE id=$1",
+                &[&credential.meta.id]
+            )
+            .unwrap()
+            .get::<_, bool>(0));
+        store
+            .revoke_credential(&credential.meta.id, "another reason")
+            .unwrap();
+        let again = store
+            .list_credentials_since(0)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.meta.id == credential.meta.id)
+            .unwrap();
+        assert_eq!(
+            again, after,
+            "an already-scrubbed revoke remains a true no-op"
+        );
+    }
+}
