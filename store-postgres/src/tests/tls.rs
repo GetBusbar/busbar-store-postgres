@@ -105,9 +105,16 @@ impl SecuredSock for Secured {
 
 /// A CA and a `localhost` server config it signed: (ca_der, server config).
 fn minted() -> (Vec<u8>, Arc<rustls::ServerConfig>) {
+    minted_by("store-postgres test CA")
+}
+
+fn minted_by(ca_name: &str) -> (Vec<u8>, Arc<rustls::ServerConfig>) {
     let ca_key = rcgen::KeyPair::generate().expect("ca key");
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, ca_name);
     let ca = ca_params.self_signed(&ca_key).expect("ca");
     let issuer = rcgen::Issuer::from_params(&ca_params, ca_key);
     let key = rcgen::KeyPair::generate().expect("key");
@@ -264,9 +271,9 @@ fn verify_full_secures_the_connection_through_the_host() {
 #[test]
 fn an_untrusted_server_certificate_fails_the_load_in_the_drivers_words() {
     let Some(url) = live_url() else { return };
-    let (_, server) = minted();
+    let (_, server) = minted_by("store-postgres untrusted issuer");
     // A TLS-capable table trusting a DIFFERENT CA than the one that signed the server's certificate.
-    let (other_ca, _) = minted();
+    let (other_ca, _) = minted_by("store-postgres trusted issuer");
     let (upstream, _) = through_proxy(&url, 0);
     let port = tls_proxy(upstream, server);
     let (_, tls_url) = through_proxy(&url, port);
