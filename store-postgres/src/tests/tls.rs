@@ -254,16 +254,20 @@ fn verify_full_secures_the_connection_through_the_host() {
 fn an_untrusted_server_certificate_fails_the_load_in_the_drivers_words() {
     let Some(url) = live_url() else { return };
     let (_, server) = minted();
+    // A TLS-capable table trusting a DIFFERENT CA than the one that signed the server's certificate.
+    let (other_ca, _) = minted();
     let (upstream, _) = through_proxy(&url, 0);
     let port = tls_proxy(upstream, server);
     let (_, tls_url) = through_proxy(&url, port);
     let settings = serde_json::json!({ "url": tls_url }).to_string();
-    // A table with no trust: every upgrade refused.
-    let e = open_loaded_over(&settings, |d| Arc::new(TcpConns::new(d.conn_waker())))
-        .expect_err("no TLS without trust");
+    let e = open_loaded_over(&settings, |d| {
+        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&other_ca)))
+    })
+    .expect_err("a certificate from an unknown CA is refused");
     assert!(
-        e.contains("open failed: error performing TLS handshake"),
-        "the driver's words: {e}"
+        e.contains("open failed: error performing TLS handshake")
+            && e.to_lowercase().contains("unknownissuer"),
+        "the verification failure, in the driver's words: {e}"
     );
 }
 
@@ -764,7 +768,7 @@ fn an_endpoint_that_times_out_hands_over_to_the_next() {
 /// instance's one kept connection. Op A holds it longer than the timeout (blocked on a row lock);
 /// op B queued behind it still succeeds.
 #[test]
-fn an_op_queued_behind_a_long_one_is_not_cut_by_connect_timeout() {
+fn an_op_held_on_a_lock_past_connect_timeout_is_not_cut() {
     let Some(url) = live_url() else { return };
     let sep = if url.contains('?') { '&' } else { '?' };
     let store = TestStore::open(&format!("{url}{sep}connect_timeout=1")).expect("the store opens");
@@ -778,15 +782,22 @@ fn an_op_queued_behind_a_long_one_is_not_cut_by_connect_timeout() {
     )
     .expect("hold the row");
     std::thread::scope(|scope| {
-        let a = scope.spawn(|| RecordStore::add_denylist(&*store, &sub, "blocked behind the lock"));
+        let a = scope.spawn(|| {
+            let started = Instant::now();
+            let r = RecordStore::add_denylist(&*store, &sub, "blocked behind the lock");
+            (r, started.elapsed())
+        });
         std::thread::sleep(Duration::from_millis(300));
         let b = scope.spawn(|| RecordStore::list_denylist(&*store));
         std::thread::sleep(Duration::from_millis(2500));
         raw.batch_execute("COMMIT").expect("release the row");
-        a.join().unwrap().expect("op A finished");
-        b.join()
-            .unwrap()
-            .expect("op B, queued longer than connect_timeout, still ran");
+        let (a, took) = a.join().unwrap();
+        a.expect("op A finished");
+        assert!(
+            took > Duration::from_secs(2),
+            "op A was held on a real row lock for longer than connect_timeout=1: {took:?}"
+        );
+        b.join().unwrap().expect("op B ran");
     });
     raw.batch_execute(&format!("DELETE FROM denylist WHERE sub = '{sub}'"))
         .expect("cleanup");
