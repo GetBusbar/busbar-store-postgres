@@ -64,7 +64,7 @@ fn open_refuses_settings_without_a_url() {
     // A present url of the wrong type says so, naming the type, rather than "required".
     assert_eq!(
         TestStore::open_slot(br#"{"url": 5}"#).err().as_deref(),
-        Some("invalid postgres plugin config: `url` must be a string, got a number")
+        Some("invalid postgres plugin config: url: settings: invalid type: integer `***`, expected a string")
     );
     // A non-object names the JSON type it got.
     for (settings, ty) in [
@@ -73,18 +73,20 @@ fn open_refuses_settings_without_a_url() {
         (&b"7"[..], "a number"),
         (&b"true"[..], "a boolean"),
     ] {
-        assert_eq!(
-            TestStore::open_slot(settings).err().as_deref(),
-            Some(
-                format!("invalid postgres plugin config: expected a JSON object, got {ty}")
-                    .as_str()
-            ),
-            "{settings:?}"
+        let error = TestStore::open_slot(settings).expect_err("a settings object is required");
+        assert!(
+            error.starts_with("invalid postgres plugin config: settings: invalid type:"),
+            "{ty}: {error}"
+        );
+        assert!(error.contains("expected a map"), "{ty}: {error}");
+        assert!(
+            !error.contains("\"x\"") && !error.contains("[1]"),
+            "values stay private"
         );
     }
     // An unknown top-level key is refused, never ignored.
     assert_eq!(
-        TestStore::open_slot(br#"{"url": "postgres://u@h/d", "x": 1}"#)
+        TestStore::open_slot(br#"{"url": "postgres://u@h/d", "x": "public"}"#)
             .err()
             .as_deref(),
         Some("invalid postgres plugin config: unknown setting `x` (accepted: url)")
@@ -126,6 +128,54 @@ fn validate_refuses_what_open_refuses() {
         br#"{"url": "postgres://u@127.0.0.1:1/d"}"#,
     )
     .expect("a parseable url validates");
+}
+
+/// Host markers are resolved by settings_lent while the host owns the borrowed bytes; the
+/// resulting store keeps only public options and a sealed credential after that loan ends.
+#[test]
+fn open_with_secrets_captures_host_markers_before_the_loan_ends() {
+    use busbar_contract::abi::sdk::store::StoreSlots;
+    let mut lent = b"postgres://marker-user:marker-secret@127.0.0.1:1/db?sslmode=require".to_vec();
+    let store = <PostgresStore as StoreSlots>::open_with_secrets(
+        br#"{"url":{"$secret":0}}"#,
+        &[&lent],
+        None,
+    )
+    .expect("the host's marker resolves");
+    zeroize::Zeroize::zeroize(&mut lent);
+    assert_eq!(store.shared.config.user, "marker-user");
+    assert_eq!(
+        store
+            .shared
+            .config
+            .redact("server echoed marker-secret".into()),
+        "server echoed <redacted>"
+    );
+    assert!(!format!("{:?}", store.shared.config).contains("marker-secret"));
+
+    for (document, secrets) in [
+        (&br#"{"url":{"$secret":1}}"#[..], vec![&b"secret"[..]]),
+        (&br#"{"url":{"$secret":"secret"}}"#[..], vec![]),
+        (&br#"{"url":{"$secret":0}}"#[..], vec![&b"\xff"[..]]),
+    ] {
+        let error = <PostgresStore as StoreSlots>::open_with_secrets(document, &secrets, None)
+            .err()
+            .expect("invalid host loan is refused");
+        assert!(
+            error.starts_with("invalid postgres plugin config: url:"),
+            "{error}"
+        );
+        assert!(!error.contains("\"secret\""), "{error}");
+    }
+}
+
+#[test]
+fn settings_capture_keeps_surrounding_url_whitespace_compatibility() {
+    use busbar_contract::abi::sdk::store::StoreSlots;
+    <PostgresStore as StoreSlots>::validate(
+        br#"{"url":"  postgres://user:hidden@127.0.0.1:1/db  "}"#,
+    )
+    .expect("settings URLs were trimmed before parsing");
 }
 
 /// S1/S2/S3/S4: a replay applies nothing and answers the original, a different body is a

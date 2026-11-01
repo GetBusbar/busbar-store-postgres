@@ -12,14 +12,14 @@ fn a_url_parses_into_its_parts() {
     )
     .unwrap();
     assert_eq!(c.user, "u@x");
-    assert_eq!(c.password.as_deref(), Some("p:ss"));
+    assert_eq!(c.redact("auth: p:ss".into()), "auth: <redacted>");
     assert_eq!(c.targets()[0].1, "db.internal:6543");
     assert_eq!(c.dbname.as_deref(), Some("busbar"));
     assert_eq!(c.ssl, SslMode::Require);
     assert_eq!(c.application_name.as_deref(), Some("bb"));
     let c = Config::parse("postgresql://u@[::1]/d").unwrap();
     assert_eq!(c.targets()[0].1, "[::1]:5432");
-    assert_eq!(c.password, None);
+    assert!(c.credentials.password().is_none());
 }
 
 #[test]
@@ -27,7 +27,7 @@ fn the_keyword_form_parses_with_spaces_and_quotes() {
     let c = Config::parse("host = db port=5433 user=u password='se cret' dbname=x sslmode=require")
         .unwrap();
     assert_eq!(c.targets()[0].1, "db:5433");
-    assert_eq!(c.password.as_deref(), Some("se cret"));
+    assert_eq!(c.redact("auth: se cret".into()), "auth: <redacted>");
     assert_eq!(c.ssl, SslMode::Require);
 }
 
@@ -483,47 +483,156 @@ fn nul_bytes_in_postgres_startup_fields_are_refused_during_parse() {
 }
 
 #[test]
-fn active_password_extraction_matches_the_parser_last_wins_semantics() {
-    for (dsn, raw, decoded) in [
-        (
-            "postgres://u:first@host/db?password=second",
-            Some("second"),
-            "second",
-        ),
+fn captured_passwords_preserve_last_wins_and_decode_semantics() {
+    for (dsn, decoded) in [
+        ("postgres://u:first@host/db?password=second", "second"),
         (
             "postgres://u:first@host/db?password=second&password=third",
-            Some("third"),
             "third",
         ),
         (
             "postgres://u:first@host/db?%70assword=second%40value",
-            Some("second%40value"),
             "second@value",
         ),
+        ("postgres://u:first@host/db?password=second&password=", ""),
+        ("host=db user=u password=first password=second", "second"),
+        ("host=db user=u password=first password=", ""),
+        ("postgres://u@host/db?password=literal+plus", "literal+plus"),
         (
-            "postgres://u:first@host/db?password=second&password=",
-            None,
-            "",
+            "postgres://u@host/db?password=literal%2Bplus",
+            "literal+plus",
         ),
-        (
-            "host=db user=u password=first password=second",
-            Some("second"),
-            "second",
-        ),
-        ("host=db user=u password=first password=", None, ""),
     ] {
         let config = Config::parse(dsn).unwrap();
-        assert_eq!(config.password.as_deref(), Some(decoded), "{dsn}");
-        let extracted = crate::dsn_password(dsn);
-        assert_eq!(extracted.as_deref(), raw, "{dsn}");
+        assert_eq!(config.credentials.password().unwrap().len(), decoded.len());
         assert_eq!(
-            crate::scrub(format!("auth: {decoded}"), extracted.as_deref()),
+            config.redact(format!("auth: {decoded}")),
             if decoded.is_empty() {
                 "auth: "
             } else {
                 "auth: <redacted>"
             },
-            "the actual effective password is scrubbed"
+            "the effective password stays sealed and still redacts peer echoes"
+        );
+        assert!(!format!("{config:?}").contains("password"));
+    }
+}
+
+#[test]
+fn captured_passwords_do_not_hide_invalid_options_or_invalid_encoding() {
+    for dsn in [
+        "postgres://u@host/db?pass=hidden",
+        "postgres://u@host/db?password=bad%zz",
+        "postgres://u@host/db?password=bad%ff",
+        "postgres://u:bad%4@host/db",
+        "host=db user=u password='unterminated",
+        "host=db user=u password=hidden unknown=hidden",
+    ] {
+        let error = Config::parse(dsn).unwrap_err().to_string();
+        assert!(!error.contains("hidden"), "{error}");
+    }
+}
+
+#[test]
+fn require_auth_is_validated_and_captured_without_relaxing_the_floor() {
+    use busbar_contract::abi::sdk::cred::PgAuth;
+    let strict = Config::parse("postgres://u:hidden@host/db").unwrap();
+    assert!(strict.credentials.floor().pg().allows(PgAuth::ScramSha256));
+    assert!(strict.credentials.floor().pg().allows(PgAuth::None));
+    assert!(!strict.credentials.floor().pg().allows(PgAuth::Password));
+    assert!(!strict.credentials.floor().pg().allows(PgAuth::Md5));
+    let explicit =
+        Config::parse("host=db user=u password=hidden require_auth=md5,password").unwrap();
+    assert!(explicit.credentials.floor().pg().allows(PgAuth::Password));
+    assert!(explicit.credentials.floor().pg().allows(PgAuth::Md5));
+    assert!(!explicit.credentials.floor().pg().allows(PgAuth::None));
+    assert!(!explicit
+        .credentials
+        .floor()
+        .pg()
+        .allows(PgAuth::ScramSha256));
+    for dsn in [
+        r"host=db user=u password=hidden require_auth=pass\word",
+        "host=db user=u password=hidden require_auth = 'password'",
+        "postgres://u:hidden@host/db?%72equire_auth=%70assword",
+    ] {
+        let config = Config::parse(dsn).unwrap();
+        assert!(config.credentials.floor().pg().allows(PgAuth::Password));
+        assert!(!config.credentials.floor().pg().allows(PgAuth::Md5));
+    }
+    let tls = Config::parse("postgres://u:hidden@host/db?sslmode=require").unwrap();
+    assert!(tls.credentials.password().unwrap().secure_required());
+    for value in ["", "hidden", "md5,md5", "password,!md5"] {
+        let error = Config::parse(&format!("host=db user=u require_auth={value}"))
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("hidden"), "{error}");
+    }
+}
+
+#[test]
+fn scram_public_message_validation_preserves_strict_native_grammar() {
+    for first in [
+        "s=QUJD,r=nonce,i=4096",
+        "r=nonce,s=QUJD,i=4096,r=other",
+        "m=required,r=nonce,s=QUJD,i=4096",
+        "r=bad nonce,s=QUJD,i=4096",
+        "r=nonce,s=QUJD,i=4096x",
+        "r=nonce,s=QUJD,i=100001",
+        "r=nonce,s=QUJD,i=0",
+        "r=nonce,s=QUJD,i=01",
+        "r=nonce,s=QUJD,i=04096",
+        "r=nonce,s=QUJD,i=4294967296",
+    ] {
+        assert!(
+            super::scram_server_first(first.as_bytes()).is_err(),
+            "{first}"
         );
     }
+    for first in [
+        "r=nonce,s=QUJD,i=1",
+        "r=nonce,s=QUJD,i=4095",
+        "r=nonce,s=QUJD,i=4096",
+        "r=nonce,s=QUJD,i=100000",
+    ] {
+        assert_eq!(super::scram_server_first(first.as_bytes()).unwrap(), first);
+    }
+    for final_message in [
+        "e=invalid-proof",
+        "v=QUJD,e=invalid-proof",
+        "e=invalid-proof,v=QUJD",
+        "v=QUJD,v=QUJD",
+        "v=QUJD,",
+        "v=not base64",
+    ] {
+        assert!(super::scram_server_final(final_message.as_bytes()).is_err());
+    }
+    assert!(super::scram_server_first(b"r=nonce,s=QUJD,i=4096\xff").is_err());
+    assert!(super::scram_server_final(b"v=QUJD\xff").is_err());
+    assert_eq!(super::scram_server_final(b"v=QUJD").unwrap(), "v=QUJD");
+}
+
+#[test]
+fn captured_dsn_redaction_covers_raw_decoded_and_superseded_passwords() {
+    let config = Config::parse("postgres://u:first%40value@host/db?password=last%2Bvalue").unwrap();
+    assert_eq!(
+        config.redact("first%40value first@value last%2Bvalue last+value".into()),
+        "<redacted> <redacted> <redacted> <redacted>",
+    );
+}
+
+#[test]
+fn the_sdk_verifier_link_accepts_the_known_native_scram_exchange() {
+    let config = Config::parse("host=db user=u password=foobar").unwrap();
+    let (_, link) = config
+        .credentials
+        .password()
+        .unwrap()
+        .pg_scram_sha256_postgres(
+            "n=,r=9IZ2O01zb9IgiIZ1WJ/zgpJB",
+            "r=9IZ2O01zb9IgiIZ1WJ/zgpJBjx/oIRLs02gGSHcw1KEty3eY,s=fs3IXBy7U7+IvVjZ,i=4096",
+            b"n,,",
+        )
+        .unwrap();
+    assert!(link.verify("v=U+ppxD5XUKtradnv8e2MkeupiA8FU87Sg8CXzXHDAzw="));
 }

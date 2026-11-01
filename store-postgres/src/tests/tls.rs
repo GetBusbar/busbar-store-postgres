@@ -26,6 +26,9 @@ use super::harness::open_loaded_over;
 use super::live_url;
 use crate::pgwire::Config;
 
+#[path = "auth.rs"]
+mod auth;
+
 /// The host's TLS for the test table ([`TcpConns::with_tls`]): rustls trusting `ca_der` alone,
 /// verifying the certificate and the name; the handshake runs to completion on the blocking socket
 /// the table hands it.
@@ -241,12 +244,7 @@ fn tls_proxy(upstream: String, server: Arc<rustls::ServerConfig>) -> u16 {
 fn through_proxy(url: &str, port: u16) -> (String, String) {
     let c = Config::parse(url).expect("the live url parses");
     let upstream = c.targets()[0].1.clone();
-    let tls = format!(
-        "postgres://{}:{}@127.0.0.1:{port}/{}?sslmode=verify-full",
-        c.user,
-        c.password.clone().unwrap_or_default(),
-        c.dbname.clone().unwrap_or_default()
-    );
+    let tls = dsn_at(url, &[("127.0.0.1", port)], "sslmode=verify-full");
     (upstream, tls)
 }
 
@@ -510,20 +508,34 @@ fn open_within(settings: String, within: Duration) -> Option<Result<(), String>>
     rx.recv_timeout(within).ok()
 }
 
-/// A keyword connection string for the live server's credentials at `endpoints` (host, port),
+/// A connection URL for the live server's credentials at `endpoints` (host, port),
 /// with `extra` options.
 fn dsn_at(live: &str, endpoints: &[(&str, u16)], extra: &str) -> String {
-    let c = Config::parse(live).expect("the live url parses");
+    // Retarget the original fixture DSN without unsealing its captured password.
     let hosts: Vec<&str> = endpoints.iter().map(|e| e.0).collect();
     let ports: Vec<String> = endpoints.iter().map(|e| e.1.to_string()).collect();
-    format!(
-        "host={} port={} user='{}' password='{}' dbname='{}' {extra}",
-        hosts.join(","),
-        ports.join(","),
-        c.user,
-        c.password.clone().unwrap_or_default(),
-        c.dbname.clone().unwrap_or_default()
-    )
+    let query_value = |text: &str| -> String {
+        text.bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                    char::from(b).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    };
+    assert!(live.starts_with("postgres://") || live.starts_with("postgresql://"));
+    let mut url = format!(
+        "{live}{}host={}&port={}",
+        if live.contains('?') { '&' } else { '?' },
+        query_value(&hosts.join(",")),
+        query_value(&ports.join(","))
+    );
+    for (key, value) in crate::pgwire::keywords(extra).expect("public fixture options") {
+        url.push_str(&format!("&{}={}", query_value(&key), query_value(&value)));
+    }
+    url
 }
 
 /// The live server's (host, port).

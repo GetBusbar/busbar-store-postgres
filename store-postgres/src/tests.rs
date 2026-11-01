@@ -124,68 +124,27 @@ fn cred_secret_column_index_matches_cred_meta_columns_count() {
     );
 }
 
-/// A connect-error string must never leak the DSN password.
+/// Constructors capture passwords once, and the only remaining error-redaction path uses Cred.
 #[test]
-fn dsn_password_extraction_and_scrub() {
-    assert_eq!(
-        dsn_password("postgres://user:s3cr3t@host:5432/db").as_deref(),
-        Some("s3cr3t")
-    );
-    assert_eq!(
-        dsn_password("postgresql://u:p%40ss@host/db").as_deref(),
-        Some("p%40ss")
-    );
-    assert_eq!(
-        dsn_password("host=db user=u password=kwsecret dbname=x").as_deref(),
-        Some("kwsecret")
-    );
-    assert_eq!(dsn_password("postgres://host:5432/db"), None);
-    assert_eq!(dsn_password("host=db user=u"), None);
-
-    // Spellings libpq accepts that a `password=` prefix match on a whitespace token does not see.
-    // Each one used to return None, which makes `scrub` a no-op and passes the connect error
-    // through with the secret in it.
-    assert_eq!(
-        dsn_password("host = db user = u password = spaced dbname = x").as_deref(),
-        Some("spaced"),
-        "libpq allows whitespace around '='"
-    );
-    assert_eq!(
-        dsn_password("host=db password='quoted secret' user=u").as_deref(),
-        Some("quoted secret"),
-        "libpq allows a single-quoted value, spaces included"
-    );
-    assert_eq!(
-        dsn_password("postgres://user@host:5432/db?password=inquery").as_deref(),
-        Some("inquery"),
-        "the URL query-parameter form is a real libpq spelling"
-    );
-    assert_eq!(
-        dsn_password("postgres://user@host:5432/db?connect_timeout=10&password=after").as_deref(),
-        Some("after"),
-        "password must be found among other query parameters"
-    );
-    assert_eq!(
-        dsn_password("postgres://u:secret@host/db?options=label@other").as_deref(),
-        Some("secret"),
-        "an at-sign after the authority is not a userinfo delimiter"
-    );
+fn captured_dsn_passwords_redact_peer_errors_without_plaintext_custody() {
     for (dsn, expected) in [
+        ("postgres://user:s3cr3t@host:5432/db", "s3cr3t"),
+        ("postgresql://u:p%40ss@host/db", "p@ss"),
+        ("host=db user=u password=kwsecret dbname=x", "kwsecret"),
+        ("host = db user = u password = spaced dbname = x", "spaced"),
+        ("host=db password='quoted secret' user=u", "quoted secret"),
+        ("postgres://user@host:5432/db?password=inquery", "inquery"),
+        (
+            "postgres://user@host:5432/db?connect_timeout=10&password=after",
+            "after",
+        ),
+        ("postgres://u:secret@host/db?options=label@other", "secret"),
         (
             r"host=db user=u password='quote\' and\\slash'",
             "quote' and\\slash",
         ),
         (r"host=db user=u password=escaped\ space", "escaped space"),
         ("host=db user=u password='two  spaces'", "two  spaces"),
-    ] {
-        let actual = dsn_password(dsn);
-        assert_eq!(actual.as_deref(), Some(expected));
-        assert_eq!(
-            scrub(format!("auth: {expected}"), actual.as_deref()),
-            "auth: <redacted>"
-        );
-    }
-    for (dsn, expected) in [
         (
             "host=db user=u password='before?password=after'",
             "before?password=after",
@@ -195,32 +154,25 @@ fn dsn_password_extraction_and_scrub() {
             "before://u:wrong@host",
         ),
     ] {
-        assert!(pgwire::Config::parse(dsn).is_ok(), "valid keyword DSN");
-        let actual = dsn_password(dsn);
-        assert_eq!(actual.as_deref(), Some(expected));
+        let store = PostgresStore::new(dsn).unwrap();
         assert_eq!(
-            scrub(format!("auth: {expected}"), actual.as_deref()),
+            store.shared.config.redact(format!("auth: {expected}")),
             "auth: <redacted>"
         );
+        assert!(!format!("{:?}", store.shared.config).contains(expected));
     }
-    assert_eq!(
-        dsn_password("host=db user=u password='unterminated").as_deref(),
-        Some("unterminated"),
-        "malformed-input fallback still finds a password"
-    );
-    // A key that merely ENDS in "password" is a different option and must not be mistaken for it.
-    assert_eq!(dsn_password("host=db sslpassword=notit user=u"), None);
-
-    let raw = dsn_password("postgresql://u:p%40ss@host/db").unwrap();
-    let leak = "could not connect: postgresql://u:p%40ss@host/db (auth p@ss)".to_string();
-    let s = scrub(leak, Some(&raw));
-    assert!(
-        !s.contains("p%40ss") && !s.contains("p@ss") && s.contains("<redacted>"),
-        "both raw and decoded password forms must be scrubbed; got {s}"
-    );
-    assert_eq!(scrub("plain".into(), None), "plain");
-    assert_eq!(percent_decode("p%40ss"), "p@ss");
-    assert_eq!(percent_decode("bad%zz"), "bad%zz");
+    for dsn in ["postgres://host:5432/db?user=u", "host=db user=u"] {
+        let store = PostgresStore::new(dsn).unwrap();
+        assert_eq!(store.shared.config.redact("plain".into()), "plain");
+    }
+    for dsn in [
+        "host=db user=u password='unterminated",
+        "host=db sslpassword=hidden user=u",
+        "postgres://u:hidden@host/db?invalid=hidden",
+    ] {
+        let error = PostgresStore::new(dsn).err().expect("invalid DSN").0;
+        assert!(!error.contains("hidden") && !error.contains("password='unterminated"));
+    }
 }
 
 fn live_url() -> Option<String> {
@@ -959,29 +911,17 @@ fn metering_roundtrip_new_fields() {
 // only incidentally. Each test below pins one specific operator or bound.
 // ---------------------------------------------------------------------------------------------
 
-/// `percent_decode`'s length guard and hi/lo-nibble arithmetic, pinned with cases the existing
-/// `p%40ss`/`bad%zz` coverage doesn't reach: a `lo` of 0 (as in `%40`) makes `hi*16+lo` and
-/// `hi*16-lo` compute the same value, so a nonzero `lo` is needed to distinguish `+` from `-`; and
-/// neither existing case puts a bare `%` within 2 bytes of the end of the string, so the `i + 2 <
-/// len` guard's `+` was never distinguished from `*` (which, at `i=1` on a 3-byte string, would
-/// wrongly pass the guard and index one byte past the end).
+/// Password capture uses strict percent decoding before a public parser sees the DSN.
 #[test]
-fn percent_decode_edge_cases() {
+fn password_capture_percent_decoding_edge_cases() {
+    let store = PostgresStore::new("postgres://u:%41@host/db").unwrap();
     assert_eq!(
-        percent_decode("%41"),
-        "A",
-        "a nonzero low nibble must be added, not subtracted"
+        store.shared.config.redact("auth: A".into()),
+        "auth: <redacted>"
     );
-    assert_eq!(
-        percent_decode("a%1"),
-        "a%1",
-        "a '%' with only one trailing hex digit must be left completely literal, never panic"
-    );
-    assert_eq!(
-        percent_decode("abc%"),
-        "abc%",
-        "a trailing bare '%' with no hex digits must be left literal, never panic"
-    );
+    for password in ["a%1", "abc%", "%ff"] {
+        assert!(PostgresStore::new(&format!("postgres://u:{password}@host/db")).is_err());
+    }
 }
 
 /// `is_undefined_table` must discriminate the ONE SQLSTATE (`42P01`/undefined_table) it exists to
@@ -1493,7 +1433,7 @@ fn unique_suffix() -> String {
 }
 
 /// Split a `postgres://user:pass@host:port/db` URL into its `(userinfo, host:port, db)` parts.
-/// This crate's own test fixtures (and `dsn_password`'s own parsing) already assume this exact
+/// This crate's own live test fixtures already assume this exact
 /// shape, so no more general a parser is needed here.
 fn split_url(url: &str) -> (&str, &str, &str) {
     let rest = url.split("://").nth(1).expect("url must have a scheme");

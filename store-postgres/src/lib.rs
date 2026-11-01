@@ -78,139 +78,6 @@ fn is_undefined_table(e: &pgwire::Error) -> bool {
     e.code().map(pgwire::SqlState::code) == Some(pgwire::SqlState::UNDEFINED_TABLE)
 }
 
-/// Extract the PASSWORD from a Postgres DSN. Supports both the URL form
-/// (`postgres://user:pass@host:5432/db`) and the libpq keyword form (`... password=secret ...`), so
-/// a connect-error string can be scrubbed of the secret regardless of which shape the operator used.
-fn dsn_password(dsn: &str) -> Option<String> {
-    if let Some(rest) = dsn
-        .strip_prefix("postgresql://")
-        .or_else(|| dsn.strip_prefix("postgres://"))
-    {
-        let authority = rest.split(['/', '?']).next().unwrap_or(rest);
-        let mut secret = authority
-            .rsplit_once('@')
-            .and_then(|(userinfo, _)| userinfo.split_once(':'))
-            .map(|(_, password)| password.to_string());
-        // Query options follow userinfo in Config::parse and the last password wins, even empty.
-        // Only a URL has query parameters; '?' and '://' are ordinary keyword values.
-        if let Some((_, query)) = rest.split_once('?') {
-            for param in query.split('&') {
-                if let Some((key, value)) = param.split_once('=') {
-                    if percent_decode(key) == "password" {
-                        secret = Some(value.to_string());
-                    }
-                }
-            }
-        }
-        return secret.filter(|value| !value.is_empty());
-    }
-    // Reuse the wire parser for valid keyword grammar, including escaped quotes, backslashes and
-    // whitespace inside values. The fallback below still detects a secret in malformed input.
-    if let Ok(pairs) = pgwire::keywords(dsn) {
-        return pairs
-            .into_iter()
-            .rev()
-            .find(|(key, _)| key == "password")
-            .and_then(|(_, value)| (!value.is_empty()).then_some(value));
-    }
-    // The libpq KEYWORD form tolerates whitespace around `=` and single-quoted values, so collapse
-    // the whitespace first and match the key only at a token boundary (`sslpassword=` is another option).
-    let normalized = collapse_around_equals(dsn);
-    let mut search = normalized.as_str();
-    while let Some(at) = search.find("password=") {
-        let at_token_start = at == 0
-            || search[..at]
-                .chars()
-                .next_back()
-                .is_some_and(char::is_whitespace);
-        let rest = &search[at + "password=".len()..];
-        if at_token_start {
-            let value = match rest.strip_prefix('\'') {
-                Some(quoted) => quoted.split('\'').next().unwrap_or(""),
-                None => rest.split_whitespace().next().unwrap_or(""),
-            };
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-        search = rest;
-    }
-    None
-}
-
-/// Remove whitespace immediately before and after every `=`, so `key = value` and `key=value`
-/// scan identically. Only used by `dsn_password`.
-fn collapse_around_equals(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c.is_whitespace() {
-            let mut j = i;
-            while j < chars.len() && chars[j].is_whitespace() {
-                j += 1;
-            }
-            // Whitespace that only separates a key from its `=` is not a token boundary.
-            if !(j < chars.len() && chars[j] == '=') {
-                out.push(' ');
-            }
-            i = j;
-            continue;
-        }
-        if c == '=' {
-            out.push('=');
-            let mut j = i + 1;
-            while j < chars.len() && chars[j].is_whitespace() {
-                j += 1;
-            }
-            i = j;
-            continue;
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
-/// Percent-DECODE a URL component (`%40` -> `@`). A malformed escape is left verbatim. So the scrub
-/// redacts BOTH the raw and decoded forms of a URL-embedded password.
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Replace every occurrence of `secret` (in BOTH raw and percent-decoded forms) with `<redacted>`.
-fn scrub(msg: String, secret: Option<&str>) -> String {
-    let Some(s) = secret.filter(|s| !s.is_empty()) else {
-        return msg;
-    };
-    let mut out = msg;
-    if out.contains(s) {
-        out = out.replace(s, "<redacted>");
-    }
-    let decoded = percent_decode(s);
-    if decoded != s && !decoded.is_empty() && out.contains(&decoded) {
-        out = out.replace(&decoded, "<redacted>");
-    }
-    out
-}
-
 /// Store schema version. A database older than v6 is refused: no release ever wrote one. v6 -> v19
 /// upgrades in place:
 /// - v10: `keys` gains `idp_subject`/`binding_mode`/`minted_by`/`idp_provider`/
@@ -464,8 +331,6 @@ pub const KEPT_CONNECTIONS: usize = 8;
 pub(crate) struct Shared {
     /// The connection settings.
     pub(crate) config: pgwire::Config,
-    /// The DSN's password, scrubbed from every connect-error text.
-    pub(crate) secret: Option<String>,
     /// When this instance last swept `store_ops` past its retention (`v3`).
     pub(crate) ops_swept_at: AtomicU64,
     /// The instance's kept connections, bounded at [`KEPT_CONNECTIONS`] (there is no pool setting).
@@ -508,24 +373,29 @@ fn now_secs() -> u64 {
 }
 
 impl PostgresStore {
-    /// The store on the connection string `conn_str`: parsed here, connected by the connect step. A
-    /// string the driver refuses is refused in its words, scrubbed of the DSN password.
+    /// Capture a borrowed DSN's password before parsing public connection options. Authentication
+    /// and peer-error redaction use the sealed SDK credential; the store keeps no plaintext copy.
     pub fn new(conn_str: &str) -> RecordStoreResult<Self> {
-        // The password is the one the connection parser read; the independent scan below is only
-        // the guess for a string the parser refuses.
-        let config = pgwire::Config::parse(conn_str).map_err(|e| {
-            RecordStoreError(scrub(e.to_string(), dsn_password(conn_str).as_deref()))
-        })?;
-        let secret = config.password.clone();
-        Ok(Self {
+        let config =
+            pgwire::Config::parse(conn_str).map_err(|e| RecordStoreError(e.to_string()))?;
+        Ok(Self::configured(config))
+    }
+
+    fn captured(captured: busbar_contract::abi::sdk::cred::CredUrl) -> RecordStoreResult<Self> {
+        let config =
+            pgwire::Config::captured(captured).map_err(|e| RecordStoreError(e.to_string()))?;
+        Ok(Self::configured(config))
+    }
+
+    fn configured(config: pgwire::Config) -> Self {
+        Self {
             shared: std::sync::Arc::new(Shared {
                 config,
-                secret,
                 ops_swept_at: AtomicU64::new(0),
                 pool: busbar_contract::abi::sdk::store::wire::Pool::new(KEPT_CONNECTIONS),
                 endpoint: std::sync::atomic::AtomicUsize::new(0),
             }),
-        })
+        }
     }
 
     pub(crate) fn shared(&self) -> std::sync::Arc<Shared> {
@@ -545,7 +415,7 @@ impl Session {
             Ok(client) => Ok(Self { client, shared }),
             Err(e) => Err(format!(
                 "postgres store: failed to connect: {}",
-                scrub(render_pg_error(&e), shared.secret.as_deref())
+                shared.config.redact(render_pg_error(&e))
             )),
         }
     }

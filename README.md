@@ -194,18 +194,43 @@ thin `cdylib` adapter around it.
 | `url` | yes | — | A libpq connection string, URL (`postgres://user:pass@host:5432/busbar?sslmode=require`) or keyword form (`host=... user=... password=... dbname=...`). Connections go through busbar's connector. See the lists below. |
 
 The only setting is `url`; every refusal starts
-`invalid postgres plugin config: `. Any other top-level key is refused
-(`unknown setting`), a settings value that is not a JSON object is refused
+`invalid postgres plugin config: `. Any other top-level key is refused,
+a settings value that is not a JSON object is refused
 naming its type, a `url` that is not a string is refused naming the type it
 is, and a missing or `null` `url` is refused as required. A connection string
 the parser refuses is refused at `validate` as at `open`, as
 `invalid postgres plugin config: url: ...`; only the connect is left to `open`.
 A failed connect reads `postgres store: failed to connect: ...`.
 
+The SDK captures DSN passwords before the store parses connection options. The
+borrowed-string constructor remains available; the stored password is a sealed
+`Cred`, and cleartext, MD5 and SCRAM proof frames use `Wire::write_sealed`.
+`open_with_secrets` reads host markers with `settings_lent`, capturing the lent
+DSN before the host's loan ends. The store retains no plaintext password for
+reconnects or error scrubbing.
+
+The SDK's signed authentication floor allows SCRAM-SHA-256 and unauthenticated
+servers by default. An operator explicitly allowing a weaker method uses
+`require_auth=password`, `require_auth=md5`, or a comma-separated list. Lists
+may contain `password`, `md5`, `scram-sha-256`, `gss`, `sspi` and `none`, or
+consist entirely of negated names; GSS and SSPI remain unsupported. Explicit
+lists also govern whether a server may ask for no authentication.
+
+The PostgreSQL SDK recipe retains valid legacy iteration counts from 1 through
+100,000. Zero and leading-zero counts are now refused as malformed RFC 5802
+`posit-number` syntax; the former native parser accepted them and treated zero
+like one iteration. Password preparation uses RFC 4013's Unicode 3.2 profile,
+with the original bytes used when preparation fails or produces an empty
+password. This differs from the former native driver's modern Unicode
+normalization: for example, U+1D2C now falls back to its original bytes instead
+of normalizing to `A`, and a password consisting only of U+00AD retains its
+original bytes instead of becoming empty. These edge cases can change the
+SCRAM proof for passwords provisioned with the former normalization.
+
 **Connection-string options honoured:** `host`, `hostaddr`, `port` (a
 comma-separated list of several endpoints, tried in order), `user`,
 `password`, `dbname`, `application_name`, `options`, `target_session_attrs`
-(`any`, `read-write`, `read-only`), `channel_binding` (`disable` or `prefer`),
+(`any`, `read-write`, `read-only`), `require_auth`, `channel_binding` (`disable` or `prefer`),
 `sslmode` (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`;
 absent means `disable`) and `connect_timeout` (whole seconds; it bounds a new
 connection's dial and handshake and defaults to 30 when absent; `0` or less removes

@@ -3,9 +3,9 @@
 
 //! The Postgres frontend protocol over the host's connector: a small async client whose every byte
 //! goes through the op's one connection ([`Wire`], the store SDK's `wire`), so this store opens no
-//! socket of its own. The codec is `postgres-protocol` (the messages, SCRAM-SHA-256 and md5) and
-//! the value encodings are `postgres-types` (the same binary `ToSql`/`FromSql` the `postgres` crate
-//! uses).
+//! socket of its own. The codec is `postgres-protocol` (public messages); authentication uses
+//! the SDK credential recipes and sealed writes. The value encodings are `postgres-types`
+//! (the same binary `ToSql`/`FromSql` the `postgres` crate uses).
 //!
 //! The surface mirrors the `postgres` crate's (`Client`, `Transaction`, `Row`, `Error`) with every
 //! call `async`. A statement is prepared under a name the first time its connection runs its text
@@ -22,11 +22,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
-use postgres_protocol::authentication::sasl::{self, ChannelBinding, ScramSha256};
+use postgres_protocol::authentication::sasl;
 use postgres_protocol::message::backend::{DataRowBody, ErrorResponseBody, Message};
 use postgres_protocol::message::frontend;
 use postgres_types::{FromSql, Kind, ToSql, Type};
 
+use busbar_contract::abi::sdk::chip::pg_scram_nonce;
+use busbar_contract::abi::sdk::cred::{CredUrl, PgAuth, RequireAuth, Seal};
 use busbar_contract::abi::sdk::store::wire::Wire;
 
 /// Whether the connection is secured (libpq's `sslmode`). `disable` and `allow` connect in
@@ -72,7 +74,8 @@ pub struct Config {
     /// first fails tries each in turn.
     endpoints: Vec<Endpoint>,
     pub user: String,
-    pub password: Option<String>,
+    /// Public connection text and SDK-sealed passwords, including redaction aliases.
+    credentials: CredUrl,
     pub dbname: Option<String>,
     pub application_name: Option<String>,
     pub options: Option<String>,
@@ -136,6 +139,13 @@ impl Config {
     /// `keepalives=0`, a Unix-socket host (this store reaches its server over the host's connector,
     /// which dials TCP) or no user.
     pub fn parse(s: &str) -> Result<Self, Error> {
+        Self::captured(CredUrl::parse_postgres(s).map_err(config_err)?)
+    }
+
+    /// Parse only public connection text, after the SDK has captured every password spelling.
+    pub(crate) fn captured(captured: CredUrl) -> Result<Self, Error> {
+        let public = captured.parsed().map_err(config_err)?.to_owned();
+        let s = public.as_str();
         let mut pairs: Vec<(String, String)> = Vec::new();
         if let Some(rest) = s
             .strip_prefix("postgresql://")
@@ -154,13 +164,7 @@ impl Config {
                 None => (None, authority),
             };
             if let Some(u) = userinfo {
-                match u.split_once(':') {
-                    Some((user, pass)) => {
-                        pairs.push(("user".into(), decode(user)?));
-                        pairs.push(("password".into(), decode(pass)?));
-                    }
-                    None => pairs.push(("user".into(), decode(u)?)),
-                }
+                pairs.push(("user".into(), decode(u)?));
             }
             if !hostport.is_empty() {
                 // libpq's multi-host list, `host1:port1,host2:port2`, kept as its keyword form's
@@ -213,22 +217,11 @@ impl Config {
         } else {
             pairs = keywords(s)?;
         }
-        // Whether the string carries a password: an unknown option's key is then not named, since
-        // a password that split on a space or `=` leaves its tail as a "key" here.
-        // A malformed URL can split an intended user:password at '?'. Keep its resulting
-        // unknown option names private without confusing that hint with the effective password.
-        let possible_userinfo_secret = s
-            .strip_prefix("postgresql://")
-            .or_else(|| s.strip_prefix("postgres://"))
-            .and_then(|rest| rest.rsplit_once('@'))
-            .is_some_and(|(userinfo, _)| userinfo.contains(':'));
-        let has_password = possible_userinfo_secret
-            || crate::dsn_password(s).is_some()
-            || pairs.iter().any(|(k, _)| k == "password");
+        let has_password = captured.password().is_some();
         let mut c = Config {
             endpoints: Vec::new(),
             user: String::new(),
-            password: None,
+            credentials: captured,
             dbname: None,
             application_name: None,
             options: None,
@@ -250,7 +243,11 @@ impl Config {
                 "hostaddr" => hostaddrs = Some(v),
                 "port" => ports = v,
                 "user" => c.user = v,
-                "password" => c.password = Some(v),
+                // A password reaching this parser would violate the capture contract.
+                "password" => return Err(config_err("password was not captured")),
+                "require_auth" => {
+                    RequireAuth::parse(&v).map_err(config_err)?;
+                }
                 "dbname" => c.dbname = Some(v),
                 "application_name" => c.application_name = Some(v),
                 "options" => c.options = Some(v),
@@ -394,6 +391,12 @@ impl Config {
             return Err(config_err("user missing"));
         }
         Ok(c)
+    }
+
+    /// Scrub a peer's echoed password without exposing the sealed credential to the store.
+    pub(crate) fn redact(&self, text: String) -> String {
+        let text = zeroize::Zeroizing::new(text);
+        self.credentials.redact_echo(&text)
     }
 
     /// Every endpoint, in the order a connect tries them: `(name, dial host:port)`.
@@ -903,6 +906,72 @@ impl fmt::Debug for Client {
     }
 }
 
+fn auth_err(why: impl fmt::Display) -> Error {
+    Error::new(Kind_::Authentication(why.to_string()))
+}
+
+/// Keep postgres-protocol's ordered, extension-free server-first grammar and its 100,000
+/// iteration ceiling. Reject zero and leading zeroes as malformed RFC 5802 posit-number syntax.
+fn scram_server_first(bytes: &[u8]) -> Result<&str, Error> {
+    let bad = || auth_err("malformed SCRAM server-first message");
+    let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
+    let mut attrs = text.split(',');
+    let nonce = attrs
+        .next()
+        .and_then(|a| a.strip_prefix("r="))
+        .ok_or_else(bad)?;
+    let salt = attrs
+        .next()
+        .and_then(|a| a.strip_prefix("s="))
+        .ok_or_else(bad)?;
+    let iterations = attrs
+        .next()
+        .and_then(|a| a.strip_prefix("i="))
+        .ok_or_else(bad)?;
+    if attrs.next().is_some()
+        || !nonce
+            .bytes()
+            .all(|b| matches!(b, b'!'..=b'+' | b'-'..=b'~'))
+        || !salt.bytes().all(scram_base64)
+        || !iterations
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_digit() && *b != b'0')
+        || !iterations.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(bad());
+    }
+    let iterations: u32 = iterations.parse().map_err(|_| bad())?;
+    if iterations > 100_000 {
+        return Err(auth_err(
+            "SCRAM iteration count exceeds the maximum allowed",
+        ));
+    }
+    Ok(text)
+}
+
+fn scram_base64(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'/' | b'+' | b'=')
+}
+
+/// No ambiguous attributes: the server-final is one verifier or one refusal. Peer-provided
+/// refusal text is withheld because it may echo credential material.
+fn scram_server_final(bytes: &[u8]) -> Result<&str, Error> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| auth_err("malformed SCRAM server-final message"))?;
+    if let Some(error) = text.strip_prefix("e=") {
+        if !error.contains(['\0', '=', ',']) {
+            return Err(auth_err("the server refused SCRAM authentication"));
+        }
+    } else if text
+        .strip_prefix("v=")
+        .is_some_and(|v| v.bytes().all(scram_base64))
+    {
+        return Ok(text);
+    }
+    Err(auth_err("malformed SCRAM server-final message"))
+}
+
 /// A parameter.
 pub type Param<'a> = &'a (dyn ToSql + Sync);
 
@@ -1082,28 +1151,32 @@ impl Client {
         frontend::startup_message(params.iter().copied(), &mut out).map_err(parse_err)?;
         self.send(&out).await?;
         let password = || {
-            cfg.password
-                .as_deref()
-                .map(str::as_bytes)
-                .ok_or_else(|| Error::new(Kind_::Config("password missing".to_string())))
+            cfg.credentials
+                .password()
+                .ok_or_else(|| config_err("password missing"))
         };
+        let mut authenticated = false;
         loop {
             match self.read().await? {
-                Message::AuthenticationOk => break,
+                Message::AuthenticationOk => {
+                    if !authenticated && !cfg.credentials.floor().pg().allows(PgAuth::None) {
+                        return Err(auth_err(
+                            "require_auth does not allow authentication method none",
+                        ));
+                    }
+                    break;
+                }
                 Message::AuthenticationCleartextPassword => {
-                    let mut out = BytesMut::new();
-                    frontend::password_message(password()?, &mut out).map_err(parse_err)?;
-                    self.send(&out).await?;
+                    let message = password()?.pg_password_message().map_err(auth_err)?;
+                    self.send_sealed(message).await?;
+                    authenticated = true;
                 }
                 Message::AuthenticationMd5Password(b) => {
-                    let hash = postgres_protocol::authentication::md5_hash(
-                        cfg.user.as_bytes(),
-                        password()?,
-                        b.salt(),
-                    );
-                    let mut out = BytesMut::new();
-                    frontend::password_message(hash.as_bytes(), &mut out).map_err(parse_err)?;
-                    self.send(&out).await?;
+                    let message = password()?
+                        .pg_md5_message(&cfg.user, b.salt())
+                        .map_err(auth_err)?;
+                    self.send_sealed(message).await?;
+                    authenticated = true;
                 }
                 Message::AuthenticationSasl(b) => {
                     let mut scram = false;
@@ -1112,28 +1185,40 @@ impl Client {
                         scram |= m == sasl::SCRAM_SHA_256;
                     }
                     if !scram {
-                        return Err(Error::new(Kind_::Authentication(
-                            "unsupported SASL mechanism".to_string(),
-                        )));
+                        return Err(auth_err("unsupported SASL mechanism"));
                     }
-                    let mut s = ScramSha256::new(password()?, ChannelBinding::unsupported());
+                    let password = password()?;
+                    if !password.floor().pg().allows(PgAuth::ScramSha256) {
+                        return Err(auth_err("require_auth does not allow SCRAM-SHA-256"));
+                    }
+                    // The nonce and the empty SCRAM username are public, as in postgres-protocol.
+                    // Channel binding stays unsupported (GS2 n,,), including when PLUS is offered.
+                    let first_bare = format!("n=,r={}", pg_scram_nonce().map_err(auth_err)?);
+                    let first = format!("n,,{first_bare}");
                     let mut out = BytesMut::new();
-                    frontend::sasl_initial_response(sasl::SCRAM_SHA_256, s.message(), &mut out)
-                        .map_err(parse_err)?;
+                    frontend::sasl_initial_response(
+                        sasl::SCRAM_SHA_256,
+                        first.as_bytes(),
+                        &mut out,
+                    )
+                    .map_err(parse_err)?;
                     self.send(&out).await?;
                     let Message::AuthenticationSaslContinue(cont) = self.read_auth().await? else {
                         return Err(parse_err("unexpected message during SASL"));
                     };
-                    s.update(cont.data())
-                        .map_err(|e| Error::new(Kind_::Authentication(e.to_string())))?;
-                    let mut out = BytesMut::new();
-                    frontend::sasl_response(s.message(), &mut out).map_err(parse_err)?;
-                    self.send(&out).await?;
+                    let server_first = scram_server_first(cont.data())?;
+                    let (message, link) = password
+                        .pg_scram_sha256_postgres(&first_bare, server_first, b"n,,")
+                        .map_err(auth_err)?;
+                    self.send_sealed(message).await?;
                     let Message::AuthenticationSaslFinal(fin) = self.read_auth().await? else {
                         return Err(parse_err("unexpected message during SASL"));
                     };
-                    s.finish(fin.data())
-                        .map_err(|e| Error::new(Kind_::Authentication(e.to_string())))?;
+                    let server_final = scram_server_final(fin.data())?;
+                    if !link.verify(server_final) {
+                        return Err(auth_err("SCRAM verification error"));
+                    }
+                    authenticated = true;
                 }
                 Message::ErrorResponse(e) => return Err(Error::new(Kind_::Db(DbError::parse(&e)))),
                 Message::NoticeResponse(_) => {}
@@ -1188,6 +1273,16 @@ impl Client {
         self.at_ready = false;
         self.wire
             .write_all(bytes)
+            .await
+            .map_err(|e| Error::new(Kind_::Io(e.to_string())))
+    }
+
+    /// A whole credential-bearing frame stays inside the SDK through partial writes and Pending.
+    /// Mark the connection busy before awaiting so cancellation cannot return it to the pool.
+    async fn send_sealed(&mut self, message: Seal) -> Result<(), Error> {
+        self.at_ready = false;
+        self.wire
+            .write_sealed(message)
             .await
             .map_err(|e| Error::new(Kind_::Io(e.to_string())))
     }
