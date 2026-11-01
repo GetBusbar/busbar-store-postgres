@@ -309,6 +309,7 @@ fn a_config_error_never_echoes_a_password_tail() {
     for dsn in [
         "host=db user=u password=pa zq9tail",
         "postgres://u:pa?zq9tail@h/db",
+        "postgres://u:pa?zq9tail=value@h/db",
         "u:zq9tail@h/db",
         "host=db user=u password='pa zq9tail' zq9tail",
     ] {
@@ -447,4 +448,82 @@ fn prepared_statements_drop_the_least_recently_run_past_the_bound() {
     assert!(!super::is_stale_statement(&super::Error::server(
         "42P01", "no table"
     )));
+}
+
+#[test]
+fn text_after_a_bracketed_ipv6_host_is_not_silently_discarded() {
+    for suffix in ["garbage", ":5432trailer"] {
+        let url = format!("postgres://user:hidden@[::1]{suffix}/db");
+        let error = Config::parse(&url)
+            .err()
+            .expect("malformed host/port tail must be refused")
+            .to_string();
+        assert!(!error.contains("hidden"));
+    }
+    assert!(Config::parse("postgres://user@[::1]:5432/db").is_ok());
+    assert!(Config::parse("postgres://user@[::1]/db").is_ok());
+}
+
+#[test]
+fn nul_bytes_in_postgres_startup_fields_are_refused_during_parse() {
+    for option in ["user", "dbname", "application_name", "options"] {
+        let url = format!("postgres://user:hidden@host/db?{option}=before%00after");
+        let error = Config::parse(&url)
+            .err()
+            .expect("startup strings cannot encode NUL")
+            .to_string();
+        assert!(error.contains(option), "{error}");
+        assert!(!error.contains("before") && !error.contains("after") && !error.contains("hidden"));
+    }
+    let error = Config::parse("host=host user='before\0after'")
+        .err()
+        .expect("keyword startup strings also refuse NUL")
+        .to_string();
+    assert!(error.contains("user"));
+}
+
+#[test]
+fn active_password_extraction_matches_the_parser_last_wins_semantics() {
+    for (dsn, raw, decoded) in [
+        (
+            "postgres://u:first@host/db?password=second",
+            Some("second"),
+            "second",
+        ),
+        (
+            "postgres://u:first@host/db?password=second&password=third",
+            Some("third"),
+            "third",
+        ),
+        (
+            "postgres://u:first@host/db?%70assword=second%40value",
+            Some("second%40value"),
+            "second@value",
+        ),
+        (
+            "postgres://u:first@host/db?password=second&password=",
+            None,
+            "",
+        ),
+        (
+            "host=db user=u password=first password=second",
+            Some("second"),
+            "second",
+        ),
+        ("host=db user=u password=first password=", None, ""),
+    ] {
+        let config = Config::parse(dsn).unwrap();
+        assert_eq!(config.password.as_deref(), Some(decoded), "{dsn}");
+        let extracted = crate::dsn_password(dsn);
+        assert_eq!(extracted.as_deref(), raw, "{dsn}");
+        assert_eq!(
+            crate::scrub(format!("auth: {decoded}"), extracted.as_deref()),
+            if decoded.is_empty() {
+                "auth: "
+            } else {
+                "auth: <redacted>"
+            },
+            "the actual effective password is scrubbed"
+        );
+    }
 }

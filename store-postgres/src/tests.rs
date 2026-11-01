@@ -13,6 +13,15 @@ use busbar_contract::records::{
 
 mod harness;
 
+#[path = "tests/usage_transactions.rs"]
+mod usage_transactions;
+
+#[path = "tests/usage_keys.rs"]
+mod usage_keys;
+
+#[path = "tests/migration_parent_presence.rs"]
+mod migration_parent_presence;
+
 pub(crate) use harness::TestStore;
 
 /// The verify path's read, which is no longer a store op: a credential's secret by `(kind,
@@ -143,6 +152,49 @@ fn dsn_password_extraction_and_scrub() {
         dsn_password("postgres://user@host:5432/db?connect_timeout=10&password=after").as_deref(),
         Some("after"),
         "password must be found among other query parameters"
+    );
+    assert_eq!(
+        dsn_password("postgres://u:secret@host/db?options=label@other").as_deref(),
+        Some("secret"),
+        "an at-sign after the authority is not a userinfo delimiter"
+    );
+    for (dsn, expected) in [
+        (
+            r"host=db user=u password='quote\' and\\slash'",
+            "quote' and\\slash",
+        ),
+        (r"host=db user=u password=escaped\ space", "escaped space"),
+        ("host=db user=u password='two  spaces'", "two  spaces"),
+    ] {
+        let actual = dsn_password(dsn);
+        assert_eq!(actual.as_deref(), Some(expected));
+        assert_eq!(
+            scrub(format!("auth: {expected}"), actual.as_deref()),
+            "auth: <redacted>"
+        );
+    }
+    for (dsn, expected) in [
+        (
+            "host=db user=u password='before?password=after'",
+            "before?password=after",
+        ),
+        (
+            "host=db user=u password='before://u:wrong@host'",
+            "before://u:wrong@host",
+        ),
+    ] {
+        assert!(pgwire::Config::parse(dsn).is_ok(), "valid keyword DSN");
+        let actual = dsn_password(dsn);
+        assert_eq!(actual.as_deref(), Some(expected));
+        assert_eq!(
+            scrub(format!("auth: {expected}"), actual.as_deref()),
+            "auth: <redacted>"
+        );
+    }
+    assert_eq!(
+        dsn_password("host=db user=u password='unterminated").as_deref(),
+        Some("unterminated"),
+        "malformed-input fallback still finds a password"
     );
     // A key that merely ENDS in "password" is a different option and must not be mistaken for it.
     assert_eq!(dsn_password("host=db sslpassword=notit user=u"), None);
@@ -803,13 +855,24 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
 #[test]
 fn get_usage_never_returns_a_torn_snapshot_under_a_concurrent_writer() {
     let Some(url) = live_url() else { return };
+    let db = TempDb::create(&url, "spg_torn_usage");
+    let url = db.url();
     let reader = connect_store_with_retry(&url).expect("connect");
     let writer = connect_store_with_retry(&url).expect("connect");
     let bucket = format!("vk_torn_{}", unique_suffix());
     let ws = 20_270_301u64;
     let done = std::sync::atomic::AtomicBool::new(false);
+    // Signal completion on both success and panic, so the reader can reach join and preserve
+    // the writer's panic. The disposable database also cleans up a failing reader assertion.
+    struct Finished<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for Finished<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
     let reads = std::thread::scope(|s| {
         let w = s.spawn(|| {
+            let _finished = Finished(&done);
             for i in 0..400 {
                 writer
                     .add_usage(
@@ -823,7 +886,6 @@ fn get_usage_never_returns_a_torn_snapshot_under_a_concurrent_writer() {
                     )
                     .unwrap();
             }
-            done.store(true, std::sync::atomic::Ordering::SeqCst);
         });
         let mut reads = 0;
         while !done.load(std::sync::atomic::Ordering::SeqCst) {
@@ -837,7 +899,8 @@ fn get_usage_never_returns_a_torn_snapshot_under_a_concurrent_writer() {
             );
             reads += 1;
         }
-        w.join().unwrap();
+        w.join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         reads
     });
     assert!(reads > 0);
@@ -2478,11 +2541,8 @@ fn legacy_revoked_secrets_are_scrubbed_on_upgrade_and_on_repeated_revoke() {
         if upgrade {
             let mut conn = store.lock();
             conn.execute("DELETE FROM busbar_schema", &[]).unwrap();
-            conn.execute(
-                "INSERT INTO busbar_schema(version) VALUES ($1)",
-                &[&(SCHEMA_VERSION - 1)],
-            )
-            .unwrap();
+            conn.execute("INSERT INTO busbar_schema(version) VALUES ($1)", &[&14_i64])
+                .unwrap();
         }
         drop(store);
         let store = TestStore::open(&tmp.url()).unwrap();
@@ -2537,3 +2597,6 @@ fn legacy_revoked_secrets_are_scrubbed_on_upgrade_and_on_repeated_revoke() {
         );
     }
 }
+
+mod metering_attribution;
+mod token_clock;

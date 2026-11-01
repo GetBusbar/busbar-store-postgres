@@ -753,8 +753,8 @@ fn a_mint_racing_a_delete_never_leaves_a_credential_under_the_tombstone() {
 // MIGRATION CONFORMANCE (busbar 1.6.0 #33 / M5): rows the PUBLISHED 1.5.5 binary wrote through the
 // published store-postgres v1.0.6 plugin read back through this build's `migrate`. The fixture in
 // `tests/fixtures/1.5.5/` was RECORDED by busbar's `scripts/store-migration-fixture.sh` driving the
-// v1.5.5 binary and the v1.0.6 plugin against postgres:16@sha256:95206741..., the binary, plugin
-// and image digests and every file's sha256 are in its `MANIFEST.tsv`. `dump.sql` is the whole
+// v1.5.5 binary and the v1.0.6 plugin against PostgreSQL 16. The manifest records the binary,
+// plugin and fixture-file hashes, not an image digest. `dump.sql` is the whole
 // database as 1.5.5 left it (plain SQL), `rows.json` every table's rows as written.
 const FIXTURE_DUMP_1_5_5: &str = include_str!("../../tests/fixtures/1.5.5/dump.sql");
 const FIXTURE_ROWS_1_5_5: &str = include_str!("../../tests/fixtures/1.5.5/rows.json");
@@ -805,8 +805,92 @@ fn reserved_units(row: &serde_json::Value) -> BTreeMap<String, u64> {
     m
 }
 
+/// Recorded admin counts must survive independently of the raw-row comparison below.
+fn assert_recorded_1_5_5_admin_counts(store: &TestStore) {
+    let usage: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/1.5.5/readback/usage.json"
+    ))
+    .unwrap();
+    let metering = store
+        .list_metering(usage["window"]["start"].as_u64().unwrap())
+        .unwrap();
+    for expected in usage["by_key"].as_array().unwrap() {
+        let rows: Vec<_> = metering
+            .iter()
+            .filter(|row| row.key_id == expected["id"].as_str().unwrap())
+            .collect();
+        let actual = [
+            rows.iter().map(|row| row.requests).sum::<u64>(),
+            rows.iter().map(|row| row.tokens_input).sum(),
+            rows.iter().map(|row| row.tokens_output).sum(),
+            rows.iter().map(|row| row.tokens_cache_read).sum(),
+            rows.iter().map(|row| row.tokens_cache_write).sum(),
+        ];
+        let expected = [
+            "requests",
+            "tokens_input",
+            "tokens_output",
+            "tokens_cache_read",
+            "tokens_cache_creation",
+        ]
+        .map(|field| expected[field].as_u64().unwrap());
+        assert_eq!(
+            actual, expected,
+            "migrated metering preserves the recorded fleet usage counts"
+        );
+    }
+    for text in [
+        include_str!("../../tests/fixtures/1.5.5/readback/key-fixture-grouped.json"),
+        include_str!("../../tests/fixtures/1.5.5/readback/key-fixture-ungrouped.json"),
+    ] {
+        let expected: serde_json::Value = serde_json::from_str(text).unwrap();
+        let id = expected["id"].as_str().unwrap();
+        let got = store
+            .get_usage(id, expected["window_start"].as_u64().unwrap())
+            .unwrap();
+        assert_eq!(got.requests, expected["requests"].as_u64().unwrap(), "preserve the independently recorded key-window count, including historical differences from metering");
+        let tokens: u64 = got
+            .models
+            .iter()
+            .map(|model| {
+                [
+                    "tokens_input",
+                    "tokens_output",
+                    "tokens_cache_read",
+                    "tokens_cache_write",
+                ]
+                .iter()
+                .map(|unit| model.usage_units.get(*unit).copied().unwrap_or(0))
+                .sum::<u64>()
+            })
+            .sum();
+        assert_eq!(tokens, expected["tokens"].as_u64().unwrap());
+    }
+}
+
 /// Every row of `rows.json` read back through the 1.6.0 surface, and no extra rows.
 fn assert_1_5_5_rows_read_back(store: &TestStore) {
+    assert_recorded_1_5_5_admin_counts(store);
+    assert!(
+        store.list_credentials_since(0).unwrap().is_empty(),
+        "migration must not invent credentials absent from this recording"
+    );
+    assert!(
+        store.list_denylist().unwrap().is_empty(),
+        "migration must not invent denylist rows absent from this recording"
+    );
+    let expected_revision = fixture_rows("store_revision")[0]["revision"]
+        .as_u64()
+        .unwrap();
+    let actual_revision: i64 = store
+        .lock()
+        .query_one("SELECT revision FROM store_revision WHERE only_row", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        actual_revision as u64, expected_revision,
+        "migration preserves the recorded global revision"
+    );
     // METERING: every row, per bucket, and nothing else.
     let metering = fixture_rows("usage_metering");
     assert!(!metering.is_empty(), "the fixture carries metering rows");

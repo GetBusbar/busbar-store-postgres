@@ -649,17 +649,14 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
 
     let path = plugin_path();
-    let Some(url) = postgres_url() else {
+    let Some(admin_url) = postgres_url() else {
         return;
     };
-    let cfg = cfg(&url);
-
-    // Start from no TERMINAL tasks. The task purge is GLOBAL and terminal-only, and its count is
-    // asserted exactly below, so a leftover terminal row from an earlier run would make that
-    // assertion meaningless. The store's own contract-level sweep of exactly that population.
-    let direct = common::linked(&cfg).expect("connect directly to clean up and verify");
-    RecordStore::purge_plane_records_before(&direct, "task", i64::MAX as u64)
-        .expect("wipe terminal tasks before this run");
+    // Retention is global per kind: every load and the linked witness use this private database,
+    // so exact sweep/cascade counts cannot delete another test's active or terminal tasks.
+    let db = TempDb::create(&admin_url, "spg_task_durability");
+    let cfg = cfg(&db.url());
+    let direct = common::linked(&cfg).expect("connect directly to verify");
 
     let stamp = format!(
         "{}_{}",
@@ -712,7 +709,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let interrupted = task(
         &t_live,
         "input-required",
-        BASE_TS + 200,
+        BASE_TS + 20,
         9,
         PlaneDisposition::Active,
     );
@@ -872,15 +869,23 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         task(
             &t_live,
             "canceled",
-            BASE_TS + 200,
+            BASE_TS + 20,
             9,
             PlaneDisposition::Terminal,
         )
         .view(),
     )
     .expect("clean up this run's task");
-    RecordStore::purge_plane_records_before(&direct, "task", i64::MAX as u64)
-        .expect("clean up this run's rows");
+    assert_eq!(
+        RecordStore::purge_plane_records_before(&direct, "task", i64::MAX as u64)
+            .expect("clean up this run's rows"),
+        1,
+        "exactly the surviving task is swept"
+    );
+    assert!(
+        events(&direct, &t_live).is_empty(),
+        "the remaining chain is cascaded too"
+    );
 }
 
 /// THE DURABILITY PROOF FOR THE TRUST STATE — the `demotion` kind and the single-use `ask` token
