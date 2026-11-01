@@ -16,13 +16,26 @@ struct Gate {
     held: Option<(InstanceId, ConnId, u64)>,
     lost: bool,
 }
-struct WithheldCommit {
+pub(in crate::tests) struct WithheldCommit {
     tcp: TcpConns,
     wake: ConnWake,
     gate: Mutex<Gate>,
 }
 impl WithheldCommit {
-    fn lose_reply(&self) {
+    pub(in crate::tests) fn new(wake: ConnWake) -> Self {
+        Self {
+            tcp: TcpConns::new(wake.clone()),
+            wake,
+            gate: Mutex::new(Gate::default()),
+        }
+    }
+    pub(in crate::tests) fn arm(&self) {
+        self.gate.lock().unwrap().armed = true;
+    }
+    pub(in crate::tests) fn is_held(&self) -> bool {
+        self.gate.lock().unwrap().held.is_some()
+    }
+    pub(in crate::tests) fn lose_reply(&self) {
         let held = {
             let mut gate = self
                 .gate

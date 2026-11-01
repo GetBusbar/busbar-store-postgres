@@ -14,7 +14,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 #[path = "conditional_records_faults.rs"]
-mod faults;
+pub(super) mod faults;
 
 const SCHEMA: &str = "conditional-test";
 

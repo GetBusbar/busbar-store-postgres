@@ -25,6 +25,9 @@ mod usage_transactions;
 #[path = "tests/usage_keys.rs"]
 mod usage_keys;
 
+#[path = "tests/usage_correction.rs"]
+mod usage_correction;
+
 #[path = "tests/conditional_records.rs"]
 mod conditional_records;
 
@@ -1137,7 +1140,7 @@ fn put_usage_and_add_usage_batch_multiple_models_correctly() {
     assert_eq!(models2[1].tier(UNIT_OUTPUT), 11);
 }
 
-/// A BIGINT accrual pins at `i64::MAX` (rule 8): an upstream's huge count never fails the batch.
+/// Raw usage pins at u64::MAX without narrowing corrected counters back through BIGINT.
 #[test]
 fn usage_accruals_pin_at_the_column_maximum() {
     let Some(url) = live_url() else { return };
@@ -1154,12 +1157,13 @@ fn usage_accruals_pin_at_the_column_maximum() {
     };
     store.add_usage(&bucket, ws, &delta).unwrap();
     store.add_usage(&bucket, ws, &delta).unwrap();
+    store.add_usage(&bucket, ws, &delta).unwrap();
     let got = store.get_usage(&bucket, ws).unwrap();
-    assert_eq!(got.requests, max as u64);
-    assert_eq!(got.billable_requests, max as u64);
-    assert_eq!(got.models[0].tier(UNIT_INPUT), max as u64);
-    assert_eq!(got.models[0].tier(UNIT_CACHE_WRITE), max as u64);
-    assert_eq!(got.models[0].tier("audio_s"), max as u64);
+    assert_eq!(got.requests, u64::MAX);
+    assert_eq!(got.billable_requests, u64::MAX);
+    assert_eq!(got.models[0].tier(UNIT_INPUT), u64::MAX);
+    assert_eq!(got.models[0].tier(UNIT_CACHE_WRITE), u64::MAX);
+    assert_eq!(got.models[0].tier("audio_s"), u64::MAX);
     // A refund still lands off the pin.
     let mut refund = mtd("m", -1, 0, 0, 0);
     refund.usage_units.insert("audio_s".into(), -1);
@@ -1175,9 +1179,9 @@ fn usage_accruals_pin_at_the_column_maximum() {
         )
         .unwrap();
     let got = store.get_usage(&bucket, ws).unwrap();
-    assert_eq!(got.requests, max as u64 - 1);
-    assert_eq!(got.models[0].tier(UNIT_INPUT), max as u64 - 1);
-    assert_eq!(got.models[0].tier("audio_s"), max as u64 - 1);
+    assert_eq!(got.requests, u64::MAX - 1);
+    assert_eq!(got.models[0].tier(UNIT_INPUT), u64::MAX - 1);
+    assert_eq!(got.models[0].tier("audio_s"), u64::MAX - 1);
 }
 
 /// The metering twin of the usage pin above.

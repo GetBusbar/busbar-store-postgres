@@ -104,10 +104,21 @@ for the explicitly listed pre-release table removal and revoked-secret erasure:
   size range. The migration copies the attribution recorded on
   each legacy parent, preserving empty unknown values. Orphan units refuse migration;
   already-collapsed historical attribution cannot be reconstructed from these rows.
+- Schema v19 stores raw usage request and unit counters as `NUMERIC(20,0)` and
+  reads and writes their complete `u64` domain. Signed accruals and refunds saturate
+  at the `u64` bounds, matching `UsageLedger::apply_delta`; previously saturated
+  counts retain their existing values. Metering counters retain their existing
+  rules. Atomic usage corrections compare the live key, the full key/day metering
+  selection and every affected canonical usage row under the same first revision
+  lock as ordinary usage, metering, purge and key writers. All replacements and
+  the operation receipt commit together. A condition conflict writes nothing;
+  an unknown commit outcome requires replaying the exact operation id and body.
+  Fresh unconditional writes to reserved usage adjustment buckets are refused;
+  already-applied legacy receipts remain replayable.
 
-Drain and stop older store processes before the v18 upgrade, then reopen every
+Drain and stop older store processes before the v19 upgrade, then reopen every
 node with this build. Builds with the newer-schema check, including v16, refuse
-a v18 database at open, but that check cannot fence an already-open process.
+a v19 database at open, but that check cannot fence an already-open process.
 The published v1.0.6 plugin used by busbar 1.5.5 has no newer-schema check.
 Do not reconnect older binaries to the upgraded database or run mixed-version
 store writers. Rollback requires a pre-upgrade backup and the corresponding

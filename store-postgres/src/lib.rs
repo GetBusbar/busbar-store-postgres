@@ -211,7 +211,7 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
     out
 }
 
-/// Store schema version. A database older than v6 is refused: no release ever wrote one. v6 -> v17
+/// Store schema version. A database older than v6 is refused: no release ever wrote one. v6 -> v19
 /// upgrades in place:
 /// - v10: `keys` gains `idp_subject`/`binding_mode`/`minted_by`/`idp_provider`/
 ///   `allowed_scopes_by_kind`; open usage units get `usage_ledger_units` and `usage_metering_units`;
@@ -225,8 +225,9 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 /// - v17: usage-window and metering-bucket keys retain their complete u64 bit pattern.
 
 /// - v18: metering parent and unit keys retain historical group and pricing version.
+/// - v19: raw usage counters retain the complete unsigned domain for exact corrections.
 
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 19;
 
 // Built-in ticket records store an absolute expiry in ts.
 const TICKET_RECORD_KIND: &str = "ticket";
@@ -815,6 +816,21 @@ impl Session {
                     ON usage_metering (key_id,bucket,model,provider,priced_from_ms);"
             ).await.store()?;
         }
+        if version < SCHEMA_VERSION {
+            tx.batch_execute(
+                "ALTER TABLE usage_windows
+                    ALTER COLUMN requests TYPE NUMERIC(20,0),
+                    ALTER COLUMN billable_requests TYPE NUMERIC(20,0);
+                 ALTER TABLE usage_ledger
+                    ALTER COLUMN tokens_input TYPE NUMERIC(20,0),
+                    ALTER COLUMN tokens_output TYPE NUMERIC(20,0),
+                    ALTER COLUMN tokens_cache_read TYPE NUMERIC(20,0),
+                    ALTER COLUMN tokens_cache_write TYPE NUMERIC(20,0);
+                 ALTER TABLE usage_ledger_units ALTER COLUMN count TYPE NUMERIC(20,0);",
+            )
+            .await
+            .store()?;
+        }
         tx.execute(
             "INSERT INTO busbar_schema (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
             &[&SCHEMA_VERSION],
@@ -889,6 +905,24 @@ fn sat_add(a: &str, b: &str, floor: bool) -> String {
     } else {
         format!("({sum})::bigint")
     }
+}
+
+/// Raw usage has an exact unsigned domain; numeric arithmetic must never narrow through BIGINT.
+fn usage_add(a: &str, b: &str) -> String {
+    format!(
+        "GREATEST(0, LEAST({}, ({a})::numeric + ({b})::numeric))",
+        u64::MAX
+    )
+}
+
+fn usage_count(row: &Row, column: usize) -> RecordStoreResult<u64> {
+    let text: String = row.try_get(column).store()?;
+    // Preserve the legacy treatment of a hand-edited negative counter as zero.
+    if text.starts_with('-') {
+        return Ok(0);
+    }
+    text.parse()
+        .map_err(|_| RecordStoreError("invalid unsigned usage counter".into()))
 }
 
 // Equality keys keep all bits; range comparisons must compare the sign partitions unsigned.
@@ -1073,6 +1107,7 @@ impl Session {
         // closes the gap between them itself (see `list_credentials_since`).
         let client = self.client();
         let mut tx = client.transaction().await.store()?;
+        Self::lock_revision(&mut tx).await?;
         let already_deleted: Option<bool> = tx
             .query_opt(
                 "SELECT deleted_at IS NOT NULL FROM keys WHERE id=$1",
@@ -1103,9 +1138,7 @@ impl Session {
         tx.execute("DELETE FROM credentials WHERE key_id=$1", &[&id])
             .await
             .store()?;
-        // `AND deleted_at IS NULL` restates the guard in the UPDATE's own WHERE: under READ COMMITTED
-        // the UPDATE re-checks it after taking the row lock, so two concurrent deletes serialize
-        // (the loser matches 0 rows) instead of both overwriting `deleted_at`/`revision`.
+        // Keep the tombstone precondition on the statement as well as the revision-locked read.
         tx.execute(
             "UPDATE keys SET enabled=FALSE, deleted_at=$2, revision=$3 \
                  WHERE id=$1 AND deleted_at IS NULL",
@@ -1113,8 +1146,6 @@ impl Session {
         )
         .await
         .store()?;
-        // A concurrent delete_key committed between our SELECT and this UPDATE: idempotent no-op,
-        // same as the `Some(true)` branch above -- not an error.
         tx.commit().await.store()?;
         Ok(())
     }
@@ -1124,27 +1155,34 @@ impl Session {
         bucket_id: &str,
         window_start: u64,
     ) -> RecordStoreResult<UsageLedger> {
-        let ws = usage_key(window_start);
         let client = self.client();
         let mut tx = Self::snapshot_consistent_tx(client).await?;
+        let ledger = Self::get_usage_in(&mut tx, bucket_id, window_start).await?;
+        tx.commit().await.store()?;
+        Ok(ledger)
+    }
+
+    async fn get_usage_in(
+        tx: &mut Transaction<'_>,
+        bucket_id: &str,
+        window_start: u64,
+    ) -> RecordStoreResult<UsageLedger> {
+        let ws = usage_key(window_start);
         let (requests, billable_requests): (u64, u64) = match tx
             .query_opt(
-                "SELECT requests, billable_requests
+                "SELECT requests::text, billable_requests::text
                  FROM usage_windows WHERE bucket_id=$1 AND window_start=$2",
                 &[&bucket_id, &ws],
             )
             .await
             .store()?
         {
-            Some(r) => (
-                read_u64(r.try_get::<_, i64>(0).store()?),
-                read_u64(r.try_get::<_, i64>(1).store()?),
-            ),
+            Some(r) => (usage_count(&r, 0)?, usage_count(&r, 1)?),
             None => (0, 0),
         };
         let rows = tx
             .query(
-                "SELECT model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write
+                "SELECT model, tokens_input::text, tokens_output::text, tokens_cache_read::text, tokens_cache_write::text
                  FROM usage_ledger WHERE bucket_id=$1 AND window_start=$2 ORDER BY model",
                 &[&bucket_id, &ws],
             )
@@ -1152,13 +1190,12 @@ impl Session {
             .store()?;
         let unit_rows = tx
             .query(
-                "SELECT model, unit, count FROM usage_ledger_units
+                "SELECT model, unit, count::text FROM usage_ledger_units
                  WHERE bucket_id=$1 AND window_start=$2 ORDER BY model, unit",
                 &[&bucket_id, &ws],
             )
             .await
             .store()?;
-        tx.commit().await.store()?;
         // One ModelTokens per model, in model order. The four reserved classes come off their
         // columns and every open class off `usage_ledger_units`, all into the one name-keyed map.
         // Zero counts are left out, so the map stays sparse the way busbar's own ledger keeps it.
@@ -1168,14 +1205,14 @@ impl Session {
                 .entry(r.try_get::<_, String>(0).store()?)
                 .or_default();
             for (i, unit) in RESERVED_COLUMNS.iter().enumerate() {
-                let v = read_u64(r.try_get::<_, i64>(i + 1).store()?);
+                let v = usage_count(r, i + 1)?;
                 if v != 0 {
                     units.insert(unit.to_string(), v);
                 }
             }
         }
         for r in &unit_rows {
-            let v = read_u64(r.try_get::<_, i64>(2).store()?);
+            let v = usage_count(r, 2)?;
             let units = models
                 .entry(r.try_get::<_, String>(0).store()?)
                 .or_default();
@@ -1199,6 +1236,7 @@ impl Session {
         }
         let cutoff = usage_key(before);
         let mut tx = self.client().transaction().await.store()?;
+        Self::lock_revision(&mut tx).await?;
         tx.batch_execute(
             "LOCK TABLE usage_windows, usage_ledger, usage_ledger_units \
              IN SHARE ROW EXCLUSIVE MODE",
@@ -1240,14 +1278,20 @@ impl Session {
         window_start: u64,
         ledger: &UsageLedger,
     ) -> RecordStoreResult<()> {
+        if busbar_contract::abi::sdk::store::correction::reserved_bucket(bucket_id) {
+            return Err(RecordStoreError(
+                "reserved usage adjustment requires atomic correction".into(),
+            ));
+        }
         let ws = usage_key(window_start);
-        let rq = clamp(ledger.requests);
-        let brq = clamp(ledger.billable_requests);
+        let rq = ledger.requests.to_string();
+        let brq = ledger.billable_requests.to_string();
         let client = self.client();
         let mut tx = client.transaction().await.store()?;
+        Self::lock_revision(&mut tx).await?;
         tx.execute(
             "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
-             VALUES ($1,$2,$3,$4)
+             VALUES ($1,$2,$3::text::numeric,$4::text::numeric)
              ON CONFLICT (bucket_id, window_start) DO UPDATE SET
                 requests = EXCLUDED.requests,
                 billable_requests = EXCLUDED.billable_requests",
@@ -1269,10 +1313,10 @@ impl Session {
         .store()?;
 
         if !ledger.models.is_empty() {
-            let rows: Vec<[i64; 4]> = ledger
+            let rows: Vec<[String; 4]> = ledger
                 .models
                 .iter()
-                .map(|m| RESERVED_COLUMNS.map(|u| clamp(m.tier(u))))
+                .map(|m| RESERVED_COLUMNS.map(|u| m.tier(u).to_string()))
                 .collect();
             for (models, rows) in ledger
                 .models
@@ -1293,7 +1337,7 @@ impl Session {
                     }
                     let base = 3 + i * 5;
                     sql.push_str(&format!(
-                        "($1,$2,${},${},${},${},${})",
+                        "($1,$2,${},${}::text::numeric,${}::text::numeric,${}::text::numeric,${}::text::numeric)",
                         base,
                         base + 1,
                         base + 2,
@@ -1309,14 +1353,14 @@ impl Session {
             }
 
             // The OPEN unit classes: an absolute set too (the window's rows were cleared above).
-            let opens: Vec<(&String, &String, i64)> = ledger
+            let opens: Vec<(&String, &String, String)> = ledger
                 .models
                 .iter()
                 .flat_map(|m| {
                     m.usage_units
                         .iter()
                         .filter(|(u, v)| !is_reserved_unit(u) && **v != 0)
-                        .map(move |(u, v)| (&m.model, u, clamp(*v)))
+                        .map(move |(u, v)| (&m.model, u, v.to_string()))
                 })
                 .collect();
             if !opens.is_empty() {
@@ -1333,7 +1377,12 @@ impl Session {
                             sql.push(',');
                         }
                         let base = 3 + i * 3;
-                        sql.push_str(&format!("($1,$2,${},${},${})", base, base + 1, base + 2));
+                        sql.push_str(&format!(
+                            "($1,$2,${},${},${}::text::numeric)",
+                            base,
+                            base + 1,
+                            base + 2
+                        ));
                         params.push(*model);
                         params.push(*unit);
                         params.push(count);
@@ -1357,11 +1406,20 @@ impl Session {
         &mut self,
         bucket: u64,
     ) -> RecordStoreResult<Vec<MeteringRow>> {
-        let b = usage_key(bucket);
         let client = self.client();
         // ONE snapshot for both reads, so a row's open classes are never read from a different
         // moment than its token columns.
         let mut tx = Self::snapshot_consistent_tx(client).await?;
+        let rows = Self::list_metering_in(&mut tx, bucket).await?;
+        tx.commit().await.store()?;
+        Ok(rows)
+    }
+
+    async fn list_metering_in(
+        tx: &mut Transaction<'_>,
+        bucket: u64,
+    ) -> RecordStoreResult<Vec<MeteringRow>> {
+        let b = usage_key(bucket);
         let rows = tx
             .query(
                 "SELECT key_id, model, provider,
@@ -1381,7 +1439,6 @@ impl Session {
             )
             .await
             .store()?;
-        tx.commit().await.store()?;
         type RowKey = (String, String, String, i64, String, String);
         let mut units: std::collections::HashMap<RowKey, BTreeMap<String, u64>> =
             std::collections::HashMap::new();
@@ -2309,8 +2366,8 @@ impl Session {
              ON CONFLICT (bucket_id, window_start) DO UPDATE SET
                 requests = {},
                 billable_requests = {}",
-            sat_add("usage_windows.requests", "$3::bigint", true),
-            sat_add("usage_windows.billable_requests", "$4::bigint", true),
+            usage_add("usage_windows.requests", "$3::bigint"),
+            usage_add("usage_windows.billable_requests", "$4::bigint"),
         );
         tx.execute(
             &window_sql,
@@ -2353,10 +2410,10 @@ impl Session {
                     tokens_cache_read  = {}, \
                     tokens_cache_write = {} \
                  FROM (VALUES ",
-                sat_add("u.tokens_input", "v.di", true),
-                sat_add("u.tokens_output", "v.do_", true),
-                sat_add("u.tokens_cache_read", "v.dcr", true),
-                sat_add("u.tokens_cache_write", "v.dcw", true),
+                usage_add("u.tokens_input", "v.di"),
+                usage_add("u.tokens_output", "v.do_"),
+                usage_add("u.tokens_cache_read", "v.dcr"),
+                usage_add("u.tokens_cache_write", "v.dcw"),
             );
             let mut ensure_params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(2 + models.len());
             let mut update_params: Vec<&(dyn ToSql + Sync)> =
@@ -2411,7 +2468,7 @@ impl Session {
                 );
                     let mut update = format!(
                         "UPDATE usage_ledger_units u SET count = {} FROM (VALUES ",
-                        sat_add("u.count", "v.d", true)
+                        usage_add("u.count", "v.d")
                     );
                     let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
                         Vec::with_capacity(2 + opens.len() * 2);

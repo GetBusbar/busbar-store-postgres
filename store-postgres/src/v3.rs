@@ -19,8 +19,8 @@
 //! ensures the schema, so an unreachable or refusing server fails the load.
 //!
 //! Every `u64` this module's own record and dedupe columns take is stored BIT-FOR-BIT in a BIGINT
-//! (`as i64`). The ops delegated to the base code keep that code's rules: usage and metering totals
-//! clamp, and appends refuse a value outside their column.
+//! (`as i64`). Raw usage counters use exact decimal NUMERIC storage and u64 saturation;
+//! metering totals retain their signed-column saturation, and appends refuse out-of-range values.
 
 use std::sync::atomic::Ordering;
 
@@ -32,6 +32,7 @@ use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::sdk::store::column::{prefix_end, storable_i64};
 use busbar_contract::abi::sdk::store::conditional::{Decision, Expected, Mutation, Request};
+use busbar_contract::abi::sdk::store::correction;
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::wire::{drive_kept, Body};
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
@@ -80,6 +81,7 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
     (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
     (busbar_contract::abi::sdk::store::conditional::CAPABILITY, b"1"),
+    (correction::CAPABILITY, b"1"),
 ]);
 
 /// How many ops of this store the host may have in flight at once.
@@ -121,6 +123,12 @@ const SWEEP_MAX_BATCHES: usize = 10;
 
 /// How often (seconds) one instance sweeps `store_ops` past its retention.
 const SWEEP_EVERY_SECS: u64 = 60;
+
+/// Ledger writes share revision authority with correction; append dedupe needs only its receipt.
+enum DedupeAuthority {
+    Receipt,
+    Ledger,
+}
 
 /// A `u64` into a BIGINT, bit for bit.
 fn bits(v: u64) -> i64 {
@@ -187,6 +195,126 @@ async fn claim(tx: &mut Transaction<'_>, op: OpId, body: &str) -> Result<Option<
 }
 
 impl Session {
+    /// All facts and the receipt share the transaction and the ordinary writers' first lock.
+    async fn v3_usage_correction(
+        &mut self,
+        request: &correction::Request,
+    ) -> OpResult<correction::Decision> {
+        request
+            .validate()
+            .map_err(|e| OpRefused::Refused(e.into()))?;
+        let dedupe = Dedupe::usage_correction(request);
+        let mut tx = self
+            .client()
+            .transaction()
+            .await
+            .map_err(|e| OpRefused::Failed(pg(e)))?;
+        Session::lock_revision(&mut tx).await.map_err(failed)?;
+        if let Some(recorded) = claim(&mut tx, request.op_id, &dedupe.body_hex())
+            .await
+            .map_err(OpRefused::Failed)?
+        {
+            dedupe.answer(Ok(Some(recorded)))?;
+            tx.rollback().await.map_err(|e| OpRefused::Failed(pg(e)))?;
+            return Ok(correction::Decision::Applied);
+        }
+        let live: bool = tx
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM keys WHERE id=$1 AND deleted_at IS NULL)",
+                &[&request.key_id],
+            )
+            .await
+            .map_err(|e| OpRefused::Failed(pg(e)))?
+            .try_get(0)
+            .map_err(|e| OpRefused::Failed(pg(e)))?;
+        let mut metering = Self::list_metering_in(&mut tx, request.day_start)
+            .await
+            .map_err(failed)?;
+        metering.retain(|row| row.key_id == request.key_id);
+        correction::canonical_metering(&mut metering);
+        let mut matches = live && metering == request.metering;
+        for change in &request.usage {
+            let mut current = Self::get_usage_in(
+                &mut tx,
+                &change.address.bucket_id,
+                change.address.window_start,
+            )
+            .await
+            .map_err(failed)?;
+            correction::canonical_ledger(&mut current).map_err(|e| OpRefused::Failed(e.into()))?;
+            matches &= current == change.expected;
+        }
+        if !matches {
+            tx.rollback().await.map_err(|e| OpRefused::Failed(pg(e)))?;
+            return Ok(correction::Decision::ConditionConflict);
+        }
+        for change in &request.usage {
+            Self::replace_usage_exact_in(&mut tx, change)
+                .await
+                .map_err(decided)?;
+        }
+        // A lost COMMIT response remains Failed/unknown. The exact request then replays the
+        // durable receipt; no caller may turn that failure into a definitive condition conflict.
+        tx.commit().await.map_err(|e| OpRefused::Failed(pg(e)))?;
+        self.sweep_ops().await;
+        Ok(correction::Decision::Applied)
+    }
+
+    /// NUMERIC stores the exact u64 domain; text parameters avoid the wire client's i64 codec.
+    async fn replace_usage_exact_in(
+        tx: &mut Transaction<'_>,
+        change: &correction::UsageChange,
+    ) -> OpResult<()> {
+        let bucket = &change.address.bucket_id;
+        let window = bits(change.address.window_start);
+        let row = &change.replacement;
+        let requests = row.requests.to_string();
+        let billable = row.billable_requests.to_string();
+        tx.execute(
+            "INSERT INTO usage_windows(bucket_id,window_start,requests,billable_requests)
+             VALUES($1,$2,$3::text::numeric,$4::text::numeric)
+             ON CONFLICT(bucket_id,window_start) DO UPDATE SET
+             requests=EXCLUDED.requests,billable_requests=EXCLUDED.billable_requests",
+            &[&bucket, &window, &requests, &billable],
+        )
+        .await
+        .map_err(|e| OpRefused::Failed(pg(e)))?;
+        tx.execute(
+            "DELETE FROM usage_ledger WHERE bucket_id=$1 AND window_start=$2",
+            &[&bucket, &window],
+        )
+        .await
+        .map_err(|e| OpRefused::Failed(pg(e)))?;
+        tx.execute(
+            "DELETE FROM usage_ledger_units WHERE bucket_id=$1 AND window_start=$2",
+            &[&bucket, &window],
+        )
+        .await
+        .map_err(|e| OpRefused::Failed(pg(e)))?;
+        for model in &row.models {
+            let counters = crate::RESERVED_COLUMNS.map(|unit| model.tier(unit).to_string());
+            tx.execute(
+                "INSERT INTO usage_ledger(bucket_id,window_start,model,tokens_input,tokens_output,tokens_cache_read,tokens_cache_write)
+                 VALUES($1,$2,$3,$4::text::numeric,$5::text::numeric,$6::text::numeric,$7::text::numeric)",
+                &[&bucket, &window, &model.model, &counters[0], &counters[1], &counters[2], &counters[3]],
+            ).await.map_err(|e| OpRefused::Failed(pg(e)))?;
+            for (unit, count) in &model.usage_units {
+                if crate::is_reserved_unit(unit) {
+                    continue;
+                }
+                let count = count.to_string();
+                tx.execute(
+                    "INSERT INTO usage_ledger_units(bucket_id,window_start,model,unit,count)
+                     VALUES($1,$2,$3,$4,$5::text::numeric)",
+                    &[&bucket, &window, &model.model, &unit, &count],
+                )
+                .await
+                .map_err(|e| OpRefused::Failed(pg(e)))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Forget every `op_id` past its retention, at most once per [`SWEEP_EVERY_SECS`].
     async fn sweep_ops(&mut self) {
         let now = now_secs();
@@ -224,6 +352,7 @@ impl Session {
         &mut self,
         op: OpId,
         body: &str,
+        authority: DedupeAuthority,
         apply: impl AsyncFnOnce(&mut Transaction<'_>) -> OpResult<()>,
     ) -> OpResult<Option<String>> {
         self.sweep_ops().await;
@@ -232,6 +361,11 @@ impl Session {
             .transaction()
             .await
             .map_err(|e| OpRefused::Failed(pg(e)))?;
+        if matches!(authority, DedupeAuthority::Ledger) {
+            // The same first lock as correction and key mutation. It also covers absent rows
+            // and the entire metering selection, which per-row/advisory cell locks cannot do.
+            Session::lock_revision(&mut tx).await.map_err(failed)?;
+        }
         let found = claim(&mut tx, op, body).await.map_err(OpRefused::Failed)?;
         if found.is_none() {
             apply(&mut tx).await.map_err(decided)?;
@@ -249,7 +383,7 @@ impl Session {
         // Decided before BEGIN: a seq or ts the column cannot hold is refused, nothing written.
         storable_i64("append_plane_record", "seq", record.seq).map_err(refused)?;
         storable_i64("append_plane_record", "ts", record.ts).map_err(refused)?;
-        self.deduped(op, body, async |tx| {
+        self.deduped(op, body, DedupeAuthority::Receipt, async |tx| {
             if Session::append_plane_record_in(tx, record)
                 .await
                 .map_err(failed)?
@@ -479,7 +613,16 @@ impl Session {
         // order and cannot deadlock (40P01). Stable, so a repeated cell keeps its order.
         let mut ordered: Vec<&(String, u64, UsageDelta)> = cells.iter().collect();
         ordered.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-        self.deduped(op, body, async |tx| {
+        self.deduped(op, body, DedupeAuthority::Ledger, async |tx| {
+            // An old exact receipt remains replayable; only fresh unconditional adjustments fail.
+            if ordered
+                .iter()
+                .any(|(bucket, _, _)| correction::reserved_bucket(bucket))
+            {
+                return Err(OpRefused::Refused(
+                    "reserved usage adjustment requires atomic correction".into(),
+                ));
+            }
             for (bucket, window, delta) in ordered {
                 Session::add_usage_in(tx, bucket, *window, delta)
                     .await
@@ -503,7 +646,7 @@ impl Session {
         // Primary-key order, as the usage batch (stable).
         let mut ordered: Vec<&MeteringDelta> = deltas.iter().collect();
         ordered.sort_by_key(|d| (&d.key_id, d.bucket, &d.model, &d.provider, d.priced_from_ms));
-        self.deduped(op, body, async |tx| {
+        self.deduped(op, body, DedupeAuthority::Ledger, async |tx| {
             for d in ordered {
                 Session::add_metering_in(tx, d).await.map_err(failed)?;
             }
@@ -597,6 +740,7 @@ macro_rules! legacy_slots {
 
 impl StoreSlots for PostgresStore {
     const RECORD_TRANSACTION: bool = true;
+    const USAGE_CORRECTION: bool = true;
 
     const TAIL: Tail = Tail {
         ephemeral: false,
@@ -643,6 +787,20 @@ impl StoreSlots for PostgresStore {
         let request = request.clone();
         on_conn!(self, cx, OpRefused::Failed, |s| s
             .v3_record_transaction(&request)
+            .await)
+    }
+
+    fn apply_usage_correction(
+        &self,
+        cx: &mut Op<'_>,
+        request: &correction::Request,
+    ) -> Step<OpResult<correction::Decision>> {
+        if let Err(error) = request.validate() {
+            return Step::Ready(Err(OpRefused::Refused(error.into())));
+        }
+        let request = request.clone();
+        on_conn!(self, cx, OpRefused::Failed, |s| s
+            .v3_usage_correction(&request)
             .await)
     }
 
