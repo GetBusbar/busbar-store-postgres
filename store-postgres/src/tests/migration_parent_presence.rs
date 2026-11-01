@@ -161,7 +161,7 @@ fn pre14_unambiguous_parent_migrates_reopens_and_accepts_identical_replay() {
 #[test]
 fn v14_and_later_presence_bits_are_preserved_without_guessed_reconstruction() {
     let Some(url) = live_url() else { return };
-    for version in [14_i64, 15] {
+    for version in [14_i64, 15, 16] {
         let db = TempDb::create(&url, "spg_parent_present");
         let store = TestStore::open(&db.url()).unwrap();
         let parentless = envelope("opaque", "alone", None);

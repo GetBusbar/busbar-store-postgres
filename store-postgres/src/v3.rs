@@ -8,7 +8,7 @@
 //!
 //! DEDUPE (`abi::store` S1-S4), DURABLE: every `op_id` this store APPLIED is a `store_ops` row
 //! holding the op's body ([`Dedupe::body_hex`]; `answer` is written empty and never read). The row
-//! is inserted FIRST in the op's own transaction with the op's effect: a racing call with the same
+//! is inserted before the effect in the op's transaction: a racing call with the same
 //! `op_id` (on this node or another) waits on the primary key, then reads the committed body, which
 //! [`Dedupe::answer`] judges a replay or a conflict. A failed op rolls its row back with its
 //! effect. Rows are kept [`OP_ID_RETENTION_SECS`] and swept at most once a minute per instance.
@@ -31,6 +31,7 @@ use busbar_contract::abi::mechanism::call::{AbiStr, Blob, BLOB_OCTETS};
 use busbar_contract::abi::sdk::conn::Host;
 use busbar_contract::abi::sdk::door::abi_str;
 use busbar_contract::abi::sdk::store::column::{prefix_end, storable_i64};
+use busbar_contract::abi::sdk::store::conditional::{Decision, Expected, Mutation, Request};
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::wire::{drive_kept, Body};
 use busbar_contract::abi::sdk::store::{Op, OpRefused, OpResult, Scanned, Step, StoreSlots, Tail};
@@ -77,6 +78,8 @@ pub const NEEDS: &[Need] = &[Need {
 // place (a 1.5.5 `url: {env: VAR}` keeps booting) and a literal passes as written.
 busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
+    (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
+    (busbar_contract::abi::sdk::store::conditional::CAPABILITY, b"1"),
 ]);
 
 /// How many ops of this store the host may have in flight at once.
@@ -263,35 +266,145 @@ impl Session {
         .await
     }
 
-    /// `record_put` (slot 26): an upsert on `(schema, key)`. An EMPTY value removes the row: it is
-    /// the host's strike, so `record_get` then answers `None` and
-    /// `record_scan` never returns it. Removing a row that is not there is `Ok`.
+    /// A conditional batch observes one pre-state and commits every mutation with its receipt.
+    async fn v3_record_transaction(&mut self, request: &Request) -> OpResult<Decision> {
+        request
+            .validate()
+            .map_err(|error| OpRefused::Refused(error.into()))?;
+        let dedupe = Dedupe::record_transaction(request);
+        let mut tx = self
+            .client()
+            .transaction()
+            .await
+            .map_err(|e| OpRefused::Failed(pg(e)))?;
+        // Different op_ids and absent addresses must serialize before either reads a predicate.
+        // Ordinary record_put uses this same lock; row locks alone cannot lock an absent address.
+        Session::lock_revision(&mut tx).await.map_err(failed)?;
+        if let Some(recorded) = claim(&mut tx, request.op_id, &dedupe.body_hex())
+            .await
+            .map_err(OpRefused::Failed)?
+        {
+            dedupe.answer(Ok(Some(recorded)))?;
+            tx.rollback().await.map_err(|e| OpRefused::Failed(pg(e)))?;
+            return Ok(Decision::Applied);
+        }
+        for predicate in &request.predicates {
+            let row = tx
+                .query_opt(
+                    "SELECT value FROM store_records WHERE schema_id=$1 AND key=$2",
+                    &[&predicate.schema, &predicate.key],
+                )
+                .await
+                .map_err(|e| OpRefused::Failed(pg(e)))?;
+            let value = row
+                .map(|row| row.try_get::<_, Vec<u8>>(0))
+                .transpose()
+                .map_err(|e| OpRefused::Failed(pg(e)))?;
+            let matches = match &predicate.expected {
+                Expected::Absent => value.is_none(),
+                Expected::Bytes(expected) => value.as_ref() == Some(expected),
+            };
+            if !matches {
+                // The tentative receipt is not an applied operation and must disappear too.
+                tx.rollback().await.map_err(|e| OpRefused::Failed(pg(e)))?;
+                return Ok(Decision::ConditionConflict);
+            }
+        }
+        for mutation in &request.mutations {
+            match mutation {
+                Mutation::Put { schema, key, value } => {
+                    Self::record_put_in(&mut tx, schema, key, value).await
+                }
+                Mutation::Delete { schema, key } => {
+                    Self::record_put_in(&mut tx, schema, key, &[]).await
+                }
+                Mutation::DeleteRange {
+                    schema,
+                    prefix,
+                    exact_key_length,
+                } => Self::record_delete_range_in(&mut tx, schema, prefix, *exact_key_length).await,
+            }
+            .map_err(OpRefused::Failed)?;
+        }
+        tx.commit().await.map_err(|e| OpRefused::Failed(pg(e)))?;
+        // Keep the existing applied-only retention policy. A condition conflict changes no receipt,
+        // including unrelated rows that an opportunistic sweep could otherwise remove.
+        self.sweep_ops().await;
+        Ok(Decision::Applied)
+    }
+
+    /// An ordinary opaque-record write follows the same serialization order as conditional batches.
     async fn v3_record_put(
         &mut self,
         schema: &str,
         key: &[u8],
         value: &[u8],
     ) -> Result<(), String> {
+        let mut tx = self.client().transaction().await.map_err(pg)?;
+        Session::lock_revision(&mut tx).await.map_err(|e| e.0)?;
+        Self::record_put_in(&mut tx, schema, key, value).await?;
+        tx.commit().await.map_err(pg)
+    }
+
+    /// Empty legacy puts are deletes; conditional requests use an explicit Delete variant.
+    async fn record_put_in(
+        tx: &mut Transaction<'_>,
+        schema: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), String> {
         if value.is_empty() {
-            return self
-                .client()
-                .execute(
-                    "DELETE FROM store_records WHERE schema_id = $1 AND key = $2",
-                    &[&schema, &key],
-                )
-                .await
-                .map(drop)
-                .map_err(pg);
-        }
-        self.client()
-            .execute(
-                "INSERT INTO store_records (schema_id, key, value) VALUES ($1, $2, $3)
-                 ON CONFLICT (schema_id, key) DO UPDATE SET value = EXCLUDED.value",
+            tx.execute(
+                "DELETE FROM store_records WHERE schema_id=$1 AND key=$2",
+                &[&schema, &key],
+            )
+            .await
+            .map(drop)
+            .map_err(pg)
+        } else {
+            tx.execute(
+                "INSERT INTO store_records (schema_id,key,value) VALUES ($1,$2,$3)
+                 ON CONFLICT (schema_id,key) DO UPDATE SET value=EXCLUDED.value",
                 &[&schema, &key, &value],
             )
             .await
             .map(drop)
             .map_err(pg)
+        }
+    }
+
+    /// Raw byte-prefix deletion with an exact key width: neighbouring longer scopes survive.
+    async fn record_delete_range_in(
+        tx: &mut Transaction<'_>,
+        schema: &str,
+        prefix: &[u8],
+        exact_key_length: u64,
+    ) -> Result<(), String> {
+        // PostgreSQL BYTEA lengths cannot reach this value; preserve the full accepted domain
+        // as a no-match instead of clamping it into a different range or refusing the request.
+        let Ok(length) = i64::try_from(exact_key_length) else {
+            return Ok(());
+        };
+        match prefix_end(prefix) {
+            Some(end) => {
+                tx.execute(
+                    "DELETE FROM store_records WHERE schema_id=$1 AND key >= $2 AND key < $3
+                 AND octet_length(key)::bigint=$4",
+                    &[&schema, &prefix, &end, &length],
+                )
+                .await
+            }
+            None => {
+                tx.execute(
+                    "DELETE FROM store_records WHERE schema_id=$1 AND key >= $2
+                 AND octet_length(key)::bigint=$3",
+                    &[&schema, &prefix, &length],
+                )
+                .await
+            }
+        }
+        .map(drop)
+        .map_err(pg)
     }
 
     async fn v3_record_get(
@@ -483,6 +596,8 @@ macro_rules! legacy_slots {
 }
 
 impl StoreSlots for PostgresStore {
+    const RECORD_TRANSACTION: bool = true;
+
     const TAIL: Tail = Tail {
         ephemeral: false,
         durable_plane: true,
@@ -522,6 +637,13 @@ impl StoreSlots for PostgresStore {
             .v3_append_plane_record(op, &body, &record)
             .await)
         .map(|r| d.answer(r))
+    }
+
+    fn record_transaction(&self, cx: &mut Op<'_>, request: &Request) -> Step<OpResult<Decision>> {
+        let request = request.clone();
+        on_conn!(self, cx, OpRefused::Failed, |s| s
+            .v3_record_transaction(&request)
+            .await)
     }
 
     fn record_put(
@@ -605,6 +727,7 @@ impl StoreSlots for PostgresStore {
         purge_usage_before(before = u64) -> u64;
         list_metering(bucket = u64) -> Vec<MeteringRow>;
         put_credential(secret: &CredentialSecret) -> ();
+        rewrap_credential(expected: &CredentialSecret, replacement: &str) -> bool;
         put_key_with_credential(key: &VirtualKey, secret: &CredentialSecret) -> ();
         list_credentials(key_id: &str) -> Vec<CredentialMeta>;
         revoke_credential(id: &str, reason: &str) -> ();

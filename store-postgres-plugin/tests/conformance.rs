@@ -194,10 +194,10 @@ fn scenario(store: &dyn RecordStore, ns: &str) -> serde_json::Value {
         .collect();
     let token = format!("{ns}-token");
     let first = store
-        .redeem_plane_token("conformance_token", &token, 2_000_000_000, 1_900_000_000)
+        .redeem_plane_token("conformance_token", &token, u64::MAX, 1_900_000_000)
         .expect("redeem");
     let second = store
-        .redeem_plane_token("conformance_token", &token, 2_000_000_000, 1_900_000_000)
+        .redeem_plane_token("conformance_token", &token, u64::MAX, 1_900_000_000)
         .expect("redeem again");
     store.delete_plane_record(kind, &id).expect("delete");
     // The events hang off the task by parent, in their own kind: delete_plane_record of that kind

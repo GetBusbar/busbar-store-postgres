@@ -43,10 +43,11 @@ explicitly in production; do not assume they move together.
 
 The first connect of this build upgrades an existing database **in place**
 (schema v6 → this build's current schema, inside one transaction, under the same advisory lock every
-node's migration takes). Nothing is dropped and no existing row changes
-meaning:
+node's migration takes). The compatibility refusals below leave the migration
+transaction unchanged; accepted upgrades preserve existing row meanings except
+for the explicitly listed pre-release table removal and revoked-secret erasure:
 
-- `keys` gains `idp_subject`, `binding_mode`, `minted_by` (NULL for existing
+- `keys` gains `idp_subject`, `binding_mode`, `minted_by`, `idp_provider` (NULL for existing
   keys) and `allowed_scopes_by_kind`, which holds non-pool scope grants
   (`mcp_server`, `agent`, …). Pool grants stay in `allowed_pools` exactly as
   1.5.x wrote them.
@@ -65,10 +66,52 @@ meaning:
   `store_journal`, `store_sessions`) and their op-id dedupe rows, and only when
   upgrading from such a v11/v12 database: a fresh database or a released
   v6-v10 one never loses a table of those names.
-- Schema v14 adds `plane_chain.has_parent`: a record appended without a parent
-  is stored under its own id, read back by `get_plane_record`, and never listed
-  as a parent. Rows already keyed by their own id are marked parentless. A
-  build older than v14 refuses a v14 database.
+- Schema v14 adds `plane_chain.has_parent`: new parentless appends are stored
+  under their own ID and are not listed as parents. Earlier schemas stored
+  both `parent=None` and `parent=Some(id)` as `parent=id`, losing the presence
+  bit. This build refuses a pre-v14 upgrade containing any such row, leaving
+  its rows, schema and revision unchanged. Repair requires authoritative
+  envelope provenance or a verified backup; neither kind, opaque body nor ID
+  equality can establish the original relationship. Rows with `parent!=id`
+  migrate as parented without changing their envelopes. This build refuses
+  a database stamped with a newer schema at open.
+  Earlier pre-release v14-v16 builds instead guessed that `parent=id` meant
+  parentless. A database upgraded by that heuristic may already have lost
+  relationship information. This build cannot distinguish those rows from
+  legitimate new parentless rows and performs no automatic reconstruction or
+  data repair; affected deployments need the same authoritative provenance.
+- Schema v15 erases retained secret bytes from already-revoked credentials
+  and sets their secret form to `none`, preserving the revocation metadata.
+  Scrubbed rows receive one shared new revision; a database with no dirty
+  revoked credentials keeps its revision unchanged.
+- Schema v16 preserves all `u64` credential timestamps as bit patterns in the
+  existing BIGINT columns. Existing nonnegative values keep their meaning,
+  including old values saturated at `i64::MAX`; their original input cannot be
+  recovered. Negative timestamps in a pre-v16 database are refused because
+  their encoding is unknown. Counters and revisions keep their existing rules.
+- Schema v17 preserves every `u64` usage-window and metering-bucket key as its
+  complete bit pattern in the existing BIGINT columns. Equality and usage
+  retention compare the original unsigned values; retention still preserves
+  window zero and the exact cutoff. Existing nonnegative keys remain unchanged.
+  Previously clamped keys remain at `i64::MAX`: their original identities cannot
+  be recovered without authoritative external records. Negative usage keys in a
+  pre-v17 database are refused because their encoding is unknown.
+
+- Schema v18 includes `key_group_at_use` and `pricing_version` in metering identities,
+  including each row's open units. Only the old identity fields remain indexed; a
+  transaction advisory lock serializes writes for that old identity, and every update
+  compares both complete historical values. History TEXT fields retain their former
+  size range. The migration copies the attribution recorded on
+  each legacy parent, preserving empty unknown values. Orphan units refuse migration;
+  already-collapsed historical attribution cannot be reconstructed from these rows.
+
+Drain and stop older store processes before the v18 upgrade, then reopen every
+node with this build. Builds with the newer-schema check, including v16, refuse
+a v18 database at open, but that check cannot fence an already-open process.
+The published v1.0.6 plugin used by busbar 1.5.5 has no newer-schema check.
+Do not reconnect older binaries to the upgraded database or run mixed-version
+store writers. Rollback requires a pre-upgrade backup and the corresponding
+older build, not reopening the upgraded database with an older binary.
 
 A database a pre-release dev build took to schema v7–v9 keeps its
 `mcp_calls`/`tasks`/`task_events`/`mcp_demotions`/`spent_ask_states` tables
@@ -99,11 +142,11 @@ that crate and exports its `door` through `export_door!`.
   into `usage_windows` with `model` in the primary key. Write reporting
   queries and ETL against the backend you are actually running, never
   against the assumption that the two are byte-identical.
-- **A few error cases differ across backends.** Revoking a credential
-  id that names no row is an error here and on MySQL, and a silent
-  success on SQLite and Valkey. Tooling that treats a store error as
-  fatal should not assume the same input produces the same outcome on
-  every backend.
+- **Unknown credential IDs are errors.** Revoking an ID that names no row
+  returns an error, as required by the shared store contract. Repeating a
+  revoke for an existing, already-revoked credential succeeds without changing
+  its revocation metadata. A no-op revoke or delete may consume a global
+  revision without changing a row; revision numbers need not be contiguous.
 
 ### Known limitations (documented honestly, not papered over)
 
@@ -121,7 +164,8 @@ that crate and exports its `door` through `export_door!`.
   connects in plaintext, as 1.5.x (`NoTls`) did. `allow` is plaintext (no
   `SSLRequest`); `prefer` sends the `SSLRequest`, secures the connection on
   the server's `S` WITHOUT verifying its certificate, and goes on in plaintext
-  on `N` (libpq's behaviour). An ABSENT `sslmode` is plaintext (the same as
+  on `N`. Any other answer or a TLS handshake failure is refused; `prefer` does not retry
+  that endpoint in plaintext after a failed TLS handshake. An ABSENT `sslmode` is plaintext (the same as
   `disable`; libpq's default of `prefer` is not applied): set `sslmode`
   explicitly. A Unix-socket
   `host` is refused: the store reaches its server over TCP.
@@ -153,8 +197,11 @@ comma-separated list of several endpoints, tried in order), `user`,
 (`any`, `read-write`, `read-only`), `channel_binding` (`disable` or `prefer`),
 `sslmode` (`disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`;
 absent means `disable`) and `connect_timeout` (whole seconds; it bounds a new
-connection's dial and handshake and defaults to 30 when absent; `0` or less
-means no bound, as in libpq; a value that is not a whole number is refused).
+connection's dial and handshake and defaults to 30 when absent; `0` or less removes
+this store's handshake bound and leaves the dial timeout to the declared need or host default.
+Positive values are used as written, including `1`; a value that is not a whole number is refused).
+The connection string must name `user` explicitly; libpq environment fallbacks
+such as `PGUSER`, `PGHOST`, `PGPASSWORD` and `PGSERVICE` are not read by this parser.
 The store sends no startup `options` of its own (a pooler such as pgbouncer
 refuses them; a DSN's `options` goes through as written). Every transaction
 begins with one simple-query batch that states its isolation level and bounds
@@ -188,10 +235,9 @@ A database stamped with a newer schema than this build is refused at open.
 
 ## Build
 
-Needs a Rust toolchain ([rustup](https://rustup.rs)), and — interim,
-until [busbar](https://github.com/GetBusbar/busbar) ships publicly
-— a sibling checkout of `busbar` at `../busbar` (see
-[Dependencies](#dependencies) below).
+Needs a Rust toolchain ([rustup](https://rustup.rs)) and access to the pinned
+Git dependencies listed in [Dependencies](#dependencies). A sibling busbar
+checkout is needed only by tests that build the real busbar executable.
 
 ```sh
 cargo build --workspace --release   # cdylib: target/release/libbusbar_store_postgres_plugin.{so,dylib}
@@ -317,3 +363,14 @@ Licensed **Apache-2.0** ([LICENSE](LICENSE)). Contributions welcome — see
 [CONTRIBUTING.md](CONTRIBUTING.md). Governed by our
 [Code of Conduct](CODE_OF_CONDUCT.md); security issues go through
 [SECURITY.md](SECURITY.md), not public issues.
+
+Replay-token expiry uses the shared database server's Unix clock. `expires_at` remains an
+absolute Unix-seconds deadline; the caller clock argument does not expire or reclaim tokens.
+An expired presentation returns false before mutation, equality with the sampled server second
+remains live, and duplicate presentations preserve the winner's expiry. For reserved kind `ticket`, `plane_token_live` checks a persisted Terminal record with an
+exact matching expiry against that same database clock without spending it. Missing, pruned,
+expired or mismatched receipts return false. Other kinds keep their Active/caller-clock contract. Clock read failures propagate as errors.
+
+Built-in `ticket` records store their absolute expiry in `ts`. Their retention cutoff is
+capped at the database clock, preserving still-live receipts even when a caller requests
+a future cutoff. Equal deadlines are retained; other record kinds keep their existing rules.

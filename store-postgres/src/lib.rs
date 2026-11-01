@@ -82,24 +82,36 @@ fn is_undefined_table(e: &pgwire::Error) -> bool {
 /// (`postgres://user:pass@host:5432/db`) and the libpq keyword form (`... password=secret ...`), so
 /// a connect-error string can be scrubbed of the secret regardless of which shape the operator used.
 fn dsn_password(dsn: &str) -> Option<String> {
-    if let Some(rest) = dsn.split("://").nth(1) {
-        if let Some((userinfo, _)) = rest.rsplit_once('@') {
-            if let Some((_, pass)) = userinfo.split_once(':') {
-                if !pass.is_empty() {
-                    return Some(pass.to_string());
+    if let Some(rest) = dsn
+        .strip_prefix("postgresql://")
+        .or_else(|| dsn.strip_prefix("postgres://"))
+    {
+        let authority = rest.split(['/', '?']).next().unwrap_or(rest);
+        let mut secret = authority
+            .rsplit_once('@')
+            .and_then(|(userinfo, _)| userinfo.split_once(':'))
+            .map(|(_, password)| password.to_string());
+        // Query options follow userinfo in Config::parse and the last password wins, even empty.
+        // Only a URL has query parameters; '?' and '://' are ordinary keyword values.
+        if let Some((_, query)) = rest.split_once('?') {
+            for param in query.split('&') {
+                if let Some((key, value)) = param.split_once('=') {
+                    if percent_decode(key) == "password" {
+                        secret = Some(value.to_string());
+                    }
                 }
             }
         }
+        return secret.filter(|value| !value.is_empty());
     }
-    // The URL QUERY-PARAMETER form (`?password=secret`) skips the userinfo branch above.
-    if let Some((_, query)) = dsn.split_once('?') {
-        for param in query.split('&') {
-            if let Some(v) = param.strip_prefix("password=") {
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
-            }
-        }
+    // Reuse the wire parser for valid keyword grammar, including escaped quotes, backslashes and
+    // whitespace inside values. The fallback below still detects a secret in malformed input.
+    if let Ok(pairs) = pgwire::keywords(dsn) {
+        return pairs
+            .into_iter()
+            .rev()
+            .find(|(key, _)| key == "password")
+            .and_then(|(_, value)| (!value.is_empty()).then_some(value));
     }
     // The libpq KEYWORD form tolerates whitespace around `=` and single-quoted values, so collapse
     // the whitespace first and match the key only at a token boundary (`sslpassword=` is another option).
@@ -199,7 +211,7 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
     out
 }
 
-/// Store schema version. A database older than v6 is refused: no release ever wrote one. v6 -> v14
+/// Store schema version. A database older than v6 is refused: no release ever wrote one. v6 -> v17
 /// upgrades in place:
 /// - v10: `keys` gains `idp_subject`/`binding_mode`/`minted_by`/`idp_provider`/
 ///   `allowed_scopes_by_kind`; open usage units get `usage_ledger_units` and `usage_metering_units`;
@@ -209,7 +221,15 @@ fn scrub(msg: String, secret: Option<&str>) -> String {
 /// - v14: `plane_chain.has_parent` (a parentless append is stored under its own id, unlisted as a
 ///   parent).
 /// - v15: erase historical revoked-credential secrets, preserving revocation metadata.
-pub const SCHEMA_VERSION: i64 = 15;
+/// - v16: credential timestamps use their complete u64 bit pattern in the BIGINT column.
+/// - v17: usage-window and metering-bucket keys retain their complete u64 bit pattern.
+
+/// - v18: metering parent and unit keys retain historical group and pricing version.
+
+pub const SCHEMA_VERSION: i64 = 18;
+
+// Built-in ticket records store an absolute expiry in ts.
+const TICKET_RECORD_KIND: &str = "ticket";
 
 /// How many times the migration transaction runs when it is chosen as a deadlock victim.
 const MIGRATE_ATTEMPTS: u32 = 3;
@@ -629,6 +649,52 @@ impl Session {
     async fn migrate_tx(client: &mut Client, version: i64) -> RecordStoreResult<()> {
         let mut tx = client.transaction().await.store()?;
         tx.batch_execute(SCHEMA).await.store()?;
+        if version < 17 {
+            // Older supported writers emitted only nonnegative keys. Preserve those bits,
+            // including an already-clamped MAX whose original input cannot be reconstructed.
+            let incompatible: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM usage_windows WHERE window_start < 0)
+                     OR EXISTS(SELECT 1 FROM usage_ledger WHERE window_start < 0)
+                     OR EXISTS(SELECT 1 FROM usage_ledger_units WHERE window_start < 0)
+                     OR EXISTS(SELECT 1 FROM usage_metering WHERE bucket < 0)
+                     OR EXISTS(SELECT 1 FROM usage_metering_units WHERE bucket < 0)",
+                    &[],
+                )
+                .await
+                .store()?
+                .try_get(0)
+                .store()?;
+            if incompatible {
+                return Err(RecordStoreError(
+                    "postgres store: negative usage key in a pre-v17 database; \
+                     refusing to infer its encoding"
+                        .into(),
+                ));
+            }
+        }
+        if version < 16 {
+            // Supported older writes produced nonnegative timestamps only. Those bits are already
+            // the v16 encoding; a negative historical value has unknown provenance, so refuse it.
+            // An old saturated MAX stays MAX: its original input cannot be reconstructed.
+            let incompatible: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM credentials WHERE created_at < 0 OR updated_at < 0
+                     OR expires_at < 0 OR revoked_at < 0)",
+                    &[],
+                )
+                .await
+                .store()?
+                .try_get(0)
+                .store()?;
+            if incompatible {
+                return Err(RecordStoreError(
+                    "postgres store: negative credential timestamp in a pre-v16 database; \
+                     refusing to infer its encoding"
+                        .into(),
+                ));
+            }
+        }
         // v10: `SCHEMA`'s `CREATE TABLE IF NOT EXISTS` never alters an existing table, so on a v6
         // database these statements ARE the upgrade. Gated on crossing INTO v10 because `ALTER TABLE`
         // takes an ACCESS EXCLUSIVE lock even as a no-op, and every node's connect runs `migrate()`.
@@ -662,11 +728,28 @@ impl Session {
             .await
             .store()?;
         }
-        // v14: `has_parent`. A row keyed by its own id was written parentless.
+        // Before v14, None and Some(id) both stored parent=id. Opaque bodies cannot restore
+        // the missing presence bit. Refuse ambiguous rows before changing their interpretation.
         if version < 14 {
+            let ambiguous: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM plane_chain WHERE parent = id)",
+                    &[],
+                )
+                .await
+                .store()?
+                .try_get(0)
+                .store()?;
+            if ambiguous {
+                return Err(RecordStoreError(
+                    "postgres store: pre-v14 plane_chain parent presence is ambiguous; \
+                     refusing to infer it; repair requires authoritative envelope provenance \
+                     or a verified backup"
+                        .into(),
+                ));
+            }
             tx.batch_execute(
-                "ALTER TABLE plane_chain ADD COLUMN IF NOT EXISTS has_parent BOOLEAN NOT NULL DEFAULT TRUE;
-                 UPDATE plane_chain SET has_parent = FALSE WHERE parent = id;",
+                "ALTER TABLE plane_chain ADD COLUMN IF NOT EXISTS has_parent BOOLEAN NOT NULL DEFAULT TRUE",
             )
             .await
             .store()?;
@@ -694,6 +777,44 @@ impl Session {
                 .store()?;
             }
         }
+        if version < 18 {
+            // The old parent key identifies the sole recorded attribution; no history is guessed.
+            let orphan: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM usage_metering_units u
+                 LEFT JOIN usage_metering m ON m.key_id=u.key_id AND m.bucket=u.bucket
+                 AND m.model=u.model AND m.provider=u.provider AND m.priced_from_ms=u.priced_from_ms
+                 WHERE m.key_id IS NULL)",
+                    &[],
+                )
+                .await
+                .store()?
+                .try_get(0)
+                .store()?;
+            if orphan {
+                return Err(RecordStoreError(
+                    "postgres store: metering unit attribution has no parent".into(),
+                ));
+            }
+            tx.batch_execute(
+                "ALTER TABLE usage_metering_units
+                    ADD COLUMN IF NOT EXISTS key_group_at_use TEXT COLLATE \"C\" NOT NULL DEFAULT '',
+                    ADD COLUMN IF NOT EXISTS pricing_version TEXT COLLATE \"C\" NOT NULL DEFAULT '';
+                 UPDATE usage_metering_units u SET key_group_at_use=m.key_group_at_use,
+                    pricing_version=m.pricing_version FROM usage_metering m
+                 WHERE m.key_id=u.key_id AND m.bucket=u.bucket AND m.model=u.model
+                    AND m.provider=u.provider AND m.priced_from_ms=u.priced_from_ms;
+                 ALTER TABLE usage_metering_units DROP CONSTRAINT IF EXISTS usage_metering_units_pkey;
+                 CREATE INDEX IF NOT EXISTS idx_metering_units_identity
+                    ON usage_metering_units (key_id,bucket,model,provider,priced_from_ms,unit);
+                 ALTER TABLE usage_metering DROP CONSTRAINT IF EXISTS usage_metering_pkey;
+                 ALTER TABLE usage_metering
+                    ALTER COLUMN key_group_at_use TYPE TEXT COLLATE \"C\",
+                    ALTER COLUMN pricing_version TYPE TEXT COLLATE \"C\";
+                 CREATE INDEX IF NOT EXISTS idx_metering_identity
+                    ON usage_metering (key_id,bucket,model,provider,priced_from_ms);"
+            ).await.store()?;
+        }
         tx.execute(
             "INSERT INTO busbar_schema (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
             &[&SCHEMA_VERSION],
@@ -704,9 +825,20 @@ impl Session {
         Ok(())
     }
 
-    /// Bump and return the store-global revision inside the caller's open transaction. Must be the
-    /// FIRST statement of any transaction that mutates `keys`/`credentials`: it fixes one lock order
-    /// (`store_revision` row, then the rest) across every mutating method, so they cannot deadlock.
+    /// Bump and return the store-global revision inside the caller's open transaction. Acquire this
+    /// row before any key/credential row lock; a compare-only operation may lock it with SELECT
+    /// first and increment only after its comparison succeeds.
+    /// Serialize a conditional decision with every revision-ordered writer without spending a revision.
+    async fn lock_revision(tx: &mut Transaction<'_>) -> RecordStoreResult<()> {
+        tx.query_one(
+            "SELECT revision FROM store_revision WHERE only_row FOR UPDATE",
+            &[],
+        )
+        .await
+        .store()?;
+        Ok(())
+    }
+
     async fn next_revision(tx: &mut Transaction<'_>) -> RecordStoreResult<i64> {
         tx.query_one(
             "UPDATE store_revision SET revision = revision + 1 WHERE only_row RETURNING revision",
@@ -759,6 +891,11 @@ fn sat_add(a: &str, b: &str, floor: bool) -> String {
     }
 }
 
+// Equality keys keep all bits; range comparisons must compare the sign partitions unsigned.
+fn usage_key(value: u64) -> i64 {
+    value as i64
+}
+
 const KEY_COLUMNS: &str = "id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,idp_subject,binding_mode,minted_by,allowed_scopes_by_kind,idp_provider";
 
 fn secret_form_to_storage(f: SecretForm) -> &'static str {
@@ -781,6 +918,15 @@ const CRED_META_COLUMNS: &str = "id,key_id,kind,slot,public_id,secret_form,creat
 /// CRED_META_COLUMNS. Guarded by `cred_secret_column_index_matches_cred_meta_columns_count`.
 const CRED_SECRET_COLUMN_INDEX: usize = 12;
 
+// Timestamp bits are bijective over u64; signed counter saturation is a different storage rule.
+fn credential_timestamp(value: u64) -> i64 {
+    value as i64
+}
+
+fn read_credential_timestamp(value: i64) -> u64 {
+    value as u64
+}
+
 fn row_to_cred_meta(r: &Row) -> RecordStoreResult<CredentialMeta> {
     Ok(CredentialMeta {
         id: r.try_get(0).store()?,
@@ -789,10 +935,16 @@ fn row_to_cred_meta(r: &Row) -> RecordStoreResult<CredentialMeta> {
         slot: r.try_get::<_, i16>(3).store()? as u8,
         public_id: r.try_get(4).store()?,
         secret_form: secret_form_from_storage(r.try_get::<_, &str>(5).store()?),
-        created_at: read_u64(r.try_get::<_, i64>(6).store()?),
-        updated_at: read_u64(r.try_get::<_, i64>(7).store()?),
-        expires_at: r.try_get::<_, Option<i64>>(8).store()?.map(read_u64),
-        revoked_at: r.try_get::<_, Option<i64>>(9).store()?.map(read_u64),
+        created_at: read_credential_timestamp(r.try_get::<_, i64>(6).store()?),
+        updated_at: read_credential_timestamp(r.try_get::<_, i64>(7).store()?),
+        expires_at: r
+            .try_get::<_, Option<i64>>(8)
+            .store()?
+            .map(read_credential_timestamp),
+        revoked_at: r
+            .try_get::<_, Option<i64>>(9)
+            .store()?
+            .map(read_credential_timestamp),
         revoke_reason: r.try_get(10).store()?,
         revision: read_u64(r.try_get::<_, i64>(11).store()?),
     })
@@ -972,7 +1124,7 @@ impl Session {
         bucket_id: &str,
         window_start: u64,
     ) -> RecordStoreResult<UsageLedger> {
-        let ws = clamp(window_start);
+        let ws = usage_key(window_start);
         let client = self.client();
         let mut tx = Self::snapshot_consistent_tx(client).await?;
         let (requests, billable_requests): (u64, u64) = match tx
@@ -1045,8 +1197,7 @@ impl Session {
         if before == 0 {
             return Ok(0);
         }
-        let above_sql_maximum = before > i64::MAX as u64;
-        let cutoff = clamp(before);
+        let cutoff = usage_key(before);
         let mut tx = self.client().transaction().await.store()?;
         tx.batch_execute(
             "LOCK TABLE usage_windows, usage_ledger, usage_ledger_units \
@@ -1055,21 +1206,27 @@ impl Session {
         .await
         .store()?;
         tx.execute(
-            "DELETE FROM usage_ledger WHERE window_start > 0 AND ($1 OR window_start < $2)",
-            &[&above_sql_maximum, &cutoff],
+            "DELETE FROM usage_ledger WHERE window_start <> 0 AND
+             (($1::bigint >= 0 AND window_start >= 0 AND window_start < $1) OR
+              ($1 < 0 AND (window_start >= 0 OR window_start < $1)))",
+            &[&cutoff],
         )
         .await
         .store()?;
         tx.execute(
-            "DELETE FROM usage_ledger_units WHERE window_start > 0 AND ($1 OR window_start < $2)",
-            &[&above_sql_maximum, &cutoff],
+            "DELETE FROM usage_ledger_units WHERE window_start <> 0 AND
+             (($1::bigint >= 0 AND window_start >= 0 AND window_start < $1) OR
+              ($1 < 0 AND (window_start >= 0 OR window_start < $1)))",
+            &[&cutoff],
         )
         .await
         .store()?;
         let removed = tx
             .execute(
-                "DELETE FROM usage_windows WHERE window_start > 0 AND ($1 OR window_start < $2)",
-                &[&above_sql_maximum, &cutoff],
+                "DELETE FROM usage_windows WHERE window_start <> 0 AND
+                 (($1::bigint >= 0 AND window_start >= 0 AND window_start < $1) OR
+                  ($1 < 0 AND (window_start >= 0 OR window_start < $1)))",
+                &[&cutoff],
             )
             .await
             .store()?;
@@ -1083,11 +1240,21 @@ impl Session {
         window_start: u64,
         ledger: &UsageLedger,
     ) -> RecordStoreResult<()> {
-        let ws = clamp(window_start);
+        let ws = usage_key(window_start);
         let rq = clamp(ledger.requests);
         let brq = clamp(ledger.billable_requests);
         let client = self.client();
         let mut tx = client.transaction().await.store()?;
+        tx.execute(
+            "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
+             VALUES ($1,$2,$3,$4)
+             ON CONFLICT (bucket_id, window_start) DO UPDATE SET
+                requests = EXCLUDED.requests,
+                billable_requests = EXCLUDED.billable_requests",
+            &[&bucket_id, &ws, &rq, &brq],
+        )
+        .await
+        .store()?;
         tx.execute(
             "DELETE FROM usage_ledger WHERE bucket_id=$1 AND window_start=$2",
             &[&bucket_id, &ws],
@@ -1100,49 +1267,46 @@ impl Session {
         )
         .await
         .store()?;
-        tx.execute(
-            "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
-             VALUES ($1,$2,$3,$4)
-             ON CONFLICT (bucket_id, window_start) DO UPDATE SET
-                requests = EXCLUDED.requests,
-                billable_requests = EXCLUDED.billable_requests",
-            &[&bucket_id, &ws, &rq, &brq],
-        )
-        .await
-        .store()?;
+
         if !ledger.models.is_empty() {
             let rows: Vec<[i64; 4]> = ledger
                 .models
                 .iter()
                 .map(|m| RESERVED_COLUMNS.map(|u| clamp(m.tier(u))))
                 .collect();
-            let mut sql = String::from(
+            for (models, rows) in ledger
+                .models
+                .chunks((pgwire::MAX_BIND_PARAMETERS - 2) / 5)
+                .zip(rows.chunks((pgwire::MAX_BIND_PARAMETERS - 2) / 5))
+            {
+                let mut sql = String::from(
                 "INSERT INTO usage_ledger \
                  (bucket_id, window_start, model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write) \
                  VALUES ",
             );
-            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(2 + rows.len() * 5);
-            params.push(&bucket_id);
-            params.push(&ws);
-            for (i, (m, row)) in ledger.models.iter().zip(rows.iter()).enumerate() {
-                if i > 0 {
-                    sql.push(',');
+                let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(2 + rows.len() * 5);
+                params.push(&bucket_id);
+                params.push(&ws);
+                for (i, (m, row)) in models.iter().zip(rows.iter()).enumerate() {
+                    if i > 0 {
+                        sql.push(',');
+                    }
+                    let base = 3 + i * 5;
+                    sql.push_str(&format!(
+                        "($1,$2,${},${},${},${},${})",
+                        base,
+                        base + 1,
+                        base + 2,
+                        base + 3,
+                        base + 4
+                    ));
+                    params.push(&m.model);
+                    for v in row {
+                        params.push(v);
+                    }
                 }
-                let base = 3 + i * 5;
-                sql.push_str(&format!(
-                    "($1,$2,${},${},${},${},${})",
-                    base,
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4
-                ));
-                params.push(&m.model);
-                for v in row {
-                    params.push(v);
-                }
+                tx.execute(&sql, &params).await.store()?;
             }
-            tx.execute(&sql, &params).await.store()?;
 
             // The OPEN unit classes: an absolute set too (the window's rows were cleared above).
             let opens: Vec<(&String, &String, i64)> = ledger
@@ -1156,30 +1320,33 @@ impl Session {
                 })
                 .collect();
             if !opens.is_empty() {
-                let mut sql = String::from(
+                for opens in opens.chunks((pgwire::MAX_BIND_PARAMETERS - 2) / 3) {
+                    let mut sql = String::from(
                     "INSERT INTO usage_ledger_units (bucket_id, window_start, model, unit, count) VALUES ",
                 );
-                let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(2 + opens.len() * 3);
-                params.push(&bucket_id);
-                params.push(&ws);
-                for (i, (model, unit, count)) in opens.iter().enumerate() {
-                    if i > 0 {
-                        sql.push(',');
+                    let mut params: Vec<&(dyn ToSql + Sync)> =
+                        Vec::with_capacity(2 + opens.len() * 3);
+                    params.push(&bucket_id);
+                    params.push(&ws);
+                    for (i, (model, unit, count)) in opens.iter().enumerate() {
+                        if i > 0 {
+                            sql.push(',');
+                        }
+                        let base = 3 + i * 3;
+                        sql.push_str(&format!("($1,$2,${},${},${})", base, base + 1, base + 2));
+                        params.push(*model);
+                        params.push(*unit);
+                        params.push(count);
                     }
-                    let base = 3 + i * 3;
-                    sql.push_str(&format!("($1,$2,${},${},${})", base, base + 1, base + 2));
-                    params.push(*model);
-                    params.push(*unit);
-                    params.push(count);
-                }
-                // Two ModelTokens entries for one model never reach this statement: the
-                // reserved-column INSERT above has no ON CONFLICT, so it refuses them (23505)
-                // first.
-                sql.push_str(
-                    " ON CONFLICT (bucket_id, window_start, model, unit) DO UPDATE SET \
+                    // Two ModelTokens entries for one model never reach this statement: the
+                    // reserved-column INSERT above has no ON CONFLICT, so it refuses them (23505)
+                    // first.
+                    sql.push_str(
+                        " ON CONFLICT (bucket_id, window_start, model, unit) DO UPDATE SET \
                      count = usage_ledger_units.count + EXCLUDED.count",
-                );
-                tx.execute(&sql, &params).await.store()?;
+                    );
+                    tx.execute(&sql, &params).await.store()?;
+                }
             }
         }
         tx.commit().await.store()?;
@@ -1190,7 +1357,7 @@ impl Session {
         &mut self,
         bucket: u64,
     ) -> RecordStoreResult<Vec<MeteringRow>> {
-        let b = clamp(bucket);
+        let b = usage_key(bucket);
         let client = self.client();
         // ONE snapshot for both reads, so a row's open classes are never read from a different
         // moment than its token columns.
@@ -1201,21 +1368,21 @@ impl Session {
                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
                     requests, billable_requests, key_group_at_use, pricing_version, priced_from_ms
                  FROM usage_metering WHERE bucket=$1
-                 ORDER BY key_id, model, provider, priced_from_ms",
+                 ORDER BY key_id, model, provider, priced_from_ms, key_group_at_use, pricing_version",
                 &[&b],
             )
             .await
             .store()?;
         let unit_rows = tx
             .query(
-                "SELECT key_id, model, provider, priced_from_ms, unit, count
+                "SELECT key_id, model, provider, priced_from_ms, unit, count, key_group_at_use, pricing_version
                  FROM usage_metering_units WHERE bucket=$1",
                 &[&b],
             )
             .await
             .store()?;
         tx.commit().await.store()?;
-        type RowKey = (String, String, String, i64);
+        type RowKey = (String, String, String, i64, String, String);
         let mut units: std::collections::HashMap<RowKey, BTreeMap<String, u64>> =
             std::collections::HashMap::new();
         for r in &unit_rows {
@@ -1229,6 +1396,8 @@ impl Session {
                     r.try_get(1).store()?,
                     r.try_get(2).store()?,
                     r.try_get(3).store()?,
+                    r.try_get(6).store()?,
+                    r.try_get(7).store()?,
                 ))
                 .or_default()
                 .insert(r.try_get(4).store()?, v);
@@ -1240,6 +1409,8 @@ impl Session {
                     r.try_get(1).store()?,
                     r.try_get(2).store()?,
                     r.try_get(11).store()?,
+                    r.try_get(9).store()?,
+                    r.try_get(10).store()?,
                 );
                 Ok(MeteringRow {
                     usage_units: units.remove(&key).unwrap_or_default(),
@@ -1270,6 +1441,79 @@ impl Session {
             tx.commit().await.store()?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn rewrap_credential(
+        &mut self,
+        expected: &CredentialSecret,
+        replacement: &str,
+    ) -> RecordStoreResult<bool> {
+        if expected.meta.revoked_at.is_some()
+            || expected.meta.secret_form != SecretForm::Recoverable
+            || expected.secret == replacement
+        {
+            return Ok(false);
+        }
+        let client = self.client();
+        let mut tx = client.transaction().await.store()?;
+        // Every key/credential writer takes this row first. Lock without incrementing so a
+        // failed comparison spends no revision and cannot race a revoke, delete, or slot mint.
+        Self::lock_revision(&mut tx).await?;
+        let owner_live: bool = tx
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM keys WHERE id=$1 AND deleted_at IS NULL)",
+                &[&expected.meta.key_id],
+            )
+            .await
+            .store()?
+            .try_get(0)
+            .store()?;
+        if !owner_live {
+            tx.commit().await.store()?;
+            return Ok(false);
+        }
+        let row = tx
+            .query_opt(
+                &format!(
+                    "SELECT {CRED_META_COLUMNS},secret FROM credentials WHERE id=$1 FOR UPDATE"
+                ),
+                &[&expected.meta.id],
+            )
+            .await
+            .store()?;
+        let matches = if let Some(row) = row {
+            let mut current = CredentialSecret {
+                meta: row_to_cred_meta(&row)?,
+                secret: row
+                    .try_get::<_, Option<String>>(CRED_SECRET_COLUMN_INDEX)
+                    .store()?
+                    .unwrap_or_default(),
+            };
+            let matches = &current == expected;
+            zeroize::Zeroize::zeroize(&mut current.secret);
+            matches
+        } else {
+            false
+        };
+        if !matches {
+            tx.commit().await.store()?;
+            return Ok(false);
+        }
+        let revision = Self::next_revision(&mut tx).await?;
+        let changed = tx
+            .execute(
+                "UPDATE credentials SET secret=$2, revision=$3 WHERE id=$1",
+                &[&expected.meta.id, &replacement, &revision],
+            )
+            .await
+            .store()?;
+        if changed != 1 {
+            return Err(RecordStoreError(
+                "credential rewrap lost its locked row".into(),
+            ));
+        }
+        tx.commit().await.store()?;
+        Ok(true)
     }
 
     pub(crate) async fn put_key_with_credential(
@@ -1353,7 +1597,7 @@ impl Session {
             )));
         }
         let rev = Self::next_revision(&mut tx).await?;
-        let now = now_secs();
+        let now = credential_timestamp(now_secs());
         // `AND revoked_at IS NULL` in the UPDATE's own WHERE: a clean repeat revoke is a true no-op
         // (no row revision bump, no rewritten reason) and, under READ COMMITTED's row-lock re-check, safe
         // against a concurrent revoke of the same id.
@@ -1362,7 +1606,7 @@ impl Session {
                 "UPDATE credentials SET revoked_at=$2, revoke_reason=$3, updated_at=$2, revision=$4,
                     secret=NULL, secret_form='none'
                  WHERE id=$1 AND revoked_at IS NULL",
-                &[&id, &clamp(now), &reason, &rev],
+                &[&id, &now, &reason, &rev],
             )
             .await
             .store()?;
@@ -1622,11 +1866,17 @@ impl Session {
         // STRICTLY older than the cutoff: a row exactly at `before` is kept. WHICH rows go is the
         // rule the call carries (never one inferred from the kind's name), read off the typed
         // `disposition` column and never out of the body.
-        let cutoff = clamp(before);
-        let above_sql_maximum = before > i64::MAX as u64;
+
         let terminal_only = retention == Retention::TerminalOnly;
         let client = self.client();
         let mut tx = client.transaction().await.store()?;
+        let before = if kind == TICKET_RECORD_KIND {
+            before.min(Self::database_now(&mut tx).await?)
+        } else {
+            before
+        };
+        let cutoff = clamp(before);
+        let above_sql_maximum = before > i64::MAX as u64;
         // In batches, so no more than `PURGE_BATCH` ids are ever held or bound at once; each
         // batch takes its own child chains.
         let mut purged = 0_u64;
@@ -1734,36 +1984,71 @@ impl Session {
         Ok(())
     }
 
+    async fn database_now(tx: &mut Transaction<'_>) -> RecordStoreResult<u64> {
+        #[cfg(test)]
+        {
+            const TEST_CLOCK_SETTING: &str = "busbar.test_database_clock";
+            let fixture: Option<String> = tx
+                .query_one("SELECT current_setting($1,true)", &[&TEST_CLOCK_SETTING])
+                .await
+                .store()?
+                .try_get(0)
+                .store()?;
+            if let Some(fixture) = fixture {
+                let now = fixture
+                    .parse::<i64>()
+                    .map_err(|_| RecordStoreError("invalid database clock fixture".into()))?;
+                return u64::try_from(now)
+                    .map_err(|_| RecordStoreError("database clock precedes Unix epoch".into()));
+            }
+        }
+        let now: i64 = tx
+            .query_one(
+                "SELECT floor(extract(epoch FROM pg_catalog.clock_timestamp()))::bigint",
+                &[],
+            )
+            .await
+            .store()?
+            .try_get(0)
+            .store()?;
+        u64::try_from(now)
+            .map_err(|_| RecordStoreError("database clock precedes Unix epoch".into()))
+    }
+
     pub(crate) async fn redeem_plane_token(
         &mut self,
         kind: &str,
         token: &str,
         expires_at: u64,
-        now: u64,
+        _caller_now: u64,
     ) -> RecordStoreResult<bool> {
-        // `now` is REFUSED, not clamped: clamped to i64::MAX it would sweep the kind's entire ledger
-        // and report the insert as a first redemption, reopening every spent token. `expires_at`
-        // alone saturates: minting claims pass `u64::MAX` for "never expires", and the column is only
-        // compared against `now` by the sweep, so `i64::MAX` is the same answer.
+        const REPLAY_TOKEN_LOCK_DOMAIN: &str = "busbar:replay-token";
+        let mut tx = self.client().transaction().await.store()?;
+        // Serialize the kind's sweep and claim before sampling the database's current time.
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended(ROW($1::text,$2::text)::text,0))",
+            &[&REPLAY_TOKEN_LOCK_DOMAIN, &kind],
+        )
+        .await
+        .store()?;
+        let store_now = Self::database_now(&mut tx).await?;
+        let cutoff = store_now as i64;
+        if expires_at < store_now {
+            tx.rollback().await.store()?;
+            return Ok(false);
+        }
+        // Preserve the existing never-expiring representation; no timestamp encoding changes.
         let expires = i64::try_from(expires_at).unwrap_or(i64::MAX);
-        let cutoff = storable_i64("redeem_plane_token", "now", now)?;
-        let client = self.client();
-        let mut tx = client.transaction().await.store()?;
-        // The eviction sweep, STRICTLY less-than (an entry expiring exactly at `now` is kept) and
-        // BEFORE the insert, so it never deletes the row this call records.
         tx.execute(
             "DELETE FROM plane_tokens WHERE kind=$1 AND expires_at < $2",
             &[&kind, &cutoff],
         )
         .await
         .store()?;
-        // THE TEST AND SET, as ONE statement: 1 row written means THIS call recorded the redemption,
-        // 0 means it was already there. A read then a write would tell both halves of a race they
-        // were first.
         let inserted = tx
             .execute(
                 "INSERT INTO plane_tokens (kind, token, expires_at) VALUES ($1,$2,$3)
-                 ON CONFLICT (kind, token) DO NOTHING",
+             ON CONFLICT (kind, token) DO NOTHING",
                 &[&kind, &token, &expires],
             )
             .await
@@ -1779,8 +2064,30 @@ impl Session {
         expires_at: u64,
         now: u64,
     ) -> RecordStoreResult<bool> {
+        if kind == TICKET_RECORD_KIND {
+            let Ok(deadline) = i64::try_from(expires_at) else {
+                return Ok(false);
+            };
+            let mut tx = Self::snapshot_consistent_tx(self.client()).await?;
+            let store_now = Self::database_now(&mut tx).await?;
+            let row = tx
+                .query_opt(
+                    "SELECT disposition FROM plane_records WHERE kind=$1 AND id=$2 AND ts=$3",
+                    &[&kind, &token, &deadline],
+                )
+                .await
+                .store()?;
+            let terminal = row
+                .as_ref()
+                .map(|r| r.try_get::<_, &str>(0).store())
+                .transpose()?;
+            let live = expires_at >= store_now
+                && terminal == Some(disposition_to_storage(PlaneDisposition::Terminal));
+            tx.commit().await.store()?;
+            return Ok(live);
+        }
         // MULTI-use and SPENDS NOTHING: a plain read of the `(kind, token)` upserted record, live only
-        // while present, `Active`, and before `expires_at`. Asking twice answers the same twice.
+        // while present, `Active`, and at or before `expires_at`. Asking twice answers the same twice.
         if now > expires_at {
             return Ok(false);
         }
@@ -1872,9 +2179,9 @@ impl Session {
             Some(secret.secret.as_str())
         };
         let slot = m.slot as i16;
-        let created = clamp(m.created_at);
-        let updated = clamp(m.updated_at);
-        let expires = m.expires_at.map(clamp);
+        let created = credential_timestamp(m.created_at);
+        let updated = credential_timestamp(m.updated_at);
+        let expires = m.expires_at.map(credential_timestamp);
         let live_refused = |key_id: &str, kind: &str, slot: i16| {
             RecordStoreError(format!(
                 "{op}: slot {slot} for key '{key_id}' kind '{kind}' holds a live credential; \
@@ -1995,7 +2302,7 @@ impl Session {
         window_start: u64,
         delta: &UsageDelta,
     ) -> RecordStoreResult<()> {
-        let ws = clamp(window_start);
+        let ws = usage_key(window_start);
         let window_sql = format!(
             "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
              VALUES ($1,$2,GREATEST(0,$3::bigint),GREATEST(0,$4::bigint))
@@ -2025,7 +2332,10 @@ impl Session {
             rounds[*n].push(m);
             *n += 1;
         }
-        for models in &rounds {
+        for models in rounds
+            .iter()
+            .flat_map(|models| models.chunks((pgwire::MAX_BIND_PARAMETERS - 2) / 5))
+        {
             // TWO batched statements, so a NEGATIVE delta (a refund) lands: `INSERT .. ON CONFLICT DO
             // UPDATE` can only add `EXCLUDED.col`, which is floored at 0 for a first-seen model, so a
             // refund was lost. Instead ensure every model's row exists at zero, then apply the SIGNED
@@ -2095,49 +2405,52 @@ impl Session {
                 })
                 .collect();
             if !opens.is_empty() {
-                let mut ensure = String::from(
+                for opens in opens.chunks((pgwire::MAX_BIND_PARAMETERS - 2) / 3) {
+                    let mut ensure = String::from(
                     "INSERT INTO usage_ledger_units (bucket_id, window_start, model, unit) VALUES ",
                 );
-                let mut update = format!(
-                    "UPDATE usage_ledger_units u SET count = {} FROM (VALUES ",
-                    sat_add("u.count", "v.d", true)
-                );
-                let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
-                    Vec::with_capacity(2 + opens.len() * 2);
-                let mut update_params: Vec<&(dyn ToSql + Sync)> =
-                    Vec::with_capacity(2 + opens.len() * 3);
-                ensure_params.push(&bucket_id);
-                ensure_params.push(&ws);
-                update_params.push(&bucket_id);
-                update_params.push(&ws);
-                for (i, (model, unit, d)) in opens.iter().enumerate() {
-                    if i > 0 {
-                        ensure.push(',');
-                        update.push(',');
+                    let mut update = format!(
+                        "UPDATE usage_ledger_units u SET count = {} FROM (VALUES ",
+                        sat_add("u.count", "v.d", true)
+                    );
+                    let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
+                        Vec::with_capacity(2 + opens.len() * 2);
+                    let mut update_params: Vec<&(dyn ToSql + Sync)> =
+                        Vec::with_capacity(2 + opens.len() * 3);
+                    ensure_params.push(&bucket_id);
+                    ensure_params.push(&ws);
+                    update_params.push(&bucket_id);
+                    update_params.push(&ws);
+                    for (i, (model, unit, d)) in opens.iter().enumerate() {
+                        if i > 0 {
+                            ensure.push(',');
+                            update.push(',');
+                        }
+                        let eb = 3 + i * 2;
+                        ensure.push_str(&format!("($1,$2,${},${})", eb, eb + 1));
+                        ensure_params.push(*model);
+                        ensure_params.push(*unit);
+                        let ub = 3 + i * 3;
+                        update.push_str(&format!(
+                            "(${}::text,${}::text,${}::bigint)",
+                            ub,
+                            ub + 1,
+                            ub + 2
+                        ));
+                        update_params.push(*model);
+                        update_params.push(*unit);
+                        update_params.push(d);
                     }
-                    let eb = 3 + i * 2;
-                    ensure.push_str(&format!("($1,$2,${},${})", eb, eb + 1));
-                    ensure_params.push(*model);
-                    ensure_params.push(*unit);
-                    let ub = 3 + i * 3;
-                    update.push_str(&format!(
-                        "(${}::text,${}::text,${}::bigint)",
-                        ub,
-                        ub + 1,
-                        ub + 2
-                    ));
-                    update_params.push(*model);
-                    update_params.push(*unit);
-                    update_params.push(d);
-                }
-                ensure.push_str(" ON CONFLICT (bucket_id, window_start, model, unit) DO NOTHING");
-                update.push_str(
-                    ") AS v(model, unit, d) \
+                    ensure
+                        .push_str(" ON CONFLICT (bucket_id, window_start, model, unit) DO NOTHING");
+                    update.push_str(
+                        ") AS v(model, unit, d) \
                      WHERE u.bucket_id = $1 AND u.window_start = $2 \
                        AND u.model = v.model AND u.unit = v.unit",
-                );
-                tx.execute(&ensure, &ensure_params).await.store()?;
-                tx.execute(&update, &update_params).await.store()?;
+                    );
+                    tx.execute(&ensure, &ensure_params).await.store()?;
+                    tx.execute(&update, &update_params).await.store()?;
+                }
             }
         }
         Ok(())
@@ -2149,7 +2462,7 @@ impl Session {
         d: &MeteringDelta,
     ) -> RecordStoreResult<()> {
         let (bucket, ti, to, tcr, tcw) = (
-            clamp(d.bucket),
+            usage_key(d.bucket),
             clamp(d.tokens_input),
             clamp(d.tokens_output),
             clamp(d.tokens_cache_read),
@@ -2158,100 +2471,91 @@ impl Session {
         let requests = clamp(d.requests);
         let brequests = clamp(d.billable_requests);
         let priced_from = clamp(d.priced_from_ms);
-        // `priced_from_ms` is part of the accrual key: a rate-card edit inside the
-        // UTC day opens a SECOND row for that day so each half keeps the card it was earned under,
-        // rather than folding counts earned under two prices into one row readable against one.
-        let meter_sql = format!(
-            "INSERT INTO usage_metering (key_id, bucket, model, provider,
-                 tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
-                 requests, billable_requests, key_group_at_use, pricing_version, priced_from_ms)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-             ON CONFLICT (key_id, bucket, model, provider, priced_from_ms) DO UPDATE SET
-                 tokens_input       = {},
-                 tokens_output      = {},
-                 tokens_cache_read  = {},
-                 tokens_cache_write = {},
-                 requests           = {},
-                 billable_requests  = {}",
-            sat_add(
-                "usage_metering.tokens_input",
-                "EXCLUDED.tokens_input",
-                false
+        // The old key fits the existing index. History stays unindexed TEXT, so adding it to
+        // the logical identity does not introduce an index-tuple limit for historical metadata.
+        // Hash collisions only serialize unrelated cells: every mutation compares the full key.
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended(ROW($1::text,$2::bigint,$3::text,$4::text,$5::bigint)::text,0))",
+            &[&d.key_id, &bucket, &d.model, &d.provider, &priced_from],
+        ).await.store()?;
+        let params: &[&(dyn ToSql + Sync)] = &[
+            &d.key_id,
+            &bucket,
+            &d.model,
+            &d.provider,
+            &ti,
+            &to,
+            &tcr,
+            &tcw,
+            &requests,
+            &brequests,
+            &d.key_group_at_use,
+            &d.pricing_version,
+            &priced_from,
+        ];
+        let updated = tx
+            .execute(
+                &format!(
+                "UPDATE usage_metering SET tokens_input={}, tokens_output={}, tokens_cache_read={},
+                 tokens_cache_write={}, requests={}, billable_requests={}
+                 WHERE key_id=$1 AND bucket=$2 AND model=$3 AND provider=$4
+                 AND key_group_at_use=$11 AND pricing_version=$12 AND priced_from_ms=$13",
+                sat_add("tokens_input", "$5::bigint", false),
+                sat_add("tokens_output", "$6::bigint", false),
+                sat_add("tokens_cache_read", "$7::bigint", false),
+                sat_add("tokens_cache_write", "$8::bigint", false),
+                sat_add("requests", "$9::bigint", false),
+                sat_add("billable_requests", "$10::bigint", false),
             ),
-            sat_add(
-                "usage_metering.tokens_output",
-                "EXCLUDED.tokens_output",
-                false
-            ),
-            sat_add(
-                "usage_metering.tokens_cache_read",
-                "EXCLUDED.tokens_cache_read",
-                false
-            ),
-            sat_add(
-                "usage_metering.tokens_cache_write",
-                "EXCLUDED.tokens_cache_write",
-                false
-            ),
-            sat_add("usage_metering.requests", "EXCLUDED.requests", false),
-            sat_add(
-                "usage_metering.billable_requests",
-                "EXCLUDED.billable_requests",
-                false
-            ),
-        );
-        tx.execute(
-            &meter_sql,
-            &[
-                &d.key_id,
-                &bucket,
-                &d.model,
-                &d.provider,
-                &ti,
-                &to,
-                &tcr,
-                &tcw,
-                &requests,
-                &brequests,
-                &d.key_group_at_use,
-                &d.pricing_version,
-                &priced_from,
-            ],
-        )
-        .await
-        .store()?;
-        // Every ledgered class the token columns do not hold, additive like them, in the SAME
-        // transaction so a metering row never shows its tokens without its other classes.
+                params,
+            )
+            .await
+            .store()?;
+        if updated == 0 {
+            tx.execute(
+                "INSERT INTO usage_metering (key_id,bucket,model,provider,tokens_input,tokens_output,
+                 tokens_cache_read,tokens_cache_write,requests,billable_requests,key_group_at_use,
+                 pricing_version,priced_from_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                params,
+            ).await.store()?;
+        }
         let units: Vec<(&String, i64)> = d
             .usage_units
             .iter()
             .filter(|(_, v)| **v != 0)
             .map(|(u, v)| (u, clamp(*v)))
             .collect();
-        if !units.is_empty() {
-            let mut sql = String::from(
-                "INSERT INTO usage_metering_units \
-                 (key_id, bucket, model, provider, priced_from_ms, unit, count) VALUES ",
-            );
-            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(5 + units.len() * 2);
-            params.push(&d.key_id);
-            params.push(&bucket);
-            params.push(&d.model);
-            params.push(&d.provider);
-            params.push(&priced_from);
+        for units in units.chunks((pgwire::MAX_BIND_PARAMETERS - 7) / 2) {
+            let mut sql = String::from("WITH incoming(unit,count) AS (VALUES ");
+            let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(7 + units.len() * 2);
+            params.extend_from_slice(&[
+                &d.key_id,
+                &bucket,
+                &d.model,
+                &d.provider,
+                &priced_from,
+                &d.key_group_at_use,
+                &d.pricing_version,
+            ]);
             for (i, (unit, count)) in units.iter().enumerate() {
-                if i > 0 {
+                if i != 0 {
                     sql.push(',');
                 }
-                let base = 6 + i * 2;
-                sql.push_str(&format!("($1,$2,$3,$4,$5,${},${})", base, base + 1));
+                let base = 8 + i * 2;
+                sql.push_str(&format!("(${}::text,${}::bigint)", base, base + 1));
                 params.push(*unit);
                 params.push(count);
             }
             sql.push_str(&format!(
-                " ON CONFLICT (key_id, bucket, model, provider, priced_from_ms, unit) DO UPDATE SET \
-                 count = {}",
-                sat_add("usage_metering_units.count", "EXCLUDED.count", false)
+                "), updated AS (UPDATE usage_metering_units u SET count={}
+                 FROM incoming v WHERE u.key_id=$1 AND u.bucket=$2 AND u.model=$3
+                 AND u.provider=$4 AND u.priced_from_ms=$5 AND u.key_group_at_use=$6
+                 AND u.pricing_version=$7 AND u.unit=v.unit RETURNING u.unit)
+                 INSERT INTO usage_metering_units
+                 (key_id,bucket,model,provider,priced_from_ms,key_group_at_use,pricing_version,unit,count)
+                 SELECT $1,$2,$3,$4,$5,$6,$7,v.unit,v.count FROM incoming v
+                 WHERE NOT EXISTS (SELECT 1 FROM updated u WHERE u.unit=v.unit)",
+                sat_add("u.count","v.count",false),
             ));
             tx.execute(&sql, &params).await.store()?;
         }

@@ -78,7 +78,7 @@ pub struct Config {
     pub options: Option<String>,
     pub ssl: SslMode,
     /// `connect_timeout` in milliseconds (whole seconds in the string, as the driver read it);
-    /// `None` = unset (the default bound); `Some(0)` = none.
+    /// `None` = unset (the default bound); `Some(0)` = no store handshake bound, host dial default.
     connect_timeout_ms: Option<u32>,
     target_session_attrs: SessionAttrs,
 }
@@ -122,7 +122,7 @@ const MAX_MESSAGE_LEN: u32 = (1 << 30) + 4;
 const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 30_000;
 
 impl Config {
-    /// The bound on a new connection's dial and handshake, in milliseconds (0 = none).
+    /// The store handshake/dial override, in milliseconds (0 = host dial default; no handshake bound).
     fn connect_bound_ms(&self) -> u32 {
         self.connect_timeout_ms
             .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS)
@@ -169,7 +169,16 @@ impl Config {
                 for one in hostport.split(',') {
                     let (host, port) = if let Some(v6) = one.strip_prefix('[') {
                         match v6.split_once(']') {
-                            Some((h, rest)) => (h.to_string(), rest.strip_prefix(':')),
+                            Some((h, rest)) => {
+                                let port = if rest.is_empty() {
+                                    None
+                                } else {
+                                    Some(rest.strip_prefix(':').ok_or_else(|| {
+                                        config_err("unexpected text after bracketed IPv6 host")
+                                    })?)
+                                };
+                                (h.to_string(), port)
+                            }
                             None => return Err(config_err("unterminated IPv6 host")),
                         }
                     } else {
@@ -206,8 +215,16 @@ impl Config {
         }
         // Whether the string carries a password: an unknown option's key is then not named, since
         // a password that split on a space or `=` leaves its tail as a "key" here.
-        let has_password =
-            crate::dsn_password(s).is_some() || pairs.iter().any(|(k, _)| k == "password");
+        // A malformed URL can split an intended user:password at '?'. Keep its resulting
+        // unknown option names private without confusing that hint with the effective password.
+        let possible_userinfo_secret = s
+            .strip_prefix("postgresql://")
+            .or_else(|| s.strip_prefix("postgres://"))
+            .and_then(|rest| rest.rsplit_once('@'))
+            .is_some_and(|(userinfo, _)| userinfo.contains(':'));
+        let has_password = possible_userinfo_secret
+            || crate::dsn_password(s).is_some()
+            || pairs.iter().any(|(k, _)| k == "password");
         let mut c = Config {
             endpoints: Vec::new(),
             user: String::new(),
@@ -221,6 +238,13 @@ impl Config {
         };
         let (mut hosts, mut hostaddrs, mut ports) = (None, None, String::new());
         for (k, v) in pairs {
+            if matches!(
+                k.as_str(),
+                "user" | "dbname" | "application_name" | "options"
+            ) && v.as_bytes().contains(&0)
+            {
+                return Err(config_err(format!("NUL byte in startup option `{k}`")));
+            }
             match k.as_str() {
                 "host" => hosts = Some(v),
                 "hostaddr" => hostaddrs = Some(v),
@@ -476,7 +500,7 @@ fn decode(s: &str) -> Result<String, Error> {
 
 /// The libpq keyword form: `key=value` pairs, whitespace around `=` allowed, single-quoted values
 /// with `\'` and `\\` escapes.
-fn keywords(s: &str) -> Result<Vec<(String, String)>, Error> {
+pub(super) fn keywords(s: &str) -> Result<Vec<(String, String)>, Error> {
     let mut out = Vec::new();
     let mut it = s.chars().peekable();
     loop {
@@ -888,7 +912,7 @@ impl Client {
     /// last connected first (`preferred`, so a failover DSN does not evict the kept connection to
     /// try its first endpoint again on every op): any failure of one endpoint's connect (the dial,
     /// the TLS refusal, the server's startup error, a `target_session_attrs` mismatch) closes it
-    /// and moves on to the next, and when all fail the last failure is the error (the driver's).
+    /// and moves on to the next. If all fail, the error names every endpoint and its failure.
     ///
     /// # Errors
     /// The connector's failure (as a connect error), a TLS refusal, or the server's refusal.
@@ -1552,6 +1576,9 @@ pub fn begin_sql(isolation: Option<IsolationLevel>) -> &'static str {
     }
 }
 
+/// A Bind frame counts parameters in an unsigned 16-bit field.
+pub(crate) const MAX_BIND_PARAMETERS: usize = u16::MAX as usize;
+
 /// [`Client::build_transaction`].
 pub struct TransactionBuilder<'a> {
     client: &'a mut Client,
@@ -1601,6 +1628,16 @@ impl Transaction<'_> {
     pub async fn commit(mut self) -> Result<(), Error> {
         self.done = true;
         self.client.batch_execute("COMMIT").await
+    }
+
+    /// Roll back, awaiting the server's completion before releasing this transaction's locks.
+    ///
+    /// # Errors
+    /// The `ROLLBACK`'s failure. An unfinished rollback retains Drop's pending cleanup.
+    pub async fn rollback(mut self) -> Result<(), Error> {
+        self.client.batch_execute("ROLLBACK").await?;
+        self.done = true;
+        Ok(())
     }
 
     /// [`Client::batch_execute`] inside the transaction.

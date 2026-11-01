@@ -808,7 +808,7 @@ pub fn assert_plane_purge_task_keeps_active_rows(store: &dyn RecordStore, ns: &s
 /// execute once across a restart and across two nodes. A different nonce is still redeemable.
 pub fn assert_plane_token_is_single_use(store: &dyn RecordStore, ns: &str) {
     let token = format!("{ns}_asknonce");
-    let expires_at = 2_000_000_000;
+    let expires_at = u64::MAX;
     let now = 1_700_000_000;
     assert!(
         store

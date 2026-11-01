@@ -13,11 +13,20 @@ use busbar_contract::records::{
 
 mod harness;
 
+#[path = "tests/credential_rewrap.rs"]
+mod credential_rewrap;
+
+#[path = "tests/credential_timestamps.rs"]
+mod credential_timestamps;
+
 #[path = "tests/usage_transactions.rs"]
 mod usage_transactions;
 
 #[path = "tests/usage_keys.rs"]
 mod usage_keys;
+
+#[path = "tests/conditional_records.rs"]
+mod conditional_records;
 
 #[path = "tests/migration_parent_presence.rs"]
 mod migration_parent_presence;
@@ -2599,4 +2608,5 @@ fn legacy_revoked_secrets_are_scrubbed_on_upgrade_and_on_repeated_revoke() {
 }
 
 mod metering_attribution;
+
 mod token_clock;

@@ -17,6 +17,7 @@ workspace = true
 # a busbar build that links this crate `[patch]`es the busbar git source to its own tree, so ONE
 # copy of the contract links.
 busbar-contract = { workspace = true }
+zeroize = { workspace = true }
 # The Postgres frontend protocol WITHOUT a socket (busbar THE DESIGN, the connections section: the
 # store reaches its server only over the host's connector): the message codec, SCRAM-SHA-256 and md5
 # (`postgres-protocol`) and the binary value encodings (`postgres-types`), the same two crates the

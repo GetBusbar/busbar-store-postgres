@@ -6,8 +6,8 @@ const WINNER_TOKEN: &str = "winner";
 const OTHER_TOKEN: &str = "other";
 const EXPIRED_TOKEN: &str = "expired";
 const SLOW_CALLER: u64 = u64::MIN;
-const FAST_CALLER: u64 = i64::MAX as u64;
-const RETAINED_EXPIRY: u64 = FAST_CALLER - 1;
+const FAST_CALLER: u64 = u64::MAX;
+const RETAINED_EXPIRY: u64 = i64::MAX as u64;
 const EXPIRED_AT_EPOCH: u64 = u64::MIN;
 fn token_expiry(store: &TestStore, kind: &str, token: &str) -> Option<u64> {
     store
@@ -73,6 +73,116 @@ fn expired_presentation_is_false_without_creating_or_sweeping_rows() {
         token_expiry(&store, TOKEN_KIND, WINNER_TOKEN),
         Some(RETAINED_EXPIRY)
     );
+}
+
+pub(super) fn assert_strict_boundary(kind: &str) {
+    use busbar_contract::records::{PlaneDisposition, PlaneRecord, Retention};
+    const TICKET_KIND: &str = "ticket";
+    const RECEIPT_BYTES: &[u8] = b"boundary-receipt";
+    const DATABASE_SECOND: u64 = 1_900_000_000;
+    const TEST_CLOCK_SETTING: &str = "busbar.test_database_clock";
+    let Some(url) = live_url() else { return };
+    let db = TempDb::create(&url, "spg_token_clock");
+    let mut raw = connect_client_with_retry(&db.url());
+    raw.batch_execute(&format!(
+        "ALTER DATABASE {} SET {TEST_CLOCK_SETTING} = '{DATABASE_SECOND}'",
+        db.name()
+    ))
+    .unwrap();
+    let store = TestStore::open(&db.url()).unwrap();
+    let receipt = PlaneRecord {
+        kind: TICKET_KIND.into(),
+        id: WINNER_TOKEN.into(),
+        parent: None,
+        seq: 0,
+        ts: DATABASE_SECOND,
+        disposition: PlaneDisposition::Terminal,
+        body: RECEIPT_BYTES.to_vec(),
+    };
+    store.upsert_plane_record(receipt.view()).unwrap();
+    assert!(store
+        .plane_token_live(TICKET_KIND, WINNER_TOKEN, DATABASE_SECOND, FAST_CALLER)
+        .unwrap());
+    assert!(store
+        .plane_token_live(TICKET_KIND, WINNER_TOKEN, DATABASE_SECOND, FAST_CALLER)
+        .unwrap());
+    assert!(store
+        .redeem_plane_token(kind, WINNER_TOKEN, DATABASE_SECOND, FAST_CALLER)
+        .unwrap());
+    assert!(store
+        .redeem_plane_token(kind, OTHER_TOKEN, RETAINED_EXPIRY, FAST_CALLER)
+        .unwrap());
+    assert!(!store
+        .redeem_plane_token(kind, WINNER_TOKEN, DATABASE_SECOND, SLOW_CALLER)
+        .unwrap());
+    assert_eq!(
+        token_expiry(&store, kind, WINNER_TOKEN),
+        Some(DATABASE_SECOND)
+    );
+    assert_eq!(
+        store
+            .purge_plane_records(TICKET_KIND, FAST_CALLER, Retention::Age)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store.get_plane_record(TICKET_KIND, WINNER_TOKEN).unwrap(),
+        Some(RECEIPT_BYTES.to_vec())
+    );
+    drop(store);
+    let after_expiry = DATABASE_SECOND + 1;
+    raw.batch_execute(&format!(
+        "ALTER DATABASE {} SET {TEST_CLOCK_SETTING} = '{after_expiry}'",
+        db.name()
+    ))
+    .unwrap();
+    let reopened = TestStore::open(&db.url()).unwrap();
+    assert!(!reopened
+        .plane_token_live(TICKET_KIND, WINNER_TOKEN, DATABASE_SECOND, SLOW_CALLER)
+        .unwrap());
+    assert!(!reopened
+        .redeem_plane_token(kind, WINNER_TOKEN, DATABASE_SECOND, SLOW_CALLER)
+        .unwrap());
+    assert_eq!(
+        reopened
+            .purge_plane_records(TICKET_KIND, FAST_CALLER, Retention::Age)
+            .unwrap(),
+        1
+    );
+    assert!(reopened
+        .redeem_plane_token(kind, WINNER_TOKEN, RETAINED_EXPIRY, SLOW_CALLER)
+        .unwrap());
+    assert!(!reopened
+        .redeem_plane_token(kind, WINNER_TOKEN, RETAINED_EXPIRY, FAST_CALLER)
+        .unwrap());
+    drop(reopened);
+    // A broken authoritative clock is an error; it does not become a false-successful claim.
+    const INVALID_CLOCK: &str = "invalid-clock-fixture";
+    raw.batch_execute(&format!(
+        "ALTER DATABASE {} SET {TEST_CLOCK_SETTING} = '{INVALID_CLOCK}'",
+        db.name()
+    ))
+    .unwrap();
+    let broken = TestStore::open(&db.url()).unwrap();
+    assert!(broken
+        .redeem_plane_token(kind, EXPIRED_TOKEN, RETAINED_EXPIRY, SLOW_CALLER)
+        .is_err());
+    assert!(broken
+        .plane_token_live(TICKET_KIND, WINNER_TOKEN, DATABASE_SECOND, SLOW_CALLER)
+        .is_err());
+    assert!(broken
+        .purge_plane_records(TICKET_KIND, FAST_CALLER, Retention::Age)
+        .is_err());
+    assert_eq!(token_expiry(&broken, kind, EXPIRED_TOKEN), None);
+    assert_eq!(
+        token_expiry(&broken, kind, WINNER_TOKEN),
+        Some(RETAINED_EXPIRY)
+    );
+}
+
+#[test]
+fn database_clock_boundary_is_strict() {
+    assert_strict_boundary(TOKEN_KIND);
 }
 
 #[test]

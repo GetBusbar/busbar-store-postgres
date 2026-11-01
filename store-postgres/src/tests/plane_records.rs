@@ -1090,11 +1090,7 @@ fn trust_ns(tag: &str) -> String {
     format!("{}-{}", tag, std::process::id())
 }
 
-/// The trust tests' clock. `redeem_plane_token` sweeps its whole kind of every entry with
-/// `expires_at < now`, and the store-conformance single-use check redeems an `ask` token that
-/// expires at 2_000_000_000 (sweeping at 1_700_000_000). So this band sits strictly BELOW 2e9 (no
-/// sweep here, at most `TRUST_NOW + 11`, can evict that token between its two redemptions) and
-/// every token here expires ABOVE 1.7e9 (the conformance sweep reaches none of them).
+/// Synthetic caller time for records; replay expiry is governed by the database clock.
 const TRUST_NOW: u64 = 1_900_000_000;
 
 /// A sweeping redemption reaches every entry of its kind below its `now`, so each sweeping test has
@@ -1186,7 +1182,7 @@ fn a_reconnected_store_refuses_a_second_redemption_of_the_same_token() {
         reset_tokens(&store, "ask", &[&spent, &fresh]);
         assert!(
             store
-                .redeem_plane_token("ask", &spent, TRUST_NOW + 900, TRUST_NOW)
+                .redeem_plane_token("ask", &spent, u64::MAX, TRUST_NOW)
                 .unwrap(),
             "the FIRST redemption must be answered `true`, or nothing below is about single use"
         );
@@ -1196,14 +1192,14 @@ fn a_reconnected_store_refuses_a_second_redemption_of_the_same_token() {
     let reopened = connect_store_with_retry(&url).expect("reconnect");
     assert!(
         !reopened
-            .redeem_plane_token("ask", &spent, TRUST_NOW + 900, TRUST_NOW + 1)
+            .redeem_plane_token("ask", &spent, u64::MAX, TRUST_NOW + 1)
             .unwrap(),
         "a restart handed a spent approval back"
     );
     // THE CONTROL: a ledger that refused everything would satisfy the case above.
     assert!(
         reopened
-            .redeem_plane_token("ask", &fresh, TRUST_NOW + 900, TRUST_NOW + 2)
+            .redeem_plane_token("ask", &fresh, u64::MAX, TRUST_NOW + 2)
             .unwrap(),
         "a different token is not the one that was spent"
     );
@@ -1221,16 +1217,16 @@ fn a_token_is_single_use_within_its_kind_not_across_kinds() {
     reset_tokens(&store, "ask", &[&token]);
     reset_tokens(&store, "other_kind", &[&token]);
     assert!(store
-        .redeem_plane_token("ask", &token, TRUST_NOW + 900, TRUST_NOW)
+        .redeem_plane_token("ask", &token, u64::MAX, TRUST_NOW)
         .unwrap());
     assert!(
         store
-            .redeem_plane_token("other_kind", &token, TRUST_NOW + 900, TRUST_NOW)
+            .redeem_plane_token("other_kind", &token, u64::MAX, TRUST_NOW)
             .unwrap(),
         "the same token string under another kind is a different ledger entry"
     );
     assert!(!store
-        .redeem_plane_token("ask", &token, TRUST_NOW + 900, TRUST_NOW)
+        .redeem_plane_token("ask", &token, u64::MAX, TRUST_NOW)
         .unwrap());
     reset_tokens(&store, "ask", &[&token]);
     reset_tokens(&store, "other_kind", &[&token]);
@@ -1248,11 +1244,11 @@ fn a_second_node_cannot_redeem_a_token_the_first_already_spent() {
     reset_tokens(&node_a, "ask", &[&nonce]);
 
     assert!(node_a
-        .redeem_plane_token("ask", &nonce, TRUST_NOW + 900, TRUST_NOW)
+        .redeem_plane_token("ask", &nonce, u64::MAX, TRUST_NOW)
         .unwrap());
     assert!(
         !node_b
-            .redeem_plane_token("ask", &nonce, TRUST_NOW + 900, TRUST_NOW)
+            .redeem_plane_token("ask", &nonce, u64::MAX, TRUST_NOW)
             .unwrap(),
         "a second node redeemed a token the first already spent"
     );
@@ -1284,7 +1280,7 @@ fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
                 let barrier = std::sync::Arc::clone(&barrier);
                 scope.spawn(move || {
                     barrier.wait();
-                    node.redeem_plane_token("ask", &nonce, TRUST_NOW + 900, TRUST_NOW)
+                    node.redeem_plane_token("ask", &nonce, u64::MAX, TRUST_NOW)
                         .expect("redeem_plane_token") as usize
                 })
             })
@@ -1299,8 +1295,7 @@ fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
     reset_tokens(&cleanup, "ask", &[&nonce]);
 }
 
-/// THE LEDGER IS BOUNDED BY ONE VALIDITY WINDOW: `now` rides every redemption so lapsed entries go
-/// in the same call, and an entry still inside its window is never swept.
+/// A live redemption removes old rows using database time and retains still-live rows.
 #[test]
 fn redeeming_evicts_entries_whose_token_can_no_longer_be_presented() {
     let database = require_live_database();
@@ -1313,15 +1308,21 @@ fn redeeming_evicts_entries_whose_token_can_no_longer_be_presented() {
     let store = connect_store_with_retry(&url).expect("connect");
     reset_tokens(&store, SWEEP_KIND_EVICT, &[&short, &long, &other]);
 
+    const EXPIRED_AT_EPOCH: i64 = 0;
+    // Seed a genuinely expired historical row using the authoritative database epoch.
+    store
+        .lock()
+        .execute(
+            "INSERT INTO plane_tokens(kind,token,expires_at) VALUES ($1,$2,$3)",
+            &[&SWEEP_KIND_EVICT, &short, &EXPIRED_AT_EPOCH],
+        )
+        .unwrap();
     assert!(store
-        .redeem_plane_token(SWEEP_KIND_EVICT, &short, TRUST_NOW + 10, TRUST_NOW)
-        .unwrap());
-    assert!(store
-        .redeem_plane_token(SWEEP_KIND_EVICT, &long, TRUST_NOW + 10_000, TRUST_NOW)
+        .redeem_plane_token(SWEEP_KIND_EVICT, &long, u64::MAX, TRUST_NOW)
         .unwrap());
     let later = TRUST_NOW + 11;
     assert!(store
-        .redeem_plane_token(SWEEP_KIND_EVICT, &other, later + 900, later)
+        .redeem_plane_token(SWEEP_KIND_EVICT, &other, u64::MAX, later)
         .unwrap());
 
     let still_there = |nonce: &str| -> bool {
@@ -1345,38 +1346,14 @@ fn redeeming_evicts_entries_whose_token_can_no_longer_be_presented() {
     reset_tokens(&store, SWEEP_KIND_EVICT, &[&short, &long, &other]);
 }
 
-/// THE SWEEP BOUNDARY IS STRICT: an entry whose `expires_at` EQUALS the sweeping redemption's `now`
-/// is still live and must stay in the ledger, so its second presentation is refused. Sweeping with
-/// `<=` would evict it one second early and hand a still-valid approval back.
+/// The strict boundary is checked against the database clock, not the caller clock.
 #[test]
 fn a_ledger_entry_expiring_exactly_now_is_not_swept() {
-    let database = require_live_database();
-    let url = database.url();
-    let (edge, sweeper) = (trust_ns("nonce-edge"), trust_ns("nonce-edge-sweeper"));
-    let store = connect_store_with_retry(&url).expect("connect");
-    reset_tokens(&store, SWEEP_KIND_EDGE, &[&edge, &sweeper]);
-
-    let deadline = TRUST_NOW + 10;
-    assert!(store
-        .redeem_plane_token(SWEEP_KIND_EDGE, &edge, deadline, TRUST_NOW)
-        .unwrap());
-    assert!(store
-        .redeem_plane_token(SWEEP_KIND_EDGE, &sweeper, deadline + 900, deadline)
-        .unwrap());
-    assert!(
-        !store
-            .redeem_plane_token(SWEEP_KIND_EDGE, &edge, deadline, TRUST_NOW)
-            .unwrap(),
-        "an entry expiring exactly at the sweep's `now` was evicted: the sweep must be `<`, not `<=`"
-    );
-    reset_tokens(&store, SWEEP_KIND_EDGE, &[&edge, &sweeper]);
+    super::token_clock::assert_strict_boundary(SWEEP_KIND_EDGE);
 }
 
-/// REFUSED RATHER THAN CLAMPED: a `now` clamped to `i64::MAX` would sweep the kind's entire ledger
-/// and then report the insert as a first redemption — every spent token reopened at once.
-/// `expires_at` alone saturates: `u64::MAX` is busbar's "never expires" for a minting claim (the
-/// boot's node identity, BUSBAR-9007), compared only by the sweep and never read back, so it is
-/// stored as `i64::MAX` and SPENT by its first redemption.
+/// Caller-clock range cannot reopen spent tokens; unrelated record timestamps remain exact.
+/// Permanent expiry keeps the existing saturating representation in this signed SQL column.
 #[test]
 fn the_ledger_refuses_values_it_cannot_store_faithfully() {
     let database = require_live_database();
@@ -1400,14 +1377,14 @@ fn the_ledger_refuses_values_it_cannot_store_faithfully() {
             .unwrap(),
         "a never-expiring grant is spent by its first redemption"
     );
-    store
-        .redeem_plane_token("ask", &nonce, TRUST_NOW + 900, u64::MAX)
-        .expect_err("an unstorable now must be an error");
+    assert!(store
+        .redeem_plane_token("ask", &nonce, u64::MAX, u64::MAX)
+        .unwrap());
     store
         .upsert_plane_record(demotion(&srv, "tool-drift", u64::MAX).view())
         .expect_err("an unstorable ts must be an error rather than a mangled row");
 
-    assert!(store
+    assert!(!store
         .redeem_plane_token("ask", &nonce, i64::MAX as u64, TRUST_NOW)
         .unwrap());
     reset_tokens(&store, "ask", &[&nonce, &forever]);

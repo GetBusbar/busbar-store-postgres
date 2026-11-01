@@ -206,3 +206,82 @@ fn unsigned_usage_purge_preserves_zero_equal_cutoffs_and_metering() {
         assert_eq!(store.get_usage("bucket", key).unwrap(), ledger(5));
     }
 }
+
+#[test]
+fn pre_v17_usage_keys_migrate_without_reinterpreting_existing_maximum_rows() {
+    let Some(url) = live_url() else { return };
+    let db = TempDb::create(&url, "spg_usage_v16");
+    let store = TestStore::open(&db.url()).unwrap();
+    for key in [0, 1, i64::MAX as u64] {
+        store.put_usage("bucket", key, &ledger(7)).unwrap();
+        store.add_metering(&meter(key, 9)).unwrap();
+    }
+    store
+        .lock()
+        .batch_execute("DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (16)")
+        .unwrap();
+    drop(store);
+    let reopened = TestStore::open(&db.url()).unwrap();
+    for key in [0, 1, i64::MAX as u64] {
+        assert_eq!(reopened.get_usage("bucket", key).unwrap(), ledger(7));
+        let rows = reopened.list_metering(key).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].requests, 9);
+        assert_eq!(rows[0].usage_units.get("audio_seconds"), Some(&9));
+    }
+    assert_eq!(
+        reopened.get_usage("bucket", u64::MAX).unwrap(),
+        UsageLedger::default()
+    );
+    assert!(reopened.list_metering(u64::MAX).unwrap().is_empty());
+    reopened.put_usage("bucket", u64::MAX, &ledger(11)).unwrap();
+    reopened.add_metering(&meter(u64::MAX, 13)).unwrap();
+    assert_eq!(
+        reopened.get_usage("bucket", i64::MAX as u64).unwrap(),
+        ledger(7)
+    );
+    assert_eq!(reopened.get_usage("bucket", u64::MAX).unwrap(), ledger(11));
+    assert_eq!(
+        reopened.list_metering(i64::MAX as u64).unwrap()[0].requests,
+        9
+    );
+    assert_eq!(reopened.list_metering(u64::MAX).unwrap()[0].requests, 13);
+}
+
+#[test]
+fn pre_v17_negative_usage_key_provenance_is_not_silently_reinterpreted() {
+    let Some(url) = live_url() else { return };
+    for (table, column) in [
+        ("usage_windows", "window_start"),
+        ("usage_ledger", "window_start"),
+        ("usage_ledger_units", "window_start"),
+        ("usage_metering", "bucket"),
+        ("usage_metering_units", "bucket"),
+    ] {
+        let db = TempDb::create(&url, "spg_usage_negative");
+        let store = TestStore::open(&db.url()).unwrap();
+        store.put_usage("bucket", 1, &ledger(7)).unwrap();
+        store.add_metering(&meter(1, 9)).unwrap();
+        store
+            .lock()
+            .batch_execute(&format!(
+                "UPDATE {table} SET {column}=-1;
+             DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (16)"
+            ))
+            .unwrap();
+        drop(store);
+        let error = TestStore::open(&db.url())
+            .err()
+            .expect("unknown old key encoding");
+        assert!(error.contains("negative usage key"), "{error}");
+        let mut raw = connect_client_with_retry(&db.url());
+        let row = raw
+            .query_one(
+                &format!("SELECT {column}, (SELECT max(version) FROM busbar_schema) FROM {table}"),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(row.get::<_, i64>(0), -1);
+        assert_eq!(row.get::<_, i64>(1), 16);
+    }
+}

@@ -974,7 +974,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
             .expect("a later agreeing observation clears the quarantine");
         assert!(
             store
-                .redeem_plane_token(&ask_kind, &nonce_restart, NOW + 900, NOW)
+                .redeem_plane_token(&ask_kind, &nonce_restart, u64::MAX, NOW)
                 .expect("redeem_plane_token"),
             "the FIRST redemption must be answered `true`, or nothing below is about single use"
         );
@@ -998,7 +998,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 
     assert!(
         !store
-            .redeem_plane_token(&ask_kind, &nonce_restart, NOW + 900, NOW + 1)
+            .redeem_plane_token(&ask_kind, &nonce_restart, u64::MAX, NOW + 1)
             .expect("redeem_plane_token"),
         "a restart handed a spent approval back over the plugin ABI"
     );
@@ -1007,18 +1007,18 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let node_b = common::dropped_at(&path, &cfg)
         .expect("a second node loads the same plugin against the same database");
     assert!(store
-        .redeem_plane_token(&ask_kind, &nonce_fleet, NOW + 900, NOW + 2)
+        .redeem_plane_token(&ask_kind, &nonce_fleet, u64::MAX, NOW + 2)
         .expect("redeem_plane_token"));
     assert!(
         !node_b
-            .redeem_plane_token(&ask_kind, &nonce_fleet, NOW + 900, NOW + 3)
+            .redeem_plane_token(&ask_kind, &nonce_fleet, u64::MAX, NOW + 3)
             .expect("redeem_plane_token"),
         "a second node redeemed an approval the first already spent"
     );
     // THE CONTROL: a ledger that refused everything would satisfy both cases above.
     assert!(
         node_b
-            .redeem_plane_token(&ask_kind, &nonce_fresh, NOW + 900, NOW + 4)
+            .redeem_plane_token(&ask_kind, &nonce_fresh, u64::MAX, NOW + 4)
             .expect("redeem_plane_token"),
         "a freshly minted approval is not the one that was spent"
     );
@@ -1032,7 +1032,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "the demotion must be physically present in Postgres, not merely cached in the plugin"
     );
     assert!(
-        !RecordStore::redeem_plane_token(&direct, &ask_kind, &nonce_restart, NOW + 900, NOW + 5)
+        !RecordStore::redeem_plane_token(&direct, &ask_kind, &nonce_restart, u64::MAX, NOW + 5)
             .expect("redeem_plane_token via the direct connection"),
         "the spent-token row must be physically present in Postgres"
     );

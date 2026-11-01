@@ -61,8 +61,7 @@ fn historical_attribution_survives_batch_replay_and_reopen() {
     let Some(url) = live_url() else { return };
     let db = TempDb::create(&url, "spg_attribution");
     let store = TestStore::open(&db.url()).unwrap();
-    const ATTRIBUTION_BUCKET: u64 = 17;
-    let bucket = ATTRIBUTION_BUCKET;
+    let bucket = u64::MAX - 1;
     let mut deltas: Vec<_> = [
         ("", ""),
         ("group", "v1"),
@@ -94,6 +93,130 @@ fn historical_attribution_survives_batch_replay_and_reopen() {
     let reopened = TestStore::open(&db.url()).unwrap();
     reopened.add_metering_batch_op(op, &deltas).unwrap();
     assert_attributed_rows(reopened.list_metering(bucket).unwrap());
+}
+
+fn legacy_metering(raw: &mut postgres::Client) {
+    raw.batch_execute(
+        "CREATE TABLE legacy_metering_units AS SELECT key_id,bucket,model,provider,priced_from_ms,unit,count FROM usage_metering_units;
+         DROP TABLE usage_metering_units;
+         ALTER TABLE legacy_metering_units RENAME TO usage_metering_units;
+         ALTER TABLE usage_metering_units ADD PRIMARY KEY (key_id,bucket,model,provider,priced_from_ms,unit);
+         ALTER TABLE usage_metering DROP CONSTRAINT IF EXISTS usage_metering_pkey;
+         ALTER TABLE usage_metering ADD PRIMARY KEY (key_id,bucket,model,provider,priced_from_ms);
+         DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (17);"
+    ).unwrap();
+}
+
+#[test]
+fn migration_preserves_legacy_attribution_units_and_replay() {
+    let Some(url) = live_url() else { return };
+    for (group, version) in [("", ""), ("historical", "old-version ")] {
+        let db = TempDb::create(&url, "spg_meter_history");
+        let store = TestStore::open(&db.url()).unwrap();
+        let old = attributed_meter(u64::MAX, group, version, 7);
+        let op = OpId::from_parts(601, 5);
+        store
+            .add_metering_batch_op(op, std::slice::from_ref(&old))
+            .unwrap();
+        let expected = store.list_metering(old.bucket).unwrap();
+        drop(store);
+        let mut raw = connect_client_with_retry(&db.url());
+        legacy_metering(&mut raw);
+        drop(raw);
+        let migrated = TestStore::open(&db.url()).unwrap();
+        migrated
+            .add_metering_batch_op(op, std::slice::from_ref(&old))
+            .unwrap();
+        assert_eq!(migrated.list_metering(old.bucket).unwrap(), expected);
+        let new = MeteringDelta {
+            key_group_at_use: "new-group".into(),
+            pricing_version: "new-version".into(),
+            ..old.clone()
+        };
+        migrated.add_metering(&new).unwrap();
+        let rows = migrated.list_metering(old.bucket).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&expected[0]));
+        for row in rows {
+            assert_eq!(row.usage_units, old.usage_units);
+        }
+    }
+}
+
+#[test]
+fn migration_refuses_orphan_metering_units_without_inventing_attribution() {
+    let Some(url) = live_url() else { return };
+    let db = TempDb::create(&url, "spg_meter_orphan");
+    let store = TestStore::open(&db.url()).unwrap();
+    store
+        .add_metering(&attributed_meter(17, "group", "version", 7))
+        .unwrap();
+    drop(store);
+    let mut raw = connect_client_with_retry(&db.url());
+    legacy_metering(&mut raw);
+    raw.batch_execute("DELETE FROM usage_metering").unwrap();
+    for _ in 0..2 {
+        let error = TestStore::open(&db.url())
+            .err()
+            .expect("orphan must refuse migration");
+        assert!(
+            error.contains("metering unit attribution has no parent"),
+            "{error}"
+        );
+        let count: i64 = raw
+            .query_one("SELECT count FROM usage_metering_units", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(count, 7);
+    }
+}
+
+#[test]
+fn long_historical_attribution_migrates_and_accumulates_without_an_index_limit() {
+    let Some(url) = live_url() else { return };
+    let db = TempDb::create(&url, "spg_long_attribution");
+    let store = TestStore::open(&db.url()).unwrap();
+    let group: String = (0..1024_u64)
+        .map(|i| {
+            format!(
+                "{:016x}",
+                i.wrapping_mul(0x9e3779b97f4a7c15).rotate_left(17)
+            )
+        })
+        .collect();
+    let version: String = group.chars().rev().collect();
+    let old = attributed_meter(u64::MAX, &group, &version, 7);
+    store.add_metering(&old).unwrap();
+    let expected = store.list_metering(old.bucket).unwrap();
+    drop(store);
+    let mut raw = connect_client_with_retry(&db.url());
+    legacy_metering(&mut raw);
+    drop(raw);
+    let migrated = TestStore::open(&db.url()).unwrap();
+    assert_eq!(migrated.list_metering(old.bucket).unwrap(), expected);
+    migrated.add_metering(&old).unwrap();
+    let new = MeteringDelta {
+        pricing_version: format!("{version}changed"),
+        ..old.clone()
+    };
+    migrated.add_metering(&new).unwrap();
+    let rows = migrated.list_metering(old.bucket).unwrap();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(row.key_group_at_use, group);
+        let n = if row.pricing_version == version {
+            14
+        } else {
+            assert_eq!(row.pricing_version, new.pricing_version);
+            7
+        };
+        assert_eq!(row.requests, n);
+        assert_eq!(row.tokens_input, n);
+        assert_eq!(
+            row.usage_units,
+            BTreeMap::from([("audio_seconds".into(), n)])
+        );
+    }
 }
 
 #[test]
