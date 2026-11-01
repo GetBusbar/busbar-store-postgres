@@ -15,11 +15,8 @@
 
 use super::*;
 
-/// Timestamps are BANDED. `purge_plane_records_before` is GLOBAL per kind and cannot be scoped to a
-/// task or a principal, so against the SHARED live database a purge test's cutoff would delete every
-/// other test's old rows if the timestamps overlapped. Everything below the top of this band belongs
-/// to the purge tests (this file's and the conformance suite's, which sweep at 100_000); every other
-/// test writes ABOVE it.
+/// The retention fixtures span both sides of this cutoff in a disposable database.
+/// Each case owns its complete database, so kind-wide sweeps cannot delete a sibling's records.
 const PURGE_BAND_TOP: u64 = 1_000_100_000;
 const LIVE_TS: u64 = 2_000_000_000;
 
@@ -30,6 +27,40 @@ static PLANE_PURGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(super) fn lock_plane_purge() -> std::sync::MutexGuard<'static, ()> {
     PLANE_PURGE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn private_database() -> Option<TempDb> {
+    live_url().map(|url| TempDb::create(&url, "spg_plane"))
+}
+
+pub(super) fn wait_for_blocked_backends(
+    observer: &mut postgres::Client,
+    blocker: i32,
+    expected: usize,
+) -> Result<Vec<i32>, postgres::Error> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: Vec<i32> = observer
+            .query(
+                "WITH RECURSIVE waiting(pid) AS (
+                   SELECT pid FROM pg_stat_activity
+                   WHERE datname=current_database() AND wait_event_type='Lock'
+                     AND $1 = ANY(pg_blocking_pids(pid))
+                   UNION
+                   SELECT a.pid FROM pg_stat_activity a JOIN waiting w
+                     ON w.pid = ANY(pg_blocking_pids(a.pid))
+                   WHERE a.datname=current_database() AND a.wait_event_type='Lock'
+                 ) SELECT pid FROM waiting ORDER BY pid",
+                &[&blocker],
+            )?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        if waiting.len() >= expected || std::time::Instant::now() >= deadline {
+            return Ok(waiting);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn body(v: serde_json::Value) -> Vec<u8> {
@@ -117,7 +148,7 @@ fn demotion(server: &str, reason: &str, recorded_at: u64) -> PlaneRecord {
     }
 }
 
-/// Live Postgres is SHARED across tests, so each test owns its own ids and clears them first.
+/// Clear a record inside the disposable database this case owns.
 fn reset(store: &TestStore, kind: &str, ids: &[&str]) {
     let mut c = store.lock();
     for id in ids {
@@ -201,7 +232,10 @@ fn listed_task_ids(store: &TestStore) -> Vec<String> {
 /// chain still links from the bodies the server hands back.
 #[test]
 fn an_mcp_call_chain_survives_dropping_the_connection_and_reconnecting() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let p = "vk_mcp_restart";
     {
         let store = connect_store_with_retry(&url).expect("connect");
@@ -251,7 +285,10 @@ fn an_mcp_call_chain_survives_dropping_the_connection_and_reconnecting() {
 /// seen, so the store must be able to name every principal holding records — each exactly once.
 #[test]
 fn mcp_call_principals_are_enumerable_after_a_reconnect() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let (a, b) = ("vk_mcp_enum_a", "vk_mcp_enum_b");
     {
         let store = connect_store_with_retry(&url).expect("connect");
@@ -296,7 +333,10 @@ fn mcp_call_principals_are_enumerable_after_a_reconnect() {
 /// the cutoff, whatever its disposition.
 #[test]
 fn purge_calls_before_deletes_and_returns_a_real_count() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let _guard = lock_plane_purge();
     let store = connect_store_with_retry(&url).expect("connect");
     clear_purge_band(&store);
@@ -350,7 +390,10 @@ fn purge_calls_before_deletes_and_returns_a_real_count() {
 /// an error. Overwriting would destroy the second case instead of reporting it.
 #[test]
 fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     let p = "vk_mcp_replay";
     reset(&store, "call", &[p]);
@@ -395,7 +438,10 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
 /// interrupted), and read back through a NEW connection.
 #[test]
 fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let (t1, t2) = ("t_restart_1", "t_restart_2");
     let second = task(
         t1,
@@ -456,7 +502,10 @@ fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
 /// pre-filtered for any one of those would break the other two.
 #[test]
 fn listing_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let rows = [
         ("t_list_working", "working", PlaneDisposition::Active),
         (
@@ -498,7 +547,10 @@ fn listing_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
 /// with the task as its parent.
 #[test]
 fn deleting_a_task_deletes_its_event_chain() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let t = "t_delete_chain_1";
     let store = connect_store_with_retry(&url).expect("connect");
     reset(&store, "task_event", &[t]);
@@ -522,7 +574,10 @@ fn deleting_a_task_deletes_its_event_chain() {
 /// counts them all, and leaves the active rows.
 #[test]
 fn a_purge_spanning_several_batches_is_whole() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let tmp = super::TempDb::create(&url, "spg_purge");
     let store = connect_store_with_retry(&tmp.url()).expect("connect");
     store
@@ -551,7 +606,10 @@ fn a_purge_spanning_several_batches_is_whole() {
 
 #[test]
 fn plane_purge_keeps_strict_cutoffs_above_the_signed_timestamp_boundary() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let max = i64::MAX as u64;
     for retention in [Retention::Age, Retention::TerminalOnly] {
         let tmp = super::TempDb::create(&url, "spg_purge_max");
@@ -638,7 +696,10 @@ fn plane_purge_keeps_strict_cutoffs_above_the_signed_timestamp_boundary() {
 /// appending an event for a task with no row yet has to WORK (no foreign key between the tables).
 #[test]
 fn a_task_event_chain_survives_a_reconnect_and_still_links() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let (t1, t2) = ("t_chain_1", "t_chain_2");
     {
         let store = connect_store_with_retry(&url).expect("connect");
@@ -694,7 +755,10 @@ fn a_task_event_chain_survives_a_reconnect_and_still_links() {
 /// fork check exists to report.
 #[test]
 fn a_replayed_task_event_is_idempotent_but_a_forked_one_is_refused() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     let t = "t_replay_event";
     reset(&store, "task_event", &[t]);
@@ -728,7 +792,10 @@ fn a_replayed_task_event_is_idempotent_but_a_forked_one_is_refused() {
 /// word its body carries.
 #[test]
 fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let _guard = lock_plane_purge();
     let store = connect_store_with_retry(&url).expect("connect");
     clear_purge_band(&store);
@@ -842,7 +909,10 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
 /// other task.
 #[test]
 fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let _guard = lock_plane_purge();
     let store = connect_store_with_retry(&url).expect("connect");
     clear_purge_band(&store);
@@ -897,7 +967,10 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
 /// pinning it is that this store does not choose the database it is pointed at.
 #[test]
 fn task_ids_differing_only_in_case_are_distinct_tasks() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     let (lower, upper) = ("t_case_fold", "T_CASE_FOLD");
     reset(&store, "task", &[lower, upper]);
@@ -945,7 +1018,10 @@ fn task_ids_differing_only_in_case_are_distinct_tasks() {
 /// retention timestamp silently changed — and nothing would ever have reported an error.
 #[test]
 fn a_sidecar_value_beyond_the_storable_range_is_refused_rather_than_clamped() {
-    let Some(url) = live_url() else { return };
+    let Some(database) = private_database() else {
+        return;
+    };
+    let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     let t = "t_out_of_range";
     reset(&store, "task", &[t]);
@@ -993,18 +1069,19 @@ fn a_sidecar_value_beyond_the_storable_range_is_refused_rather_than_clamped() {
 // approval back at the next restart. Every case reads back through a RECONNECTED store, and the
 // ledger cases include genuinely independent connections — which is what a second node is.
 
-/// THE LIVE URL, OR A FAILURE. Deliberately NOT `live_url()`, whose `None` arm lets a case return
+/// A PRIVATE DATABASE, OR A FAILURE. Deliberately NOT `live_url()`, whose `None` arm lets a case return
 /// green having tested nothing: these are exactly the properties where a skipped test costs an
 /// operator something.
-fn require_live_url() -> String {
-    std::env::var("BUSBAR_TEST_POSTGRES_URL").unwrap_or_else(|_| {
+fn require_live_database() -> TempDb {
+    let url = std::env::var("BUSBAR_TEST_POSTGRES_URL").unwrap_or_else(|_| {
         panic!(
             "BUSBAR_TEST_POSTGRES_URL is unset. These cases are the ONLY coverage of the durable \
              demotion record, the single-use token ledger and the push-callback capability on this \
              backend, and all of them fail SILENTLY when unimplemented. Point this at a live \
              Postgres, e.g. postgres://busbar:busbar@127.0.0.1:5432/busbar_test"
         )
-    })
+    });
+    TempDb::create(&url, "spg_plane_trust")
 }
 
 /// Per-process namespacing: a fixed key would have two concurrent runs redeeming each other's
@@ -1038,7 +1115,8 @@ fn demotions(store: &TestStore) -> Vec<serde_json::Value> {
 /// a quarantined upstream its approval back.
 #[test]
 fn a_demotion_survives_dropping_the_store_and_reconnecting() {
-    let url = require_live_url();
+    let database = require_live_database();
+    let url = database.url();
     let (a, b, c) = (
         trust_ns("srv-payments"),
         trust_ns("srv-search"),
@@ -1100,7 +1178,8 @@ fn a_demotion_survives_dropping_the_store_and_reconnecting() {
 /// presentation exactly as on its first; only a record that the first happened tells them apart.
 #[test]
 fn a_reconnected_store_refuses_a_second_redemption_of_the_same_token() {
-    let url = require_live_url();
+    let database = require_live_database();
+    let url = database.url();
     let (spent, fresh) = (trust_ns("nonce-restart"), trust_ns("nonce-restart-other"));
     {
         let store = connect_store_with_retry(&url).expect("connect");
@@ -1135,7 +1214,8 @@ fn a_reconnected_store_refuses_a_second_redemption_of_the_same_token() {
 /// capability from the same string under another, so neither redemption may refuse the other.
 #[test]
 fn a_token_is_single_use_within_its_kind_not_across_kinds() {
-    let url = require_live_url();
+    let database = require_live_database();
+    let url = database.url();
     let token = trust_ns("nonce-kinds");
     let store = connect_store_with_retry(&url).expect("connect");
     reset_tokens(&store, "ask", &[&token]);
@@ -1160,7 +1240,8 @@ fn a_token_is_single_use_within_its_kind_not_across_kinds() {
 /// the second redemption is an ordinary request a load balancer sends somewhere else.
 #[test]
 fn a_second_node_cannot_redeem_a_token_the_first_already_spent() {
-    let url = require_live_url();
+    let database = require_live_database();
+    let url = database.url();
     let nonce = trust_ns("nonce-fleet");
     let node_a = connect_store_with_retry(&url).expect("node A connects");
     let node_b = connect_store_with_retry(&url).expect("node B connects");
@@ -1182,22 +1263,26 @@ fn a_second_node_cannot_redeem_a_token_the_first_already_spent() {
 /// barrier — the arrangement a read-then-write implementation answers "first" to eight times.
 #[test]
 fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
-    let url = require_live_url();
+    let database = require_live_database();
+    let url = database.url();
     let nonce = trust_ns("nonce-race");
     let cleanup = connect_store_with_retry(&url).expect("connect");
     reset_tokens(&cleanup, "ask", &[&nonce]);
     drop(cleanup);
 
     let n = 8usize;
+    // A failed connection must happen before any worker can block at the barrier.
+    let nodes: Vec<_> = (0..n)
+        .map(|_| connect_store_with_retry(&url).expect("a racing node connects"))
+        .collect();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
     let winners: usize = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..n)
-            .map(|_| {
-                let url = url.clone();
+        let handles: Vec<_> = nodes
+            .into_iter()
+            .map(|node| {
                 let nonce = nonce.clone();
                 let barrier = std::sync::Arc::clone(&barrier);
                 scope.spawn(move || {
-                    let node = connect_store_with_retry(&url).expect("a racing node connects");
                     barrier.wait();
                     node.redeem_plane_token("ask", &nonce, TRUST_NOW + 900, TRUST_NOW)
                         .expect("redeem_plane_token") as usize
@@ -1218,7 +1303,8 @@ fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
 /// in the same call, and an entry still inside its window is never swept.
 #[test]
 fn redeeming_evicts_entries_whose_token_can_no_longer_be_presented() {
-    let url = require_live_url();
+    let database = require_live_database();
+    let url = database.url();
     let (short, long, other) = (
         trust_ns("nonce-short"),
         trust_ns("nonce-long"),
@@ -1264,7 +1350,8 @@ fn redeeming_evicts_entries_whose_token_can_no_longer_be_presented() {
 /// `<=` would evict it one second early and hand a still-valid approval back.
 #[test]
 fn a_ledger_entry_expiring_exactly_now_is_not_swept() {
-    let url = require_live_url();
+    let database = require_live_database();
+    let url = database.url();
     let (edge, sweeper) = (trust_ns("nonce-edge"), trust_ns("nonce-edge-sweeper"));
     let store = connect_store_with_retry(&url).expect("connect");
     reset_tokens(&store, SWEEP_KIND_EDGE, &[&edge, &sweeper]);
@@ -1292,7 +1379,8 @@ fn a_ledger_entry_expiring_exactly_now_is_not_swept() {
 /// stored as `i64::MAX` and SPENT by its first redemption.
 #[test]
 fn the_ledger_refuses_values_it_cannot_store_faithfully() {
-    let url = require_live_url();
+    let database = require_live_database();
+    let url = database.url();
     let nonce = trust_ns("nonce-range");
     let forever = trust_ns("nonce-forever");
     let srv = trust_ns("srv-range");
@@ -1331,7 +1419,8 @@ fn the_ledger_refuses_values_it_cannot_store_faithfully() {
 /// disposition, and holds nothing once deleted.
 #[test]
 fn plane_token_live_carries_a_task_and_dies_with_it() {
-    let url = require_live_url();
+    let database = require_live_database();
+    let url = database.url();
     let id = trust_ns("push-live");
     let store = connect_store_with_retry(&url).expect("connect");
     reset(&store, "push_config", &[&id]);
@@ -1386,7 +1475,8 @@ fn plane_token_live_carries_a_task_and_dies_with_it() {
 /// token holds nothing live.
 #[test]
 fn plane_token_live_refuses_a_lapsed_token_and_an_unknown_one() {
-    let url = require_live_url();
+    let database = require_live_database();
+    let url = database.url();
     let id = trust_ns("push-lapse");
     let store = connect_store_with_retry(&url).expect("connect");
     reset(&store, "push_config", &[&id]);
@@ -1429,7 +1519,8 @@ fn plane_token_live_refuses_a_lapsed_token_and_an_unknown_one() {
 /// return several rows (`query_one` fails) or read another schema's collation.
 #[test]
 fn the_plane_identity_columns_pin_a_byte_exact_collation() {
-    let url = require_live_url();
+    let database = require_live_database();
+    let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     for (table, column) in [
         ("plane_records", "kind"),
@@ -1486,7 +1577,8 @@ fn wipe_kind(store: &TestStore, kind: &str) {
 /// itself); a record that names itself as its parent is listed as one.
 #[test]
 fn an_appended_record_honours_its_actual_parent() {
-    let url = require_live_url();
+    let database = require_live_database();
+    let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     let kind = format!("r14_{}", unique_suffix());
     wipe_kind(&store, &kind);
@@ -1538,7 +1630,8 @@ fn an_appended_record_honours_its_actual_parent() {
 /// the appended rows together.
 #[test]
 fn list_plane_records_is_one_order_across_upserts_and_appends() {
-    let url = require_live_url();
+    let database = require_live_database();
+    let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     let kind = format!("r15_{}", unique_suffix());
     wipe_kind(&store, &kind);
@@ -1568,7 +1661,8 @@ fn list_plane_records_is_one_order_across_upserts_and_appends() {
 /// version of the row after the lock wait.
 #[test]
 fn a_purge_spares_a_row_rewritten_while_it_waited() {
-    let url = require_live_url();
+    let database = require_live_database();
+    let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     let kind = format!("p19_{}", unique_suffix());
     wipe_kind(&store, &kind);
@@ -1577,21 +1671,43 @@ fn a_purge_spares_a_row_rewritten_while_it_waited() {
     store.upsert_plane_record(old.view()).unwrap();
 
     let mut holder = connect_client_with_retry(&url);
+    let holder_pid: i32 = holder
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+    let mut observer = connect_client_with_retry(&url);
     holder
         .batch_execute(&format!(
             "BEGIN; UPDATE plane_records SET ts = 5000 WHERE kind = '{kind}' AND id = 'x'"
         ))
         .unwrap();
-    let purged = std::thread::scope(|s| {
+    let (blocked, released, purged) = std::thread::scope(|s| {
         let purge = s.spawn(|| store.purge_plane_records(&kind, 1000, Retention::Age));
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        holder.batch_execute("COMMIT").unwrap();
-        purge.join().unwrap().expect("purge")
+        let blocked = wait_for_blocked_backends(&mut observer, holder_pid, 1);
+        // Always release the row before judging the observation or worker result.
+        let released = holder.batch_execute("COMMIT");
+        (blocked, released, purge.join().unwrap())
     });
+    released.expect("release the rewritten row");
+    assert_eq!(
+        blocked.expect("observe the purge backend").len(),
+        1,
+        "the purge must actually wait on the transaction rewriting this row"
+    );
+    let purged = purged.expect("purge");
     assert_eq!(purged, 0, "the rewritten row no longer matched the cutoff");
     assert!(
         store.get_plane_record(&kind, "x").unwrap().is_some(),
         "the rewritten row survived"
     );
+    let row = store
+        .lock()
+        .query_one(
+            "SELECT ts,body FROM plane_records WHERE kind=$1 AND id='x'",
+            &[&kind],
+        )
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 5000);
+    assert_eq!(row.get::<_, Vec<u8>>(1), old.body);
     wipe_kind(&store, &kind);
 }

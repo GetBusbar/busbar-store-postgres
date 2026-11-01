@@ -196,9 +196,30 @@ fn an_op_id_dedupes_durably_across_a_reconnect() {
         b.append_plane_record_op(fork, rec("two").view()),
         Err(OpRefused::Failed(_))
     ));
+    assert_eq!(
+        b.list_plane_records("call", &PlaneSelector::Parent(parent.clone().into()))
+            .unwrap(),
+        vec![rec("one").body],
+        "the failed fork leaves the committed chain body unchanged"
+    );
+    let recorded: i64 = b
+        .lock()
+        .query_one(
+            "SELECT COUNT(*) FROM store_ops WHERE op_id=$1",
+            &[&&fork.0[..]],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(recorded, 0, "a failed fork must not enter durable dedupe");
     clear(&b);
     b.append_plane_record_op(fork, rec("two").view())
         .expect("a failed op was not recorded, so its retry is evaluated afresh");
+    assert_eq!(
+        b.list_plane_records("call", &PlaneSelector::Parent(parent.clone().into()))
+            .unwrap(),
+        vec![rec("two").body],
+        "the retry must append its actual body, not return a cached success over an empty chain"
+    );
     clear(&b);
 }
 
@@ -238,7 +259,10 @@ fn a_write_refused_before_commit_answers_refused_and_records_nothing() {
     s.append_plane_record_op(id, rec(1).view())
         .expect("the same op_id with a valid record applies");
     s.lock()
-        .execute("DELETE FROM plane_chain WHERE kind = 'refusedkind'", &[])
+        .execute(
+            "DELETE FROM plane_chain WHERE kind = 'refusedkind' AND parent=$1",
+            &[&parent],
+        )
         .unwrap();
 
     let mut meter = MeteringDelta {

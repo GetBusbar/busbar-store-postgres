@@ -31,13 +31,17 @@ use crate::pgwire::Config;
 /// the table hands it.
 type TlsFailure = Arc<Mutex<Option<String>>>;
 
-struct Trusting(Arc<rustls::ClientConfig>, Option<TlsFailure>);
+struct Trusting(Arc<rustls::ClientConfig>, Option<TlsFailure>, bool);
 
-fn trusting(ca_der: &[u8]) -> Arc<dyn SecureDial> {
-    trusting_report(ca_der, None)
+fn trusting(ca_der: &[u8], verify_off: bool) -> Arc<dyn SecureDial> {
+    trusting_report(ca_der, None, verify_off)
 }
 
-fn trusting_report(ca_der: &[u8], failure: Option<TlsFailure>) -> Arc<dyn SecureDial> {
+fn trusting_report(
+    ca_der: &[u8],
+    failure: Option<TlsFailure>,
+    verify_off: bool,
+) -> Arc<dyn SecureDial> {
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(rustls_pki_types::CertificateDer::from(ca_der.to_vec()))
@@ -49,16 +53,20 @@ fn trusting_report(ca_der: &[u8], failure: Option<TlsFailure>) -> Arc<dyn Secure
     .expect("the default protocol versions")
     .with_root_certificates(roots)
     .with_no_client_auth();
-    Arc::new(Trusting(Arc::new(config), failure))
+    Arc::new(Trusting(Arc::new(config), failure, verify_off))
 }
 
 impl SecureDial for Trusting {
     fn secure(
         &self,
         server: &str,
-        _verify_off: bool,
+        verify_off: bool,
         mut tcp: TcpStream,
     ) -> std::io::Result<Box<dyn SecuredSock>> {
+        assert_eq!(
+            verify_off, self.2,
+            "the host must receive the requested TLS verification mode"
+        );
         let name = rustls_pki_types::ServerName::try_from(server.to_owned())
             .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
         let mut tls = rustls::ClientConnection::new(Arc::clone(&self.0), name)
@@ -253,7 +261,7 @@ fn verify_full_secures_the_connection_through_the_host() {
     let (_, tls_url) = through_proxy(&url, port);
     let settings = serde_json::json!({ "url": tls_url }).to_string();
     let store = open_loaded_over(&settings, |d| {
-        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&ca_der)))
+        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&ca_der, false)))
     })
     .expect("the store opens over TLS");
     let sub = format!("tls-{}", std::process::id());
@@ -282,7 +290,7 @@ fn an_untrusted_server_certificate_fails_the_load_in_the_drivers_words() {
     let e = open_loaded_over(&settings, |d| {
         Arc::new(TcpConns::with_tls(
             d.conn_waker(),
-            trusting_report(&other_ca, Some(Arc::clone(&failure))),
+            trusting_report(&other_ca, Some(Arc::clone(&failure)), false),
         ))
     })
     .expect_err("a certificate from an unknown CA is refused");
@@ -562,7 +570,7 @@ fn plaintext_after_the_servers_s_is_refused_before_the_upgrade() {
         "postgres://u:zq9pw@localhost:{port}/d?sslmode=verify-full"
     ));
     let e = open_loaded_over(&settings, |d| {
-        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&ca_der)))
+        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&ca_der, false)))
     })
     .expect_err("a server that injects plaintext is refused");
     assert!(
@@ -651,7 +659,7 @@ fn prefer_secures_the_connection_when_the_server_answers_s() {
     let tls_url = tls_url.replace("sslmode=verify-full", "sslmode=prefer");
     let settings = serde_json::json!({ "url": tls_url }).to_string();
     let store = open_loaded_over(&settings, |d| {
-        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&ca_der)))
+        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&ca_der, true)))
     })
     .expect("prefer upgrades over the proxy's S");
     RecordStore::list_denylist(&store).expect("a read over TLS");

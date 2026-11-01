@@ -327,6 +327,8 @@ fn a_released_v6_database_upgrades_in_place_without_losing_a_row() {
 #[test]
 fn scope_grants_of_every_kind_round_trip_without_collapsing_into_pools() {
     let Some(url) = live_url() else { return };
+    let database = TempDb::create(&url, "spg_shapes");
+    let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     let (mixed, mcp_only) = ("vk_scope_mixed", "vk_scope_mcp_only");
     hard_reset(&store, mixed);
@@ -389,6 +391,8 @@ fn scope_grants_of_every_kind_round_trip_without_collapsing_into_pools() {
 #[test]
 fn the_attribution_fields_round_trip_through_every_key_write() {
     let Some(url) = live_url() else { return };
+    let database = TempDb::create(&url, "spg_shapes");
+    let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     let (a, b) = ("vk_attr_put", "vk_attr_mint");
     hard_reset(&store, a);
@@ -429,6 +433,8 @@ fn the_attribution_fields_round_trip_through_every_key_write() {
 #[test]
 fn idp_provider_round_trips() {
     let Some(url) = live_url() else { return };
+    let database = TempDb::create(&url, "spg_shapes");
+    let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     let id = "vk_idp_provider";
     hard_reset(&store, id);
@@ -446,6 +452,8 @@ fn idp_provider_round_trips() {
 #[test]
 fn the_usage_ledger_carries_open_units_and_applies_refunds() {
     let Some(url) = live_url() else { return };
+    let database = TempDb::create(&url, "spg_shapes");
+    let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     let bucket = "vk_units_ledger";
     hard_reset(&store, bucket);
@@ -577,6 +585,8 @@ fn the_usage_ledger_carries_open_units_and_applies_refunds() {
 #[test]
 fn metering_splits_on_priced_from_ms_and_carries_open_classes() {
     let Some(url) = live_url() else { return };
+    let database = TempDb::create(&url, "spg_shapes");
+    let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     let key_id = format!("vk_meter_units_{}", unique_suffix());
     let bucket = 20_270_611u64;
@@ -625,50 +635,102 @@ fn metering_splits_on_priced_from_ms_and_carries_open_classes() {
     hard_reset(&store, &key_id);
 }
 
-/// `put_credential` on a TOMBSTONED key is refused even when the tombstone commits between the
-/// caller's check and the write: many racing mints against one concurrent delete may never leave a
-/// credential behind under the tombstoned key.
+/// A delete holds the revision transaction while both mints reach that real lock. Once the
+/// observed delete commits, both mints must check the committed tombstone, never an earlier live
+/// owner snapshot, and leave no credential behind.
 #[test]
 fn a_mint_racing_a_delete_never_leaves_a_credential_under_the_tombstone() {
     let Some(url) = live_url() else { return };
+    let database = TempDb::create(&url, "spg_shapes");
+    let url = database.url();
+    let setup = connect_store_with_retry(&url).expect("connect");
+    setup
+        .lock()
+        .batch_execute(
+            "CREATE FUNCTION hold_key_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+           PERFORM pg_advisory_xact_lock(hashtext(current_database()), 1);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER hold_key_delete BEFORE UPDATE OF deleted_at ON keys
+         FOR EACH ROW WHEN (NEW.deleted_at IS NOT NULL) EXECUTE FUNCTION hold_key_delete();",
+        )
+        .unwrap();
+    let mut holder = connect_client_with_retry(&url);
+    let holder_pid: i32 = holder
+        .query_one("SELECT pg_backend_pid()", &[])
+        .unwrap()
+        .get(0);
+    let mut observer = connect_client_with_retry(&url);
     for round in 0..5u32 {
         let id = format!("vk_race_mint_{}_{round}", std::process::id());
-        let setup = connect_store_with_retry(&url).expect("connect");
         hard_reset(&setup, &id);
         setup.put_key(&sample_key(&id)).unwrap();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-        let mints = std::sync::Mutex::new(Vec::new());
-        std::thread::scope(|scope| {
-            for slot in 0..2u8 {
-                let (url, id, barrier) = (url.clone(), id.clone(), barrier.clone());
-                let mints = &mints;
-                scope.spawn(move || {
-                    let s = connect_store_with_retry(&url).expect("connect");
-                    barrier.wait();
-                    let r = s.put_credential(&sample_cred(
-                        &id,
-                        slot,
-                        &format!("AKIA_RACE_{}_{slot}", id.to_uppercase()),
-                    ));
-                    mints.lock().unwrap().push(r);
-                });
-            }
-            let (url, id, barrier) = (url.clone(), id.clone(), barrier.clone());
-            scope.spawn(move || {
-                let s = connect_store_with_retry(&url).expect("connect");
-                barrier.wait();
-                s.delete_key(&id).unwrap();
-            });
+        // Finish every connection before holding the delete inside its actual transaction.
+        let mint_nodes: Vec<_> = (0..2u8)
+            .map(|slot| {
+                (
+                    slot,
+                    connect_store_with_retry(&url).expect("mint node connects"),
+                )
+            })
+            .collect();
+        let delete_node = connect_store_with_retry(&url).expect("delete node connects");
+        holder
+            .query_one(
+                "SELECT pg_advisory_lock(hashtext(current_database()), 1)",
+                &[],
+            )
+            .unwrap();
+        let (delete_wait, mint_wait, released, deleted, mints) = std::thread::scope(|scope| {
+            let delete_id = id.clone();
+            let delete = scope.spawn(move || delete_node.delete_key(&delete_id));
+            let delete_wait =
+                super::plane_records::wait_for_blocked_backends(&mut observer, holder_pid, 1);
+            let delete_pid = delete_wait
+                .as_ref()
+                .ok()
+                .and_then(|pids| pids.first())
+                .copied();
+            let workers: Vec<_> = mint_nodes
+                .into_iter()
+                .map(|(slot, node)| {
+                    let id = id.clone();
+                    scope.spawn(move || {
+                        node.put_credential(&sample_cred(
+                            &id,
+                            slot,
+                            &format!("AKIA_RACE_{}_{slot}", id.to_uppercase()),
+                        ))
+                    })
+                })
+                .collect();
+            let mint_wait = delete_pid
+                .map(|pid| super::plane_records::wait_for_blocked_backends(&mut observer, pid, 2));
+            // Release before any assertion, including a failed lock observation.
+            let released = holder.query_one(
+                "SELECT pg_advisory_unlock(hashtext(current_database()), 1)",
+                &[],
+            );
+            let deleted = delete.join().unwrap();
+            let mints: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+            (delete_wait, mint_wait, released, deleted, mints)
         });
-        // One of the two documented orders: the mint won (it applied, and the delete's cascade took
-        // it) or the delete won (the mint was refused, naming the tombstone). Nothing else.
-        for r in mints.into_inner().unwrap() {
-            if let Err(e) = r {
-                assert!(
-                    e.0.contains("is tombstoned"),
-                    "round {round}: a mint lost to the delete must say so: {e:?}"
-                );
-            }
+        assert!(released
+            .expect("release the paused delete")
+            .get::<_, bool>(0));
+        deleted.expect("the observed delete commits");
+        assert_eq!(delete_wait.expect("observe the delete backend").len(), 1);
+        assert_eq!(
+            mint_wait
+                .expect("delete must have reached its trigger")
+                .expect("observe both mint backends")
+                .len(),
+            2,
+            "both mints must actually wait on the deletion transaction"
+        );
+        for r in mints {
+            let e = r.expect_err("a mint blocked behind the delete must see its tombstone");
+            assert!(e.0.contains("is tombstoned"), "round {round}: {e:?}");
         }
         assert!(setup.get_key(&id).unwrap().unwrap().deleted_at.is_some());
         // The delete-first order, settled: a mint after the tombstone is refused naming it.
@@ -934,6 +996,8 @@ fn migrate_over_the_1_5_5_rows_is_idempotent() {
 #[test]
 fn add_usage_folds_a_model_named_twice_sequentially() {
     let Some(url) = live_url() else { return };
+    let database = TempDb::create(&url, "spg_shapes");
+    let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     let ws = 20_270_601u64;
     let entry = |m: &str, u: &[(&str, i64)]| ModelTokensDelta {
