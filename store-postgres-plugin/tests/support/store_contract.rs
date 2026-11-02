@@ -133,7 +133,6 @@ fn at<'v>(k: &'v serde_json::Value, path: &str) -> &'v serde_json::Value {
 
 struct Inputs<'a> {
     credential_kind: &'a str,
-    node: u64,
     usage_bucket: &'a str,
     window: u64,
     schema: &'a str,
@@ -158,7 +157,6 @@ impl<'a> Inputs<'a> {
         };
         Self {
             credential_kind: s("credential_kind"),
-            node: n("node"),
             usage_bucket: s("usage.bucket"),
             window: n("usage.window"),
             schema: s("schema"),

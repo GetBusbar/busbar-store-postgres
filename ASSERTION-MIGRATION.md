@@ -65,3 +65,8 @@ resource-lane approval; this source change does not claim runtime equivalence or
 Host-helper destination-judge cases (private/default-loopback/cloud-metadata refusal and
 operator-infrastructure loopback admission) are retired helper selfchecks; their explicit
 core connector-test mapping and final-SDK execution are pending root qualification.
+
+The old framework's unused `store.node` mint-slot parameter is removed. Ordinary callbacks
+use this repo's existing `common::mint`, which generates fresh bridge-write IDs independently
+of test scheduling. Private schemas isolate both deliveries. Explicit replay/conflict calls
+continue using exactly `OpId::from_parts(2, n)`; no operation-ID replay assertion changes.
