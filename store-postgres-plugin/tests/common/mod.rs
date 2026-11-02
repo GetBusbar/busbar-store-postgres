@@ -18,7 +18,7 @@ use busbar_plugin_loader::store_v3::LoadedStore;
 #[path = "../../../store-postgres/tests-support/postgres_io.rs"]
 pub mod postgres_io;
 
-/// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
+/// The actual freshly built own-library artifact selected by [`plugin_path`]. Missing is a
 pub fn cdylib() -> PathBuf {
     plugin_path()
 }
@@ -159,6 +159,10 @@ pub fn build_real_binaries() -> (PathBuf, PathBuf) {
         ][..],
     ] {
         let status = Command::new("cargo")
+            .env(
+                "RUSTUP_TOOLCHAIN",
+                std::env::var_os("RUSTUP_TOOLCHAIN").unwrap_or_else(|| "1.98".into()),
+            )
             .args(args)
             .env("BUSBAR_RELEASE_PUBKEY", E2E_RELEASE_PUBKEY)
             .env_remove("CARGO_TARGET_DIR")
