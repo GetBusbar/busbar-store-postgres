@@ -2304,3 +2304,6 @@ mod postgres_io;
 
 #[path = "../tests-support/postgres_clock.rs"]
 mod postgres_clock;
+
+#[path = "tests/kept_product.rs"]
+mod kept_product;
