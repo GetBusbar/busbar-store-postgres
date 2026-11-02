@@ -428,10 +428,10 @@ fn prepared_statements_drop_the_least_recently_run_past_the_bound() {
 fn text_after_a_bracketed_ipv6_host_is_not_silently_discarded() {
     for suffix in ["garbage", ":5432trailer"] {
         let url = format!("postgres://user:hidden@[::1]{suffix}/db");
-        let error = Config::parse(&url)
-            .err()
-            .expect("malformed host/port tail must be refused")
-            .to_string();
+        let error = match Config::parse(&url) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("malformed host/port tail must be refused"),
+        };
         assert!(!error.contains("hidden"));
     }
     assert!(Config::parse("postgres://user@[::1]:5432/db").is_ok());
@@ -442,17 +442,17 @@ fn text_after_a_bracketed_ipv6_host_is_not_silently_discarded() {
 fn nul_bytes_in_postgres_startup_fields_are_refused_during_parse() {
     for option in ["user", "dbname", "application_name", "options"] {
         let url = format!("postgres://user:hidden@host/db?{option}=before%00after");
-        let error = Config::parse(&url)
-            .err()
-            .expect("startup strings cannot encode NUL")
-            .to_string();
+        let error = match Config::parse(&url) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("startup strings cannot encode NUL"),
+        };
         assert!(error.contains(option), "{error}");
         assert!(!error.contains("before") && !error.contains("after") && !error.contains("hidden"));
     }
-    let error = Config::parse("host=host user='before\0after'")
-        .err()
-        .expect("keyword startup strings also refuse NUL")
-        .to_string();
+    let error = match Config::parse("host=host user='before\0after'") {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("keyword startup strings also refuse NUL"),
+    };
     assert!(error.contains("user"));
 }
 

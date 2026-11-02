@@ -57,8 +57,6 @@ fn mint() -> OpId {
     )
 }
 
-/// The clock alone, on the dispatcher's timebase; all other services are refused.
-
 /// The store's linked door opened on `settings` over the loader, its needs on the production connector.
 pub(crate) fn open_loaded(settings: &str) -> Result<LoadedStore, String> {
     open_loaded_over(settings, |d| {
