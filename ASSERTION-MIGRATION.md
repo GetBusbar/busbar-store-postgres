@@ -8,7 +8,8 @@ no SDK, peer revision, lockfile, publication or dependency-policy changes are in
 - The existing `the_linked_and_the_dropped_in_postgres_store_are_one_store`, foreign-byte rejection,
   wrong-kind rejection, all provider tests, real-install e2e and admin HTTP e2e assertions remain.
 - `support/store_contract.rs` expands the pinned store script into ordinary Rust operations:
-  every operation preserves its exact first-crossing assertion, all 31 slot guard, answer golden,
+  all 86 original operation labels plus READY preserve exact first-crossing assertions (87 total),
+  the pending/resume positive witness, all 31 slot guard, answer golden,
   replay/conflict, credentials, usage, budgets, denylist, event ordering, single redemption,
   generic record and scoped-key checks. Actual linked and actual dropped runs compare all answers.
 - `support/door_refusals.rs` preserves ABI +1/-1 pack/linked/dropped errors; layout xor1/zero
@@ -60,3 +61,7 @@ The reusable CI producer is root-owned and remains at the existing pin in this s
 
 Validation: cargo fmt --all -- --check and git diff --check. Builds and live execution await
 resource-lane approval; this source change does not claim runtime equivalence or green CI.
+
+Host-helper destination-judge cases (private/default-loopback/cloud-metadata refusal and
+operator-infrastructure loopback admission) are retired helper selfchecks; their explicit
+core connector-test mapping and final-SDK execution are pending root qualification.

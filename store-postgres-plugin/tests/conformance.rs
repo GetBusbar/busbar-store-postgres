@@ -276,7 +276,7 @@ fn the_postgres_store_library_loaded_as_another_kind_is_refused() {
 
 use busbar_contract::abi::store::OpId;
 use busbar_contract::kinds::RecordBytes;
-use busbar_contract::records::VirtualKey;
+use busbar_contract::records::{UsageDelta, VirtualKey};
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 type Loaded = (Plugin<Store>, Arc<Dispatcher>);
 fn linked() -> Loaded {

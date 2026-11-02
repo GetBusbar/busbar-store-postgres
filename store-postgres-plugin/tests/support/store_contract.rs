@@ -179,14 +179,35 @@ fn exercise(load: impl Fn() -> Loaded, settings: &[u8]) -> Vec<(&'static str, St
     let (p, d) = load();
     let held = Arc::clone(&p.inner);
     let first = || held.crossings.load(Ordering::SeqCst) - held.resumes.load(Ordering::SeqCst);
+    let before = first();
     let mut answers = vec![(
         "facts",
         format!(
-            "{} {:?}",
+            "{:?} {} max_inflight={} {:?}",
+            p.kind(),
             p.name(),
+            p.max_inflight(),
             p.context::<busbar_plugin_loader::dispatch::kinds::store::StoreFacts>()
         ),
     )];
+    assert_eq!(first() - before, 0, "facts: exact first crossings");
+    let before = first();
+    let hook = LinkedRow::of(busbar_store_postgres::door).and_then(|row| {
+        load_linked::<busbar_plugin_loader::dispatch::kinds::hook::Hook>(&row, common::bind(&d))
+    });
+    assert!(matches!(
+        hook.err(),
+        Some(busbar_plugin_loader::dispatch::LoadError::ManifestKind {
+            stated: busbar_contract::abi::mechanism::KindCode::Store,
+            want: busbar_contract::abi::mechanism::KindCode::Hook
+        })
+    ));
+    assert_eq!(
+        first() - before,
+        0,
+        "refused as another kind: exact first crossings"
+    );
+    answers.push(("refused as another kind", "refused=true".into()));
     let open_pin = 1 + u64::from(p.has_ready());
     let before = first();
     let st = LoadedStore::open(p, Arc::clone(&d), settings, common::mint).expect("Postgres opens");
@@ -194,9 +215,15 @@ fn exercise(load: impl Fn() -> Loaded, settings: &[u8]) -> Vec<(&'static str, St
     answers.push(("open", format!("Ready {:?}", st.facts())));
     let before = first();
     let ready_pin = u64::from(st.plugin().has_ready());
-    st.plugin()
-        .ready(&d, std::time::Duration::from_secs(30))
-        .expect("Postgres ready");
+    let ready = st.plugin().ready(&d, std::time::Duration::from_secs(30));
+    assert!(
+        ready.is_ok(),
+        "the honest Postgres door becomes ready: {ready:?}"
+    );
+    answers.push((
+        "ready",
+        format!("has_ready={} {ready:?}", st.plugin().has_ready()),
+    ));
     assert_eq!(first() - before, ready_pin, "ready crossings");
     let b: &dyn RecordStore = &st;
     let keys = |r: Result<Vec<VirtualKey>, busbar_contract::records::RecordStoreError>| {
@@ -962,6 +989,7 @@ fn contract(fold: &[(&str, String)], i: &Inputs<'_>) {
         assert!(!answer.contains("faulted"), "{label}: {answer}");
     }
     assert!(at("open").starts_with("Ready "), "open: {}", at("open"));
+    assert_eq!(at("refused as another kind"), "refused=true");
     for label in [
         "put grouped",
         "put plain",
