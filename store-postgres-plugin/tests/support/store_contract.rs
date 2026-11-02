@@ -10,6 +10,8 @@ use std::fmt::{Debug, Display};
 use std::sync::atomic::Ordering;
 const _: () = assert!(busbar_contract::abi::store::KIND_SLOTS == 31);
 const LEASED: u64 = 2;
+// Keep the replay deadline from the pinned store script valid against the actual host clock.
+const LIVE_REPLAY_DEADLINE: u64 = u64::MAX;
 fn ans<T: Debug, E: Display>(r: Result<T, E>) -> String {
     match r {
         Ok(v) => format!("= {v:?}"),
