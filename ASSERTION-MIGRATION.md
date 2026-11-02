@@ -47,11 +47,11 @@ no SDK, peer revision, lockfile, publication or dependency-policy changes are in
 
 ## Explicit qualification limits
 
-The old macro's undeclared-need and cross-instance connection safety checks entered host ABI
-slots using the loader's private instance context. That context is not a public plugin-repo
-API. These two exact host-ABI checks require a core-owned source transfer; they are neither
-claimed preserved here nor silently replaced with weaker plugin assertions. They must remain
-on the release integration checklist until the core owner confirms their ordinary tests.
+The undeclared-need and cross-instance checks enter the actual host ABI slots through the
+public hidden loader seams at the unchanged author pin. They preserve exact refusal outcomes
+and text for undeclared needs, foreign write/read/close and owner-write success, with the actual
+TCP carrier reaching a real listener. A final SDK with different visibility requires separate
+qualification without retargeting the authored source.
 
 CI must build this exact real cdylib immediately before the test run and export its absolute
 path in BUSBAR_PLUGIN_CDYLIB. Missing/relative artifacts fail. Direct developer fallback names

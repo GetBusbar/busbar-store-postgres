@@ -16,7 +16,7 @@ use busbar_plugin_loader::dispatch::{
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
 #[path = "../../../store-postgres/tests-support/postgres_io.rs"]
-mod postgres_io;
+pub mod postgres_io;
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
 pub fn cdylib() -> PathBuf {
