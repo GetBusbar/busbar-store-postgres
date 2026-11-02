@@ -84,9 +84,10 @@ fn failed_postgres_ready_closes_the_actual_successful_open_once() {
     let held = Arc::clone(&p.inner);
     let first = || held.crossings.load(Ordering::SeqCst) - held.resumes.load(Ordering::SeqCst);
     let before = first();
-    let e = LoadedStore::open(p, d, &settings, common::mint)
-        .err()
-        .expect("READY fails");
+    let e = match LoadedStore::open(p, d, &settings, common::mint) {
+        Err(error) => error,
+        Ok(_) => panic!("READY fails"),
+    };
     assert_eq!(
         e,
         format!("plugin '{plugin_name}' ready failed: postgres discovery refused")
@@ -124,9 +125,11 @@ fn postgres_declares_exactly_its_statement_needs_and_requested_profile() {
     declared.sort();
     declared.dedup();
     assert_eq!(stated, declared);
-    if std::env::var_os("BUSBAR_EXPECT_RELEASE").is_some() {
-        assert!(!cfg!(debug_assertions), "release profile requested");
-    }
+    #[cfg(debug_assertions)]
+    assert!(
+        std::env::var_os("BUSBAR_EXPECT_RELEASE").is_none(),
+        "release profile requested"
+    );
 }
 
 use busbar_contract::abi::host::conn::connector::{service, EstablishIn, IoIn, StreamIn};
