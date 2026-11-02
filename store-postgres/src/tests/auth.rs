@@ -6,12 +6,12 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
+use crate::tests::postgres_io;
 use busbar_contract::abi::mechanism::rendering::ReadNeed;
 use busbar_contract::conn::{
     ConnError, ConnId, ConnWake, Conns, DeclaredConns, InstanceId, NeedId, OpenDesc, Piece,
 };
 use busbar_contract::transport::ConnFacts;
-use busbar_test_kit::tcp_conns::TcpConns;
 
 use super::{fake_server, fatal, msg, read_frontend, read_startup, settings_of};
 use crate::tests::harness::open_loaded_over;
@@ -33,7 +33,7 @@ struct Progress {
 }
 
 struct PartialConns {
-    inner: TcpConns,
+    inner: Arc<dyn busbar_contract::conn::DeclaredConns>,
     wake: ConnWake,
     counts: Arc<Counts>,
     progress: Mutex<Progress>,
@@ -150,6 +150,12 @@ impl DeclaredConns for PartialConns {
         self.inner.declared(owner, need)
     }
 
+    fn landed(&self, owner: InstanceId, conn: ConnId, ticket: u64) -> Result<(), ConnError> {
+        self.inner.landed(owner, conn, ticket)
+    }
+    fn cause(&self, owner: InstanceId, conn: ConnId) -> Option<busbar_contract::conn::ConnCause> {
+        self.inner.cause(owner, conn)
+    }
     fn serves_scheme(&self, scheme: &str) -> bool {
         self.inner.serves_scheme(scheme)
     }
@@ -161,7 +167,7 @@ fn loaded(settings: &str, fault: bool) -> (String, Arc<Counts>) {
     let error = open_loaded_over(settings, |dispatcher| {
         let wake = dispatcher.conn_waker();
         Arc::new(PartialConns {
-            inner: TcpConns::new(wake.clone()),
+            inner: postgres_io::host(wake.clone(), Default::default()),
             wake,
             counts: observed,
             progress: Mutex::new(Progress::default()),

@@ -2,12 +2,12 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 use super::*;
+use crate::tests::postgres_io;
 use busbar_contract::abi::mechanism::rendering::ReadNeed;
 use busbar_contract::conn::{
     ConnError, ConnId, ConnWake, Conns, DeclaredConns, InstanceId, NeedId, OpenDesc, Piece,
 };
 use busbar_contract::transport::ConnFacts;
-use busbar_test_kit::tcp_conns::TcpConns;
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -17,14 +17,14 @@ struct Gate {
     lost: bool,
 }
 pub(in crate::tests) struct WithheldCommit {
-    tcp: TcpConns,
+    tcp: Arc<dyn busbar_contract::conn::DeclaredConns>,
     wake: ConnWake,
     gate: Mutex<Gate>,
 }
 impl WithheldCommit {
     pub(in crate::tests) fn new(wake: ConnWake) -> Self {
         Self {
-            tcp: TcpConns::new(wake.clone()),
+            tcp: postgres_io::host(wake.clone(), Default::default()),
             wake,
             gate: Mutex::new(Gate::default()),
         }
@@ -131,6 +131,12 @@ impl DeclaredConns for WithheldCommit {
     fn declared(&self, owner: InstanceId, need: NeedId) -> Option<Result<(), ConnError>> {
         self.tcp.declared(owner, need)
     }
+    fn landed(&self, owner: InstanceId, conn: ConnId, ticket: u64) -> Result<(), ConnError> {
+        self.tcp.landed(owner, conn, ticket)
+    }
+    fn cause(&self, owner: InstanceId, conn: ConnId) -> Option<busbar_contract::conn::ConnCause> {
+        self.tcp.cause(owner, conn)
+    }
     fn serves_scheme(&self, scheme: &str) -> bool {
         self.tcp.serves_scheme(scheme)
     }
@@ -155,7 +161,7 @@ fn a_committed_batch_with_a_lost_reply_replays_its_exact_receipt_after_reopen() 
     let loaded = harness::open_loaded_over(&settings, |dispatcher| {
         let wake = dispatcher.conn_waker();
         let table = Arc::new(WithheldCommit {
-            tcp: TcpConns::new(wake.clone()),
+            tcp: postgres_io::host(wake.clone(), Default::default()),
             wake,
             gate: Mutex::new(Gate::default()),
         });

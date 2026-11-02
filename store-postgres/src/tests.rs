@@ -2298,3 +2298,9 @@ fn legacy_revoked_secrets_are_scrubbed_on_upgrade_and_on_repeated_revoke() {
 mod metering_attribution;
 
 mod token_clock;
+
+#[path = "../tests-support/postgres_io.rs"]
+mod postgres_io;
+
+#[path = "../tests-support/postgres_clock.rs"]
+mod postgres_clock;

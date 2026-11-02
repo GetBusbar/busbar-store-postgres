@@ -8,8 +8,11 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::tests::postgres_io;
+use busbar_contract::abi::mechanism::rendering::ReadNeed;
+use busbar_contract::conn::*;
 use busbar_contract::records::RecordStore;
-use busbar_test_kit::tcp_conns::{SecureDial, SecuredSock, TcpConns};
+use busbar_contract::transport::{ConnFacts, EgressTrust};
 
 use super::harness::open_loaded_over;
 use super::live_url;
@@ -18,86 +21,127 @@ use crate::pgwire::Config;
 #[path = "auth.rs"]
 mod auth;
 
-/// The host's TLS for the test table ([`TcpConns::with_tls`]): rustls trusting `ca_der` alone,
+// Observe only the TLS request made by this store. Socket I/O, ownership, readiness,
+// certificate verification and connection security all stay in the production connector.
 type TlsFailure = Arc<Mutex<Option<String>>>;
-
-struct Trusting(Arc<rustls::ClientConfig>, Option<TlsFailure>, bool);
-
-fn trusting(ca_der: &[u8], verify_off: bool) -> Arc<dyn SecureDial> {
-    trusting_report(ca_der, None, verify_off)
-}
-
-fn trusting_report(
-    ca_der: &[u8],
+struct TlsRequest {
+    host: Arc<dyn DeclaredConns>,
     failure: Option<TlsFailure>,
     verify_off: bool,
-) -> Arc<dyn SecureDial> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(rustls_pki_types::CertificateDer::from(ca_der.to_vec()))
-        .expect("the test CA is a root certificate");
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .expect("the default protocol versions")
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    Arc::new(Trusting(Arc::new(config), failure, verify_off))
 }
-
-impl SecureDial for Trusting {
-    fn secure(
+fn trusting_host(
+    wake: ConnWake,
+    ca: &[u8],
+    failure: Option<TlsFailure>,
+    verify_off: bool,
+) -> Arc<dyn DeclaredConns> {
+    Arc::new(TlsRequest {
+        host: postgres_io::host(
+            wake,
+            EgressTrust {
+                extra_anchors: vec![ca.to_vec()],
+                ..Default::default()
+            },
+        ),
+        failure,
+        verify_off,
+    })
+}
+impl Conns for TlsRequest {
+    fn open(
         &self,
-        server: &str,
+        owner: InstanceId,
+        need: NeedId,
+        desc: &OpenDesc<'_>,
+    ) -> Result<ConnId, ConnError> {
+        self.host.open(owner, need, desc)
+    }
+    fn write(
+        &self,
+        owner: InstanceId,
+        conn: ConnId,
+        bytes: &[u8],
+        end: bool,
+        text: bool,
+    ) -> Result<usize, ConnError> {
+        self.host.write(owner, conn, bytes, end, text)
+    }
+    fn read(
+        &self,
+        owner: InstanceId,
+        conn: ConnId,
+        ticket: u64,
+        bytes: &mut [u8],
+    ) -> Result<Piece, ConnError> {
+        self.host.read(owner, conn, ticket, bytes)
+    }
+    fn wait(&self, owner: InstanceId, conns: &[ConnId], ticket: u64) -> Result<usize, ConnError> {
+        self.host.wait(owner, conns, ticket)
+    }
+    fn facts(&self, owner: InstanceId, conn: ConnId) -> Result<ConnFacts, ConnError> {
+        self.host.facts(owner, conn)
+    }
+    fn close(&self, owner: InstanceId, conn: ConnId) -> Result<(), ConnError> {
+        self.host.close(owner, conn)
+    }
+}
+impl DeclaredConns for TlsRequest {
+    fn open_request(
+        &self,
+        owner: InstanceId,
+        need: NeedId,
+        desc: &OpenDesc<'_>,
+        secure: bool,
+        timeout: u64,
+    ) -> Result<ConnId, ConnError> {
+        self.host.open_request(owner, need, desc, secure, timeout)
+    }
+    fn declare(
+        &self,
+        owner: InstanceId,
+        need: NeedId,
+        spec: &ReadNeed,
+        target: Option<&str>,
+        trust: Option<&str>,
+    ) -> Result<(), ConnError> {
+        self.host.declare(owner, need, spec, target, trust)
+    }
+    fn declared(&self, owner: InstanceId, need: NeedId) -> Option<Result<(), ConnError>> {
+        self.host.declared(owner, need)
+    }
+    fn serves_scheme(&self, scheme: &str) -> bool {
+        self.host.serves_scheme(scheme)
+    }
+    fn landed(&self, owner: InstanceId, conn: ConnId, ticket: u64) -> Result<(), ConnError> {
+        self.host.landed(owner, conn, ticket)
+    }
+    fn cause(&self, owner: InstanceId, conn: ConnId) -> Option<ConnCause> {
+        self.host.cause(owner, conn)
+    }
+    fn upgrade_secure(
+        &self,
+        owner: InstanceId,
+        conn: ConnId,
+        name: Option<&str>,
+        trust: Option<&str>,
         verify_off: bool,
-        mut tcp: TcpStream,
-    ) -> std::io::Result<Box<dyn SecuredSock>> {
+        ticket: u64,
+    ) -> Result<(), ConnError> {
         assert_eq!(
-            verify_off, self.2,
+            verify_off, self.verify_off,
             "the host must receive the requested TLS verification mode"
         );
-        let name = rustls_pki_types::ServerName::try_from(server.to_owned())
-            .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
-        let mut tls = rustls::ClientConnection::new(Arc::clone(&self.0), name)
-            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-        while tls.is_handshaking() {
-            tls.complete_io(&mut tcp).inspect_err(|e| {
-                if let Some(failure) = &self.1 {
-                    *failure.lock().unwrap() = Some(format!("{e:?}"));
+        let result = self
+            .host
+            .upgrade_secure(owner, conn, name, trust, verify_off, ticket);
+        if let Err(error) = &result {
+            if *error != ConnError::Pending {
+                if let Some(failure) = &self.failure {
+                    *failure.lock().unwrap() = Some(format!("{error:?}"));
                 }
-            })?;
+            }
         }
-        Ok(Box::new(Secured(rustls::StreamOwned::new(tls, tcp))))
-    }
-}
-
-/// A stream [`Trusting`] secured.
-struct Secured(rustls::StreamOwned<rustls::ClientConnection, TcpStream>);
-
-impl Read for Secured {
-    fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(b)
-    }
-}
-
-impl Write for Secured {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.0.write(b)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-}
-
-impl SecuredSock for Secured {
-    fn tcp(&self) -> &TcpStream {
-        self.0.get_ref()
-    }
-    fn close(&mut self) {
-        self.0.conn.send_close_notify();
-        let _ = self.0.flush();
-        let _ = self.0.sock.shutdown(std::net::Shutdown::Both);
+        result
     }
 }
 
@@ -243,7 +287,7 @@ fn verify_full_secures_the_connection_through_the_host() {
     let (_, tls_url) = through_proxy(&url, port);
     let settings = serde_json::json!({ "url": tls_url }).to_string();
     let store = open_loaded_over(&settings, |d| {
-        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&ca_der, false)))
+        trusting_host(d.conn_waker(), &ca_der, None, false)
     })
     .expect("the store opens over TLS");
     let sub = format!("tls-{}", std::process::id());
@@ -269,10 +313,7 @@ fn an_untrusted_server_certificate_fails_the_load_in_the_drivers_words() {
     let settings = serde_json::json!({ "url": tls_url }).to_string();
     let failure: TlsFailure = Arc::new(Mutex::new(None));
     let e = open_loaded_over(&settings, |d| {
-        Arc::new(TcpConns::with_tls(
-            d.conn_waker(),
-            trusting_report(&other_ca, Some(Arc::clone(&failure)), false),
-        ))
+        trusting_host(d.conn_waker(), &other_ca, Some(Arc::clone(&failure)), false)
     })
     .expect_err("a certificate from an unknown CA is refused");
     assert!(
@@ -284,10 +325,8 @@ fn an_untrusted_server_certificate_fails_the_load_in_the_drivers_words() {
 
     let failure = failure.lock().unwrap();
     assert!(
-        failure
-            .as_deref()
-            .is_some_and(|text| text.to_lowercase().contains("unknownissuer")),
-        "the host's TLS verifier must have refused the issuing CA: {failure:?}"
+        failure.as_deref().is_some_and(|text| text == "Refused"),
+        "the production host must refuse the untrusted certificate: {failure:?}"
     );
 }
 
@@ -299,8 +338,10 @@ fn the_store_keeps_one_connection_across_its_ops() {
     let sep = if url.contains('?') { '&' } else { '?' };
     let settings =
         serde_json::json!({ "url": format!("{url}{sep}application_name={app}") }).to_string();
-    let store = open_loaded_over(&settings, |d| Arc::new(TcpConns::new(d.conn_waker())))
-        .expect("the store opens");
+    let store = open_loaded_over(&settings, |d| {
+        postgres_io::host(d.conn_waker(), Default::default())
+    })
+    .expect("the store opens");
     let mut raw = super::connect_client_with_retry(&url);
     let backends = |raw: &mut postgres::Client| -> Vec<i32> {
         raw.query(
@@ -553,7 +594,7 @@ fn plaintext_after_the_servers_s_is_refused_before_the_upgrade() {
         "postgres://u:zq9pw@localhost:{port}/d?sslmode=verify-full"
     ));
     let e = open_loaded_over(&settings, |d| {
-        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&ca_der, false)))
+        trusting_host(d.conn_waker(), &ca_der, None, false)
     })
     .expect_err("a server that injects plaintext is refused");
     assert!(
@@ -640,7 +681,7 @@ fn prefer_secures_the_connection_when_the_server_answers_s() {
     let tls_url = tls_url.replace("sslmode=verify-full", "sslmode=prefer");
     let settings = serde_json::json!({ "url": tls_url }).to_string();
     let store = open_loaded_over(&settings, |d| {
-        Arc::new(TcpConns::with_tls(d.conn_waker(), trusting(&ca_der, true)))
+        trusting_host(d.conn_waker(), &ca_der, None, true)
     })
     .expect("prefer upgrades over the proxy's S");
     RecordStore::list_denylist(&store).expect("a read over TLS");

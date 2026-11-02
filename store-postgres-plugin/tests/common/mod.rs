@@ -15,22 +15,12 @@ use busbar_plugin_loader::dispatch::{
     LinkedRow, NoSink,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
-use busbar_test_kit::tcp_conns::TcpConns;
+#[path = "../../../store-postgres/tests-support/postgres_io.rs"]
+mod postgres_io;
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
 pub fn cdylib() -> PathBuf {
-    let exe = std::env::current_exe().expect("the test binary has a path");
-    let profile = exe
-        .parent()
-        .and_then(|d| d.parent())
-        .expect("target/<profile>");
-    let file = busbar_plugin_loader::plugin_library_filename("busbar_store_postgres_plugin");
-    [profile.join(&file), profile.join("deps").join(&file)]
-        .into_iter()
-        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
-        .max()
-        .map(|(_, p)| p)
-        .unwrap_or_else(|| panic!("the busbar-store-postgres-plugin cdylib ({file}) is not built"))
+    plugin_path()
 }
 
 /// The Statement rendering the signed manifest states: the linked door's own (the cdylib is the
@@ -39,7 +29,7 @@ pub fn stated() -> Vec<u8> {
 }
 
 /// A fresh `op_id` for every bridge write: a node half no other open (in this run or an earlier
-fn mint() -> busbar_contract::abi::store::OpId {
+pub fn mint() -> busbar_contract::abi::store::OpId {
     static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let node = *NODE.get_or_init(|| {
@@ -56,13 +46,13 @@ fn mint() -> busbar_contract::abi::store::OpId {
 }
 
 /// The instance's binding: its connections over the loader's test connection table (plain TCP),
-fn bind(d: &Dispatcher) -> Bind {
+pub fn bind(d: &Dispatcher) -> Bind {
     Bind {
         instance: Arc::from("store-postgres-test"),
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: ConnTable::Host(Arc::new(TcpConns::new(d.conn_waker()))),
+        conns: ConnTable::Host(postgres_io::host(d.conn_waker(), Default::default())),
     }
 }
 
@@ -102,103 +92,28 @@ pub fn postgres_url() -> Option<String> {
     }
 }
 
-/// Locate the cdylib THIS `cargo test` invocation just built — never a leftover artifact.
-///
-/// This looks ONLY in `target/<profile>/deps/`, never `target/<profile>/`, and that distinction is
-/// the whole point of this function.
-///
-/// `cargo` emits the lib target's cdylib into `deps/` as part of the very build graph that produces
-/// this test binary (this package's lib unit is compiled with BOTH declared crate-types — see
-/// `[lib] crate-type = ["cdylib", "rlib"]` in Cargo.toml), so `deps/libbusbar_store_postgres_plugin.dylib` is by construction up to
-/// date with the source tree under test. Cargo only *uplifts* a copy to `target/<profile>/` for
-/// `cargo build`, NEVER for `cargo test`. A lookup in `target/<profile>/` therefore reads an
-/// artifact that nothing in this test's dependency graph refreshes: whatever some earlier `cargo
-/// build` left there, from any commit — or nothing at all.
-///
-/// Both outcomes of that are lies about durability, and the second is the dangerous one:
-///   * NOTHING there  -> the old code `return`ed with a "skip:" line and reported GREEN. That is how
-///     `cargo test` can pass with ZERO over-the-ABI coverage of the durable store path.
-///   * STALE artifact -> a cdylib built before an ABI change answers every write `Ok(())` and every
-///     read empty, which is BYTE-FOR-BYTE the signature of the unrelayed-seam defect this file
-///     exists to catch (that defect was real: `DynStore`'s `impl Store` overrode 24 methods, none of
-///     them the task/call-log methods, so `put_task` took the accept-and-keep-nothing trait
-///     default). RED on a stale artifact is indistinguishable from RED on the real bug — and an
-///     artifact NEWER than a regression reports GREEN while the shipped ABI is broken. Proven, not
-///     theorised: with a regressed plugin in the tree and a good cdylib in `target/debug/`, the old
-///     lookup passed and this one fails.
-///
-/// Same hazard, and the same reasoning, as the engine's `crates/busbar/Cargo.toml` dev-dependency on
-/// `busbar-store-example-plugin`: keep the cdylib in the build graph so no test can judge a stale
-/// one. Here the plugin's lib IS this package, so that graph edge already exists — what was missing
-/// was reading the artifact that edge actually produces.
-///
-/// Panics rather than skipping: a missing cdylib under `cargo test` means the build graph changed
-/// shape, and the only honest report of that is a failure, not a silent pass.
-/// The newest mtime across every workspace crate's `src/` — "how fresh must a cdylib be to be the
-/// one this source tree describes".
-///
-/// Deliberately ONLY `src/**/*.rs` of each workspace member: editing a `tests/` file or a
-/// `[dev-dependencies]` line recompiles the test binary but NOT the lib, so including those would
-/// fail a perfectly current cdylib.
-pub fn newest_source_mtime() -> std::time::SystemTime {
-    fn walk(dir: &std::path::Path, newest: &mut std::time::SystemTime) {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p, newest);
-            } else if p.extension().is_some_and(|x| x == "rs") {
-                if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
-                    if m > *newest {
-                        *newest = m;
-                    }
-                }
-            }
-        }
-    }
-    let ws_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("the plugin crate always sits under the workspace root");
-    let mut newest = std::time::SystemTime::UNIX_EPOCH;
-    for e in std::fs::read_dir(ws_root).into_iter().flatten().flatten() {
-        let src = e.path().join("src");
-        if src.is_dir() {
-            walk(&src, &mut newest);
-        }
-    }
-    newest
-}
-
+/// The actual own-library artifact built for this run. CI supplies its absolute path.
+/// Developers build the cdylib into Cargo's profile directory before running these tests.
 pub fn plugin_path() -> PathBuf {
-    let exe = std::env::current_exe().expect("current_exe");
-    let deps_dir = exe.parent().expect("the test binary always lives in deps/");
-    let name = busbar_plugin_loader::plugin_library_filename("busbar_store_postgres_plugin");
-    let fresh = deps_dir.join(&name);
-    assert!(
-        fresh.exists(),
-        "the store-postgres-plugin cdylib is not at {}, where cargo emits it for the same build that produced \
-         this test binary. Refusing to fall back to target/<profile>/ (an artifact only `cargo \
-         build` refreshes) or to skip: judging a stale cdylib is exactly how an unrelayed plugin \
-         ABI reads as green.",
-        fresh.display()
-    );
-
-    let built = std::fs::metadata(&fresh)
-        .and_then(|m| m.modified())
-        .expect("cdylib mtime");
-    let newest_src = newest_source_mtime();
-    assert!(
-        built >= newest_src,
-        "STALE ARTIFACT — THIS IS NOT A DURABILITY FAILURE. {} predates this workspace's sources, \
-         so it cannot answer for the code in the tree; a pre-change cdylib returns empty for every \
-         read, which reads exactly like an unrelayed plugin ABI. Run `cargo build -p {}` (or just \
-         `cargo test`, which rebuilds it) and re-run.",
-        fresh.display(),
-        "busbar-store-postgres-plugin"
-    );
-    fresh
+    let artifact = match std::env::var_os("BUSBAR_PLUGIN_CDYLIB") {
+        Some(path) => {
+            let path = PathBuf::from(path);
+            assert!(path.is_absolute(), "BUSBAR_PLUGIN_CDYLIB must be absolute");
+            path
+        }
+        None => {
+            let exe = std::env::current_exe().expect("test executable");
+            let profile = exe
+                .parent()
+                .and_then(Path::parent)
+                .expect("Cargo profile directory");
+            profile.join(busbar_plugin_loader::plugin_library_filename(
+                "busbar_store_postgres_plugin",
+            ))
+        }
+    };
+    assert!(artifact.is_file(),"actual freshly built Postgres cdylib missing at {}; build busbar-store-postgres-plugin and set BUSBAR_PLUGIN_CDYLIB to its absolute path",artifact.display());
+    artifact
 }
 
 /// The busbar checkout the real binaries are built from: `BUSBAR_CHECKOUT` when set, else a sibling

@@ -7,19 +7,18 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 
+use crate::tests::postgres_clock::PostgresClock;
+use crate::tests::postgres_io;
 use busbar_contract::abi::sdk::store::{OpRefused, StoreSlots};
 use busbar_contract::abi::store::OpId;
 use busbar_contract::kinds::RecordBytes;
 use busbar_contract::records::{MeteringDelta, PlaneRecordRef, UsageDelta};
-use busbar_contract::services::Reading;
 use busbar_contract::store_calls::{StoreCalls, StoreFailure};
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
     load_linked, Bind, ConnTable, DispatchConfig, Dispatcher, LinkedRow, NoSink,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
-use busbar_test_kit::services_double::{Double, ServicesDouble};
-use busbar_test_kit::tcp_conns::TcpConns;
 
 struct Unpark(std::thread::Thread);
 impl Wake for Unpark {
@@ -59,30 +58,22 @@ fn mint() -> OpId {
 }
 
 /// The clock alone, on the dispatcher's timebase; all other services are refused.
-struct ClockOnly;
 
-impl ServicesDouble for ClockOnly {
-    fn now(&self) -> Reading {
-        Reading {
-            wall_ns: 0,
-            mono_ns: busbar_plugin_loader::dispatch::now_ns(),
-        }
-    }
-}
-
-/// The store's linked door opened on `settings` over the loader, its needs on a [`TcpConns`].
+/// The store's linked door opened on `settings` over the loader, its needs on the production connector.
 pub(crate) fn open_loaded(settings: &str) -> Result<LoadedStore, String> {
-    open_loaded_over(settings, |d| Arc::new(TcpConns::new(d.conn_waker())))
+    open_loaded_over(settings, |d| {
+        postgres_io::host(d.conn_waker(), Default::default())
+    })
 }
 
-/// [`open_loaded`], its needs on the table `conns` builds (a [`TcpConns`] that trusts a test CA).
+/// [`open_loaded`], its needs on the table `conns` builds (a production connector that trusts a test CA).
 pub(crate) fn open_loaded_over(
     settings: &str,
     conns: impl FnOnce(&Dispatcher) -> Arc<dyn busbar_contract::conn::DeclaredConns>,
 ) -> Result<LoadedStore, String> {
     let d = Arc::new(Dispatcher::with_services(
         DispatchConfig::default(),
-        Arc::new(Double(ClockOnly)),
+        Arc::new(PostgresClock),
     ));
     let conns = conns(&d);
     let row = LinkedRow::of(crate::door).map_err(|e| e.to_string())?;

@@ -1,4 +1,6 @@
 use super::*;
+use crate::tests::postgres_clock::PostgresClock;
+use crate::tests::postgres_io;
 use busbar_contract::abi::mechanism::call::{
     Blob, DeadlineClass, OutHead, Outcome, BLOB_JSON, BLOB_OCTETS, BLOB_SECRET,
 };
@@ -10,7 +12,6 @@ use busbar_contract::abi::store::{slot, BlobIn};
 use busbar_contract::conn::{
     ConnError, ConnId, ConnWake, Conns, DeclaredConns, InstanceId, NeedId, OpenDesc, Piece,
 };
-use busbar_contract::services::Reading;
 use busbar_contract::transport::ConnFacts;
 use busbar_plugin_loader::dispatch::kinds::store::Store;
 use busbar_plugin_loader::dispatch::{
@@ -18,8 +19,6 @@ use busbar_plugin_loader::dispatch::{
     NoSink, Reply,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
-use busbar_test_kit::services_double::{Double, ServicesDouble};
-use busbar_test_kit::tcp_conns::TcpConns;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -33,7 +32,7 @@ struct Gate {
 }
 
 struct WithheldCommit {
-    tcp: TcpConns,
+    tcp: Arc<dyn busbar_contract::conn::DeclaredConns>,
     wake: ConnWake,
     state: Mutex<Gate>,
 }
@@ -151,29 +150,25 @@ impl DeclaredConns for WithheldCommit {
         self.tcp.declared(owner, need)
     }
 
+    fn landed(&self, owner: InstanceId, conn: ConnId, ticket: u64) -> Result<(), ConnError> {
+        self.tcp.landed(owner, conn, ticket)
+    }
+    fn cause(&self, owner: InstanceId, conn: ConnId) -> Option<busbar_contract::conn::ConnCause> {
+        self.tcp.cause(owner, conn)
+    }
     fn serves_scheme(&self, scheme: &str) -> bool {
         self.tcp.serves_scheme(scheme)
-    }
-}
-
-struct Clock;
-impl ServicesDouble for Clock {
-    fn now(&self) -> Reading {
-        Reading {
-            wall_ns: 0,
-            mono_ns: busbar_plugin_loader::dispatch::now_ns(),
-        }
     }
 }
 
 fn loaded(url: &str) -> (LoadedStore, Arc<Dispatcher>, Arc<WithheldCommit>) {
     let dispatcher = Arc::new(Dispatcher::with_services(
         DispatchConfig::default(),
-        Arc::new(Double(Clock)),
+        Arc::new(PostgresClock),
     ));
     let wake = dispatcher.conn_waker();
     let gate = Arc::new(WithheldCommit {
-        tcp: TcpConns::new(wake.clone()),
+        tcp: postgres_io::host(wake.clone(), Default::default()),
         wake,
         state: Mutex::new(Gate::default()),
     });

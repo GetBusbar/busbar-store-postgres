@@ -5,18 +5,12 @@
 
 mod common;
 
-#[path = "support/conformance_host.rs"]
-mod conformance_host;
-
-busbar_test_kit::conformance_suite! {
-    door: busbar_store_postgres::door,
-    cdylib: "busbar_store_postgres_plugin",
-    inputs: include_str!("conformance.json"),
-    host: host,
-    tls: conformance_host::anchors(),
-    namespace: (create_fold_schema, drop_fold_schema),
-    newer_schema: stamp_newer_schema,
-}
+#[path = "support/door_refusals.rs"]
+mod door_refusals;
+#[path = "support/host_boundaries.rs"]
+mod host_boundaries;
+#[path = "support/store_contract.rs"]
+mod store_contract;
 
 /// The live Postgres's address (`BUSBAR_TEST_POSTGRES_URL`'s authority; the service container's
 fn upstream() -> &'static str {
@@ -33,24 +27,6 @@ fn upstream() -> &'static str {
     })
 }
 
-/// Postgres's cleartext negotiation: the client's `SSLRequest` (length 8, code 80877103) answered
-fn ssl_request(tcp: &mut std::net::TcpStream) -> bool {
-    use std::io::{Read, Write};
-    let mut req = [0_u8; 8];
-    tcp.read_exact(&mut req).is_ok()
-        && req == [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f]
-        && tcp.write_all(b"S").is_ok()
-}
-
-/// The host the suite binds the store over, with the TLS front its settings name already listening.
-fn host(
-    wake: busbar_contract::conn::ConnWake,
-    anchors: Option<&str>,
-) -> std::sync::Arc<dyn busbar_contract::conn::DeclaredConns> {
-    conformance_host::tls_front(ssl_request, upstream());
-    conformance_host::host(wake, anchors)
-}
-
 /// The live server a fold's filled settings name, on a connection of the `postgres` driver's own.
 fn fold_client(settings: &[u8]) -> postgres::Client {
     let v: serde_json::Value =
@@ -60,7 +36,7 @@ fn fold_client(settings: &[u8]) -> postgres::Client {
         .expect("conformance.json's settings name a url");
 
     let url = url
-        .replace(conformance_host::FAR_END, upstream())
+        .replace("localhost:52670", upstream())
         .replace("sslmode=require", "sslmode=disable");
     postgres::Client::connect(&url, postgres::NoTls)
         .expect("the live Postgres accepts the test client")
@@ -92,7 +68,8 @@ fn drop_fold_schema(namespace: &str, settings: &[u8]) {
 use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
 use busbar_plugin_loader::dispatch::kinds::secret::Secret;
 use busbar_plugin_loader::dispatch::{
-    load_dropped, Bind, ConnTable, DispatchConfig, Dispatcher, NoSink,
+    load_dropped, load_linked, rendering_of_library, Bind, ConnTable, DispatchConfig, Dispatcher,
+    LinkedRow, NoSink, Plugin,
 };
 use busbar_plugin_loader::store_v3::LoadedStore;
 use std::sync::Arc;
@@ -295,4 +272,45 @@ fn the_postgres_store_library_loaded_as_another_kind_is_refused() {
         load_dropped::<Secret>(&lib, &common::stated(), bind).is_err(),
         "a store library loaded as kind secret"
     );
+}
+
+use busbar_contract::abi::store::OpId;
+use busbar_contract::kinds::RecordBytes;
+use busbar_contract::records::VirtualKey;
+use busbar_plugin_loader::dispatch::kinds::store::Store;
+type Loaded = (Plugin<Store>, Arc<Dispatcher>);
+fn linked() -> Loaded {
+    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let row = LinkedRow::of(busbar_store_postgres::door).expect("Postgres statement");
+    let p = load_linked::<Store>(&row, common::bind(&d)).expect("linked Postgres loads");
+    (p, d)
+}
+fn dropped(lib: &std::path::Path, stated: &[u8]) -> Loaded {
+    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let p = load_dropped::<Store>(lib, stated, common::bind(&d)).expect("dropped Postgres loads");
+    (p, d)
+}
+fn cdylib() -> std::path::PathBuf {
+    common::plugin_path()
+}
+fn packed_rendering(lib: &std::path::Path) -> Vec<u8> {
+    rendering_of_library(lib)
+        .expect("library rendering")
+        .expect("door exists")
+}
+fn inputs() -> String {
+    let url = match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
+        Ok(url) => url,
+        Err(_) if std::env::var_os("CI").is_some() => {
+            panic!("BUSBAR_TEST_POSTGRES_URL must name CI's provisioned Postgres service")
+        }
+        Err(_) => "postgres://busbar:busbar@localhost:5432/busbar_test".into(),
+    };
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let mut config: serde_json::Value =
+        serde_json::from_str(include_str!("conformance.json")).unwrap();
+    config["settings"]["url"] = serde_json::json!(format!(
+        "{url}{separator}options=-c%20search_path%3D{{fold}}"
+    ));
+    config.to_string()
 }
