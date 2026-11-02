@@ -70,3 +70,13 @@ The old framework's unused `store.node` mint-slot parameter is removed. Ordinary
 use this repo's existing `common::mint`, which generates fresh bridge-write IDs independently
 of test scheduling. Private schemas isolate both deliveries. Explicit replay/conflict calls
 continue using exactly `OpId::from_parts(2, n)`; no operation-ID replay assertion changes.
+
+Native qualification at immutable 45e654b passed 232 provider tests, all 11 ordinary conformance
+tests and all 3 URL reference tests. Two real-root boot arms exposed the author pin's Store
+bootstrap security requirement: the operator base config must pin the admitted signed archive's
+exact SHA256. The file-drop configuration now hashes its retained freshly packed archive. The
+admin path leaves boot #1 unchanged, installs through the real API, asserts retained bytes equal
+uploaded bytes, then pins that retained archive in boot #2's base configuration. Existing boot,
+schema, admin, mint and persistence assertions remain. No security check is weakened; exact-match
+local archives satisfy the production fetch cache before any download is attempted. The changed
+candidate's full root boot rerun remains lane-owned qualification work.

@@ -204,6 +204,9 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     assert!(status.success(), "packing the plugin must succeed");
 
     std::fs::copy(&tarball, plugins_dir.join("store-postgres.tar.gz")).unwrap();
+    let archive_pin = busbar_contract::redacted::sha256_hex(
+        &std::fs::read(plugins_dir.join("store-postgres.tar.gz")).unwrap(),
+    );
 
     let config = work.join("config.yaml");
     let providers = work.join("providers.yaml");
@@ -216,7 +219,7 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     let config_text = format!(
         "listen: \"127.0.0.1:0\"\n\
          store:\n  module: postgres\n  settings: {{ url: \"{url}\" }}\n\
-         plugins:\n  enabled: true\n  dir: {}\n  trust:\n    allow_unsigned: true\n\
+         plugins:\n  enabled: true\n  dir: {}\n  fetch:\n    - url: \"https://plugins.example/store-postgres.tar.gz\"\n      sha256: \"{archive_pin}\"\n  trust:\n    allow_unsigned: true\n\
          auth:\n  chain: []\n\
          providers:\n  mock:\n    api_key: {{ env: MOCK_KEY }}\n\
          models:\n  test-model:\n    provider: mock\n",

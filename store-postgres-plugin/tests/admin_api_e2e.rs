@@ -369,12 +369,22 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
 
     drop(guard1);
 
+    let retained = std::fs::read(plugins_dir.join(file)).expect("read the admin-installed archive");
+    assert_eq!(
+        retained, tarball_bytes,
+        "the admin install retains the exact uploaded signed archive"
+    );
+    let archive_pin = busbar_contract::redacted::sha256_hex(&retained);
+    let pinned_common = providers_and_common.replacen(
+        "  trust:\n",
+        &format!("  fetch:\n    - url: \"https://plugins.example/{file}\"\n      sha256: \"{archive_pin}\"\n  trust:\n"),
+        1,
+    );
+
     let config2 = work.join("config2.yaml");
     std::fs::write(
         &config2,
-        format!(
-            "{providers_and_common}store:\n  module: postgres\n  settings: {{ url: \"{url}\" }}\n"
-        ),
+        format!("{pinned_common}store:\n  module: postgres\n  settings: {{ url: \"{url}\" }}\n"),
     )
     .unwrap();
 
