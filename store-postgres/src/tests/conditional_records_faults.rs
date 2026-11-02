@@ -106,6 +106,18 @@ impl Conns for WithheldCommit {
     }
 }
 impl DeclaredConns for WithheldCommit {
+    fn open_request(
+        &self,
+        owner: InstanceId,
+        need: NeedId,
+        desc: &OpenDesc<'_>,
+        require_secure: bool,
+        dial_timeout_ms: u64,
+    ) -> Result<ConnId, ConnError> {
+        self.tcp
+            .open_request(owner, need, desc, require_secure, dial_timeout_ms)
+    }
+
     fn declare(
         &self,
         owner: InstanceId,
