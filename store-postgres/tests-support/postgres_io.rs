@@ -40,8 +40,7 @@ fn transport_dispatcher() -> &'static Arc<Dispatcher> {
 pub fn host(wake: ConnWake, trust: EgressTrust) -> Arc<dyn DeclaredConns> {
     busbar_core_connector::io::install_process_reactor(reactor());
     let dispatcher = transport_dispatcher();
-    let row =
-        LinkedRow::of_macro(busbar_transport_tcp::door::MACRO_DOOR).expect("real TCP statement");
+    let row = LinkedRow::of(busbar_transport_tcp::linked::door).expect("real TCP statement");
     let plugin = load_linked::<Transport>(
         &row,
         Bind {
