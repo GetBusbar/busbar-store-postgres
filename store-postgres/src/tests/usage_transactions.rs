@@ -16,7 +16,7 @@ fn an_absolute_usage_write_waits_on_the_window_before_touching_its_ledger() {
         billable_requests: 7,
         models: vec![ModelTokens {
             model: "model".into(),
-            usage_units: [("tokens_input".into(), 1)].into_iter().collect(),
+            usage_units: [(UNIT_INPUT.into(), 1)].into_iter().collect(),
         }],
     };
     writer.put_usage("bucket", 60, &ledger).unwrap();
@@ -72,7 +72,7 @@ fn usage_model_lists_cross_the_existing_bind_frame_width_without_a_new_admission
         models: (0..count)
             .map(|i| ModelTokens {
                 model: format!("m{i}"),
-                usage_units: [("tokens_input".into(), 1)].into_iter().collect(),
+                usage_units: [(UNIT_INPUT.into(), 1)].into_iter().collect(),
             })
             .collect(),
     };
@@ -92,15 +92,10 @@ fn usage_model_lists_cross_the_existing_bind_frame_width_without_a_new_admission
     store.add_usage("bucket", 60, &delta).unwrap();
     let got = store.get_usage("bucket", 60).unwrap();
     assert_eq!(got.requests, 8);
-    assert!(got
-        .models
-        .iter()
-        .all(|model| model.tier("tokens_input") == 2));
+    assert!(got.models.iter().all(|model| model.tier(UNIT_INPUT) == 2));
     let mut invalid = ledger;
     invalid.requests = 999;
-    invalid.models[0]
-        .usage_units
-        .insert("tokens_input".into(), 99);
+    invalid.models[0].usage_units.insert(UNIT_INPUT.into(), 99);
     invalid.models.push(invalid.models[0].clone());
     assert!(store.put_usage("bucket", 60, &invalid).is_err());
     let unchanged = store.get_usage("bucket", 60).unwrap();
@@ -112,7 +107,7 @@ fn usage_model_lists_cross_the_existing_bind_frame_width_without_a_new_admission
     assert!(unchanged
         .models
         .iter()
-        .all(|model| model.tier("tokens_input") == 2));
+        .all(|model| model.tier(UNIT_INPUT) == 2));
 }
 
 #[test]

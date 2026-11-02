@@ -853,15 +853,10 @@ fn assert_recorded_1_5_5_admin_counts(store: &TestStore) {
             .models
             .iter()
             .map(|model| {
-                [
-                    "tokens_input",
-                    "tokens_output",
-                    "tokens_cache_read",
-                    "tokens_cache_write",
-                ]
-                .iter()
-                .map(|unit| model.usage_units.get(*unit).copied().unwrap_or(0))
-                .sum::<u64>()
+                [UNIT_INPUT, UNIT_OUTPUT, UNIT_CACHE_READ, UNIT_CACHE_WRITE]
+                    .iter()
+                    .map(|unit| model.usage_units.get(*unit).copied().unwrap_or(0))
+                    .sum::<u64>()
             })
             .sum();
         assert_eq!(tokens, expected["tokens"].as_u64().unwrap());

@@ -664,7 +664,7 @@ fn record(bytes: Vec<u8>) -> Result<RecordBytes, String> {
 /// Parse with the SDK's wiping settings reader: a host secret marker is restored from its
 /// lent slot, and every DSN is captured before any public connection option is parsed.
 fn parse_settings(settings: &[u8], secrets: &[&[u8]]) -> Result<PostgresStore, String> {
-    use busbar_contract::abi::sdk::cred::{settings_lent, PostgresUrl};
+    use busbar_contract::abi::sdk::cred::{settings_lent, PostgresUrl, SettingsError};
 
     const BAD: &str = "invalid postgres plugin config";
     let settings = if settings.trim_ascii().is_empty() {
@@ -672,19 +672,27 @@ fn parse_settings(settings: &[u8], secrets: &[&[u8]]) -> Result<PostgresStore, S
     } else {
         settings
     };
-    let map: Option<std::collections::HashMap<String, Option<PostgresUrl>>> =
-        settings_lent(settings, secrets).map_err(|e| {
-            let path = if e.path().is_empty() {
-                String::new()
-            } else {
-                format!("{}: ", e.path())
-            };
-            format!("{BAD}: {path}{e}")
-        })?;
-    let mut map = map.unwrap_or_default();
-    if let Some(k) = map.keys().find(|k| k.as_str() != "url") {
+    let parse_error = |e: SettingsError| {
+        let path = if e.path().is_empty() {
+            String::new()
+        } else {
+            format!("{}: ", e.path())
+        };
+        format!("{BAD}: {path}{e}")
+    };
+    // Reject unknown keys before their values can be mistaken for connection strings.
+    // IgnoredAny drops each value inside the SDK reader, which wipes its owned strings.
+    let keys: Option<std::collections::HashMap<String, serde::de::IgnoredAny>> =
+        settings_lent(settings, secrets).map_err(&parse_error)?;
+    if let Some(k) = keys
+        .as_ref()
+        .and_then(|keys| keys.keys().find(|k| k.as_str() != "url"))
+    {
         return Err(format!("{BAD}: unknown setting `{k}` (accepted: url)"));
     }
+    let map: Option<std::collections::HashMap<String, Option<PostgresUrl>>> =
+        settings_lent(settings, secrets).map_err(parse_error)?;
+    let mut map = map.unwrap_or_default();
     let captured = map
         .remove("url")
         .flatten()

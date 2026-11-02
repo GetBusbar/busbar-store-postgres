@@ -330,6 +330,8 @@ fn writer_before_correction(
 ) -> Decision {
     let writer = TestStore::open(&db.url()).unwrap();
     let correction = TestStore::open(&db.url()).unwrap();
+    // Autocommit observations must see each new waiter, not a transaction's cached activity.
+    let mut observer = connect_client_with_retry(&db.url());
     let mut blocker = connect_client_with_retry(&db.url());
     blocker
         .batch_execute("BEGIN; SELECT revision FROM store_revision WHERE only_row FOR UPDATE")
@@ -344,12 +346,12 @@ fn writer_before_correction(
         .get(0)
     };
     let writer = std::thread::spawn(move || write(writer));
-    let writer_waited = until(|| waiting(&mut blocker) == 1);
+    let writer_waited = until(|| waiting(&mut observer) == 1);
     let (tx, rx) = std::sync::mpsc::channel();
     let correction = std::thread::spawn(move || {
         let _ = tx.send(apply(&correction, &r));
     });
-    let both_waited = until(|| waiting(&mut blocker) == 2);
+    let both_waited = until(|| waiting(&mut observer) == 2);
     blocker.batch_execute("COMMIT").unwrap();
     let written = writer.join().unwrap();
     let answer = rx.recv_timeout(WAIT).unwrap();
@@ -530,6 +532,8 @@ fn cancelling_a_pending_authority_wait_drops_the_uncommitted_transaction_without
     let store = seed(&db);
     let settings = serde_json::json!({"url": db.url()}).to_string();
     let loaded = harness::open_loaded(&settings).unwrap();
+    // Keep lock observations outside the transaction holding the serialization row.
+    let mut observer = connect_client_with_retry(&db.url());
     let mut blocker = connect_client_with_retry(&db.url());
     blocker
         .batch_execute("BEGIN; SELECT revision FROM store_revision WHERE only_row FOR UPDATE")
@@ -540,7 +544,7 @@ fn cancelling_a_pending_authority_wait_drops_the_uncommitted_transaction_without
     let mut cx = Context::from_waker(Waker::noop());
     let reached_wait = until(|| {
         assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Pending));
-        blocker.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database()
+        observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database()
             AND pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE '%store_revision%FOR UPDATE%')", &[])
             .unwrap().get::<_,bool>(0)
     });
