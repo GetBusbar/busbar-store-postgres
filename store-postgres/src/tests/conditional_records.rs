@@ -198,6 +198,8 @@ fn race(db: &TempDb, left: Request, right: Request) -> [Decision; 2] {
     // Both opens precede the blocker and workers. Actual server lock waits establish the schedule.
     let a = TestStore::open(&db.url()).unwrap();
     let b = TestStore::open(&db.url()).unwrap();
+    // The blocker transaction would cache pg_stat_activity on its first observation.
+    let mut observer = connect_client_with_retry(&db.url());
     let mut blocker = connect_client_with_retry(&db.url());
     blocker
         .batch_execute("BEGIN; SELECT revision FROM store_revision WHERE only_row FOR UPDATE")
@@ -214,7 +216,7 @@ fn race(db: &TempDb, left: Request, right: Request) -> [Decision; 2] {
     let b = launch(b, right);
     drop(tx);
     let blocked = until(|| {
-        blocker.query_one(
+        observer.query_one(
         "SELECT COUNT(*) FROM pg_stat_activity WHERE datname=current_database()
          AND pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE '%store_revision%FOR UPDATE%'", &[],
     ).unwrap().get::<_, i64>(0) == 2
@@ -505,6 +507,8 @@ fn ordinary_record_put_and_delete_cannot_bypass_the_conditional_serialization_lo
     let before = revision(&store);
     for value in [b"new".to_vec(), Vec::new()] {
         store.record_put(SCHEMA, b"state", b"old").unwrap();
+        // Observe each lock wait in autocommit rather than the blocker's cached snapshot.
+        let mut observer = connect_client_with_retry(&db.url());
         let mut blocker = connect_client_with_retry(&db.url());
         blocker
             .batch_execute("BEGIN; SELECT revision FROM store_revision WHERE only_row FOR UPDATE")
@@ -517,7 +521,7 @@ fn ordinary_record_put_and_delete_cannot_bypass_the_conditional_serialization_lo
             })
         };
         let blocked = until(|| {
-            blocker.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE '%store_revision%FOR UPDATE%')", &[]).unwrap().get::<_,bool>(0)
+            observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE '%store_revision%FOR UPDATE%')", &[]).unwrap().get::<_,bool>(0)
         });
         let precommit = rows(&store);
         blocker.batch_execute("ROLLBACK").unwrap();
