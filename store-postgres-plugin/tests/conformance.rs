@@ -271,8 +271,8 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
     );
     assert_eq!(
         refusals[3],
-        "plugin 'busbar-store-postgres' open failed: invalid postgres plugin config: `url` must be \
-         a string, got a number",
+        "plugin 'busbar-store-postgres' open failed: invalid postgres plugin config: url: \
+         settings: invalid type: integer `***`, expected a string",
         "a present non-string url says so"
     );
     let unreachable = refusals[4].as_str().unwrap();
