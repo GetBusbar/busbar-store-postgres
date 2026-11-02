@@ -18,7 +18,6 @@ use busbar_plugin_loader::store_v3::LoadedStore;
 use busbar_test_kit::tcp_conns::TcpConns;
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
-
 pub fn cdylib() -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let profile = exe
@@ -35,13 +34,11 @@ pub fn cdylib() -> PathBuf {
 }
 
 /// The Statement rendering the signed manifest states: the linked door's own (the cdylib is the
-
 pub fn stated() -> Vec<u8> {
     rendering_of(busbar_store_postgres::door).expect("the store renders its Statement")
 }
 
 /// A fresh `op_id` for every bridge write: a node half no other open (in this run or an earlier
-
 fn mint() -> busbar_contract::abi::store::OpId {
     static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -59,7 +56,6 @@ fn mint() -> busbar_contract::abi::store::OpId {
 }
 
 /// The instance's binding: its connections over the loader's test connection table (plain TCP),
-
 fn bind(d: &Dispatcher) -> Bind {
     Bind {
         instance: Arc::from("store-postgres-test"),
@@ -79,7 +75,6 @@ pub fn linked(settings: &str) -> Result<LoadedStore, String> {
 }
 
 /// The library at `path` through the DROPPED-IN door, admitted against [`stated`] and opened on
-
 pub fn dropped_at(path: &Path, settings: &str) -> Result<LoadedStore, String> {
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let p = load_dropped::<Store>(path, &stated(), bind(&d)).map_err(|e| e.to_string())?;
@@ -207,7 +202,6 @@ pub fn plugin_path() -> PathBuf {
 }
 
 /// The busbar checkout the real binaries are built from: `BUSBAR_CHECKOUT` when set, else a sibling
-
 pub fn busbar_root() -> PathBuf {
     let root = std::env::var_os("BUSBAR_CHECKOUT")
         .map(PathBuf::from)
@@ -222,7 +216,6 @@ pub fn busbar_root() -> PathBuf {
 }
 
 /// Build (once, cached by cargo) and return the path to the real `busbar` binary and the real
-
 pub fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
 
@@ -267,7 +260,6 @@ pub fn build_real_binaries() -> (PathBuf, PathBuf) {
 }
 
 /// THE TEST-ONLY FIRST-PARTY KEYPAIR (ed25519, `busbar-plugin-pack keygen`), never the release key.
-
 pub const E2E_RELEASE_PUBKEY: &str =
     "9209607c315f66473c8cca8bf9a7b8031115d01bb47341613cebf57f0e4f271c";
 pub const E2E_RELEASE_PRIVKEY: &str =

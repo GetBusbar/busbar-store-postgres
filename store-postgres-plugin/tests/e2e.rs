@@ -50,7 +50,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// RAII guard for a spawned child process: kills and reaps it on drop, including when a panic
-
 struct ChildGuard(Child, PathBuf);
 
 impl ChildGuard {
@@ -67,7 +66,6 @@ impl Drop for ChildGuard {
 }
 
 /// A disposable database that drops itself on drop, panic path included. Written as a trailing
-
 struct TempDb {
     admin_url: String,
     name: String,
@@ -96,7 +94,6 @@ impl TempDb {
     }
 
     /// Rewrite the admin DSN to name this database, keeping the credentials. The shape is the one
-
     fn url(&self) -> String {
         let rest = self
             .admin_url
@@ -127,7 +124,6 @@ fn cfg(url: &str) -> String {
 }
 
 /// Every `env:` secret-ref name a config text references, in first-seen order, de-duplicated.
-
 fn referenced_env_vars(text: &str) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
     for (i, _) in text.match_indices("env:") {
@@ -145,7 +141,6 @@ fn referenced_env_vars(text: &str) -> Vec<String> {
 }
 
 /// Set a harmless placeholder for every `{ env: NAME }` `config_text` references, so `--validate`
-
 fn set_referenced_secret_envs(cmd: &mut Command, config_text: &str) {
     for name in referenced_env_vars(config_text) {
         cmd.env(
@@ -156,7 +151,6 @@ fn set_referenced_secret_envs(cmd: &mut Command, config_text: &str) {
 }
 
 /// THE REAL END-TO-END INSTALL PROOF: pack the plugin, drop it in a real `plugins.dir`, run the real
-
 #[test]
 fn load_and_exercise_postgres_plugin_via_file_drop() {
     let Some(admin_url) = postgres_url() else {
@@ -323,7 +317,6 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
 }
 
 /// END-TO-END FAILURE (ABI-contract unit test, see module doc for why this stays a direct
-
 #[test]
 fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
     let path = plugin_path();
@@ -354,7 +347,6 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
 }
 
 /// A non-plugin library (or a missing file) is refused with a clear error, never a crash. Same
-
 #[test]
 fn refuses_non_plugin() {
     let err = match common::dropped_at(std::path::Path::new("/definitely/not/a/plugin.so"), "{}") {
@@ -365,7 +357,6 @@ fn refuses_non_plugin() {
 }
 
 /// Serialize a stand-in plane-record body. The store never decodes a body, so the shape only has to
-
 fn plane_body(v: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&v).expect("serialize a stand-in body")
 }
@@ -375,7 +366,6 @@ fn plane_decode(b: &[u8]) -> serde_json::Value {
 }
 
 /// THE DURABILITY PROOF FOR THE `call` PLANE KIND (the MCP call log), OVER THE REAL PLUGIN PATH.
-
 #[test]
 fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
@@ -531,7 +521,6 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 }
 
 /// THE DURABILITY PROOF FOR THE `task` / `task_event` PLANE KINDS (the A2A task store), OVER THE REAL
-
 #[test]
 fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
@@ -768,7 +757,6 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 }
 
 /// THE DURABILITY PROOF FOR THE TRUST STATE — the `demotion` kind and the single-use `ask` token
-
 #[test]
 fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};

@@ -19,7 +19,6 @@ busbar_test_kit::conformance_suite! {
 }
 
 /// The live Postgres's address (`BUSBAR_TEST_POSTGRES_URL`'s authority; the service container's
-
 fn upstream() -> &'static str {
     static AT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     AT.get_or_init(|| {
@@ -35,7 +34,6 @@ fn upstream() -> &'static str {
 }
 
 /// Postgres's cleartext negotiation: the client's `SSLRequest` (length 8, code 80877103) answered
-
 fn ssl_request(tcp: &mut std::net::TcpStream) -> bool {
     use std::io::{Read, Write};
     let mut req = [0_u8; 8];
@@ -85,7 +83,6 @@ fn create_fold_schema(namespace: &str, settings: &[u8]) {
 }
 
 /// The suite's namespace hook: the fold's schema and everything the store made in it, dropped after
-
 fn drop_fold_schema(namespace: &str, settings: &[u8]) {
     fold_client(settings)
         .batch_execute(&format!("DROP SCHEMA IF EXISTS \"{namespace}\" CASCADE"))
@@ -101,7 +98,6 @@ use busbar_plugin_loader::store_v3::LoadedStore;
 use std::sync::Arc;
 
 /// The live Postgres, by this repo's one gate: set → `Some`; unset under CI → a FAILURE (the
-
 fn live_url() -> Option<String> {
     match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
         Ok(url) => Some(url),
@@ -117,7 +113,6 @@ fn live_url() -> Option<String> {
 }
 
 /// One durable scenario through `store`, every id namespaced by `ns` so the two doors (and
-
 fn scenario(store: &dyn RecordStore, ns: &str) -> serde_json::Value {
     let kind = "conformance_task";
     let child = "conformance_event";
@@ -212,7 +207,6 @@ fn transcript(
 }
 
 /// The Postgres store behaves as ONE store through either door; the RED arms below show the
-
 #[test]
 fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
     let live = live_url();
@@ -264,7 +258,6 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
 }
 
 /// RED: DIFFERENT bytes (the object's magic broken) are not the store. The foreign image is
-
 #[test]
 fn foreign_bytes_dropped_in_are_not_the_postgres_store() {
     let lib = common::plugin_path();

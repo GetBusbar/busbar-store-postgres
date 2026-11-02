@@ -35,7 +35,6 @@ mod migration_parent_presence;
 pub(crate) use harness::TestStore;
 
 /// The verify path's read, which is no longer a store op: a credential's secret by `(kind,
-
 trait Lookup {
     fn lookup_credential_secret(
         &self,
@@ -58,7 +57,6 @@ impl Lookup for TestStore {
 }
 
 /// One model's ledger row from the four RESERVED token classes (zero classes left out, the way the
-
 fn mt(
     model: impl Into<String>,
     input: u64,
@@ -109,7 +107,6 @@ fn mtd(
 }
 
 /// Drift guard, no live DB needed: `CRED_SECRET_COLUMN_INDEX` must stay in sync with
-
 #[test]
 fn cred_secret_column_index_matches_cred_meta_columns_count() {
     assert_eq!(
@@ -188,7 +185,6 @@ fn live_url() -> Option<String> {
 }
 
 /// Open a raw `postgres::Client` with bounded retry-with-backoff. Used only where a test genuinely
-
 fn connect_client_with_retry(url: &str) -> postgres::Client {
     let mut last_err = None;
     for attempt in 0..10u32 {
@@ -204,7 +200,6 @@ fn connect_client_with_retry(url: &str) -> postgres::Client {
 }
 
 /// The store under test, opened with bounded retry-with-backoff: through the REAL loader on a
-
 fn connect_store_with_retry(url: &str) -> Result<TestStore, String> {
     let mut last_err = None;
     for attempt in 0..10u32 {
@@ -220,7 +215,6 @@ fn connect_store_with_retry(url: &str) -> Result<TestStore, String> {
 }
 
 /// TRUE reset for test isolation -- unlike `delete_key` (a deliberate tombstone that can never fully
-
 fn hard_reset(store: &TestStore, id: &str) {
     let mut client = store.lock();
     for sql in [
@@ -276,7 +270,6 @@ fn sample_cred(key_id: &str, slot: u8, public_id: &str) -> CredentialSecret {
 }
 
 /// Basic key round-trip, including the new fields (generation_hash, expires_at, deleted_at,
-
 #[test]
 fn key_roundtrip_new_fields() {
     let Some(url) = live_url() else { return };
@@ -314,7 +307,6 @@ fn key_roundtrip_new_fields() {
 }
 
 /// THE core invariant: delete_key is a TOMBSTONE. The row survives (deleted_at set, enabled=false),
-
 #[test]
 fn delete_key_is_a_tombstone_not_a_hard_delete() {
     let Some(url) = live_url() else { return };
@@ -356,7 +348,6 @@ fn delete_key_is_a_tombstone_not_a_hard_delete() {
 }
 
 /// `delete_key` must stamp `deleted_at` with a WALL-CLOCK time, not with the store-global revision
-
 #[test]
 fn delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision() {
     let Some(url) = live_url() else { return };
@@ -396,7 +387,6 @@ fn delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision() {
 }
 
 /// put_key_with_credential must REFUSE to re-mint over a tombstoned id.
-
 #[test]
 fn put_key_with_credential_refuses_to_remint_over_a_tombstone() {
     let Some(url) = live_url() else { return };
@@ -442,7 +432,6 @@ fn put_key_with_credential_refuses_to_remint_over_a_tombstone() {
 }
 
 /// Credential minting is slot-safe: minting into a slot holding a LIVE credential must fail, not
-
 #[test]
 fn credential_slot_guard_rejects_clobbering_a_live_credential() {
     let Some(url) = live_url() else { return };
@@ -483,7 +472,6 @@ fn credential_slot_guard_rejects_clobbering_a_live_credential() {
 }
 
 /// put_credential_tx must bind CredentialMeta::updated_at to its own column, not silently reuse
-
 #[test]
 fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
     let Some(url) = live_url() else { return };
@@ -513,7 +501,6 @@ fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
 }
 
 /// revoke_credential kills ONE credential independent of the key: the key stays enabled, the OTHER
-
 #[test]
 fn revoke_credential_is_independent_of_the_key_and_other_slots() {
     let Some(url) = live_url() else { return };
@@ -577,7 +564,6 @@ fn revoke_credential_is_independent_of_the_key_and_other_slots() {
 }
 
 /// `revoke_credential` must FAIL LOUD on a credential id that does not exist, rather than reporting
-
 #[test]
 fn revoke_credential_errors_on_an_unknown_id_but_stays_idempotent_on_a_revoked_one() {
     let Some(url) = live_url() else { return };
@@ -642,7 +628,6 @@ fn revoke_credential_errors_on_an_unknown_id_but_stays_idempotent_on_a_revoked_o
 }
 
 /// HYDRATION-DELTA SOUNDNESS, the same invariant the SQLite and MySQL schemas have to hold. A
-
 #[test]
 fn hydration_delta_makes_credential_deletion_observable_via_the_key_tombstone() {
     let Some(url) = live_url() else { return };
@@ -684,7 +669,6 @@ fn hydration_delta_makes_credential_deletion_observable_via_the_key_tombstone() 
 }
 
 /// A concurrent-instance race: two independent connections both try to delete the same key. Exactly
-
 #[test]
 fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
     let Some(url) = live_url() else { return };
@@ -722,7 +706,6 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
 }
 
 /// A concurrent `add_usage` landing between `get_usage`'s reads must not be half-visible. A writer
-
 #[test]
 fn get_usage_never_returns_a_torn_snapshot_under_a_concurrent_writer() {
     let Some(url) = live_url() else { return };
@@ -778,7 +761,6 @@ fn get_usage_never_returns_a_torn_snapshot_under_a_concurrent_writer() {
 }
 
 /// usage_metering round-trip including the new fields (billable_requests, key_group_at_use,
-
 #[test]
 fn metering_roundtrip_new_fields() {
     let Some(url) = live_url() else { return };
@@ -826,7 +808,6 @@ fn password_capture_percent_decoding_edge_cases() {
 }
 
 /// `is_undefined_table` must discriminate the ONE SQLSTATE (`42P01`/undefined_table) it exists to
-
 #[test]
 fn is_undefined_table_matches_only_the_real_sqlstate() {
     let missing = crate::pgwire::Error::server("42P01", "relation \"x\" does not exist");
@@ -845,7 +826,6 @@ fn is_undefined_table_matches_only_the_real_sqlstate() {
 }
 
 /// `labels_to_storage`'s serialization -- not just the empty-map default -- must round-trip a
-
 #[test]
 fn labels_round_trip_non_empty_map() {
     let Some(url) = live_url() else { return };
@@ -866,7 +846,6 @@ fn labels_round_trip_non_empty_map() {
 }
 
 /// `secret_form_to_storage`/`secret_form_from_storage` for all three `SecretForm` variants, pure
-
 #[test]
 fn secret_form_storage_round_trip_all_variants() {
     assert_eq!(secret_form_to_storage(SecretForm::None), "none");
@@ -890,7 +869,6 @@ fn secret_form_storage_round_trip_all_variants() {
 }
 
 /// `put_usage`/`add_usage`'s multi-row `VALUES (...)` batching (comma insertion gated on `i > 0`,
-
 #[test]
 fn put_usage_and_add_usage_batch_multiple_models_correctly() {
     let Some(url) = live_url() else { return };
@@ -1110,7 +1088,6 @@ fn denylist_add_is_listed_and_a_repeat_add_is_a_no_op() {
 }
 
 /// `list_audit_tail` must return the tail OLDEST FIRST, and `list_audit` must return the whole log
-
 #[test]
 fn list_audit_tail_returns_the_newest_entries_oldest_first() {
     let Some(url) = live_url() else { return };
@@ -1166,7 +1143,6 @@ fn list_audit_tail_returns_the_newest_entries_oldest_first() {
 }
 
 /// `list_keys` is deliberately UNFILTERED: it must include tombstoned rows, because
-
 #[test]
 fn list_keys_includes_tombstoned_rows() {
     let Some(url) = live_url() else { return };
@@ -1190,7 +1166,6 @@ fn list_keys_includes_tombstoned_rows() {
 }
 
 /// `list_credentials_since` must actually return credentials. Its only previous appearance in this
-
 #[test]
 fn list_credentials_since_returns_new_credentials_with_their_secret() {
     let Some(url) = live_url() else { return };
@@ -1230,7 +1205,6 @@ fn list_credentials_since_returns_new_credentials_with_their_secret() {
 }
 
 /// `put_credential_tx`'s SECOND failure branch: the slot is free, so the guarded upsert is not what
-
 #[test]
 fn put_credential_rejects_a_public_id_already_used_by_another_key() {
     let Some(url) = live_url() else { return };
@@ -1273,7 +1247,6 @@ fn put_credential_rejects_a_public_id_already_used_by_another_key() {
 }
 
 /// A unique-enough suffix (pid + nanos) for names that must not collide across concurrently
-
 fn unique_suffix() -> String {
     format!(
         "{}_{}",
@@ -1286,7 +1259,6 @@ fn unique_suffix() -> String {
 }
 
 /// Split a `postgres://user:pass@host:port/db` URL into its `(userinfo, host:port, db)` parts.
-
 fn split_url(url: &str) -> (&str, &str, &str) {
     let rest = url.split("://").nth(1).expect("url must have a scheme");
     let (userinfo, host_and_db) = rest.rsplit_once('@').expect("url must have userinfo");
@@ -1324,7 +1296,6 @@ fn drop_database(url: &str, db_name: &str) {
 }
 
 /// A disposable database that removes itself on drop, INCLUDING when a panic unwinds partway
-
 struct TempDb {
     admin_url: String,
     name: String,
@@ -1370,7 +1341,6 @@ impl Drop for TempDb {
 }
 
 /// Every store transaction opens with `SET LOCAL lock_timeout` and
-
 #[test]
 fn a_store_transaction_runs_with_the_lock_and_idle_timeouts() {
     let Some(url) = live_url() else { return };
@@ -1394,7 +1364,6 @@ fn a_store_transaction_runs_with_the_lock_and_idle_timeouts() {
 }
 
 /// `migrate_locked`'s undefined-table bootstrap path on a genuinely fresh (separate, disposable)
-
 #[test]
 fn migrate_bootstraps_fresh_database() {
     let Some(url) = live_url() else { return };
@@ -1419,7 +1388,6 @@ fn migrate_bootstraps_fresh_database() {
 }
 
 /// The v13 drops belong to a pre-release v11/v12 database only: on a fresh database or a released
-
 #[test]
 fn the_v13_drops_never_touch_a_fresh_or_a_released_database() {
     let Some(url) = live_url() else { return };
@@ -1456,7 +1424,6 @@ fn the_v13_drops_never_touch_a_fresh_or_a_released_database() {
 }
 
 /// Schema v13 drops the pre-release money/journal tables and their `op_id` rows (README); the kept
-
 #[test]
 fn the_v13_upgrade_drops_the_money_and_dead_slot_tables() {
     let Some(url) = live_url() else { return };
@@ -1527,7 +1494,6 @@ fn the_v13_upgrade_drops_the_money_and_dead_slot_tables() {
 }
 
 /// A malformed unsigned usage counter, or a NULL where the store reads a value, answers an
-
 #[test]
 fn a_row_that_does_not_decode_is_an_error_not_a_panic() {
     let Some(url) = live_url() else { return };
@@ -1553,7 +1519,6 @@ fn a_row_that_does_not_decode_is_an_error_not_a_panic() {
 }
 
 /// An op held on the server (here waiting on the `store_revision` row lock) does not hold up a
-
 #[test]
 fn a_held_op_does_not_block_a_second_op() {
     let Some(url) = live_url() else { return };
@@ -1584,7 +1549,6 @@ fn a_held_op_does_not_block_a_second_op() {
 }
 
 /// `since = 0` returns every row, and a row at revision 0 (a 1.5.x row the revision bump never
-
 #[test]
 fn revision_zero_rows_are_in_every_delta() {
     let Some(url) = live_url() else { return };
@@ -1665,7 +1629,6 @@ fn plane_tokens_has_its_sweep_index() {
 }
 
 /// A credential deleted (a `delete_key` cascade) between the revoke's existence check and its
-
 #[test]
 fn revoking_a_credential_deleted_underneath_says_unknown_id() {
     let Some(url) = live_url() else { return };
@@ -1703,7 +1666,6 @@ fn revoking_a_credential_deleted_underneath_says_unknown_id() {
 }
 
 /// A rolling-upgrade migration chosen as a deadlock victim (40P01) against a node holding locks
-
 #[test]
 fn a_migration_deadlock_victim_is_retried() {
     let Some(url) = live_url() else { return };
@@ -1735,7 +1697,6 @@ fn a_migration_deadlock_victim_is_retried() {
 }
 
 /// A database stamped ABOVE this build is refused at open, with the reason: an older binary would
-
 #[test]
 fn migrate_refuses_a_database_stamped_newer_than_this_build() {
     let Some(url) = live_url() else { return };
@@ -1765,7 +1726,6 @@ fn migrate_refuses_a_database_stamped_newer_than_this_build() {
 }
 
 /// `migrate`/`migrate_locked` must never silently succeed against a role that lacks real read
-
 #[test]
 fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() {
     let Some(url) = live_url() else { return };
@@ -1819,7 +1779,6 @@ fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() 
 }
 
 /// TWO NODES BOOTING AGAINST ONE FRESH DATABASE. Every node runs `migrate()` on connect, and a fleet
-
 #[test]
 fn two_nodes_opening_a_fresh_database_together_both_migrate_cleanly() {
     let Some(url) = live_url() else { return };
@@ -1888,20 +1847,17 @@ fn two_nodes_opening_a_fresh_database_together_both_migrate_cleanly() {
 mod store_conformance;
 
 /// The cross-backend `Store` conformance checks, answered by this backend — EVERY check the suite
-
 mod conformance {
     use super::plane_records::lock_plane_purge;
     use super::store_conformance as conf;
     use super::{clamp, connect_store_with_retry, live_url, TestStore};
 
     /// A per-process, PER-CHECK namespace. Short enough for every id column in the schema.
-
     fn ns(check: &str) -> String {
         format!("vk_c{}{}", std::process::id(), check)
     }
 
     /// Delete every row this suite is about to write, so a rerun (or a crashed prior run that left
-
     fn reset(store: &TestStore, ns: &str, seq: u64) {
         let mut client = store.lock();
         for id in conf::key_ids(ns) {

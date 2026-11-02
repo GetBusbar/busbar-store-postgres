@@ -49,7 +49,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Fixed ed25519 signing secret (64 hex = 32 bytes) for this e2e test. 1.5.1 requires an
-
 const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// RAII guard for a spawned child process: kills and reaps it on drop, including when a panic
@@ -73,7 +72,6 @@ struct ChildGuard(Child, PathBuf);
 
 impl ChildGuard {
     /// The child's captured output, formatted for a panic message. Never panics itself: this runs
-
     fn output(&self) -> String {
         match std::fs::read_to_string(&self.1) {
             Ok(s) if s.trim().is_empty() => "  (the child produced no output)".to_string(),
@@ -95,7 +93,6 @@ impl Drop for ChildGuard {
 }
 
 /// Spawn `busbar` with its stdout+stderr captured to `log`, and wrap it in a `ChildGuard` that
-
 fn spawn_busbar(cmd: &mut Command, log: PathBuf, what: &str) -> ChildGuard {
     let out = std::fs::File::create(&log)
         .unwrap_or_else(|e| panic!("create the {what} log at {}: {e}", log.display()));
@@ -111,7 +108,6 @@ fn spawn_busbar(cmd: &mut Command, log: PathBuf, what: &str) -> ChildGuard {
 }
 
 /// Reserve a free loopback port for the admin listener (bind-then-drop; the standard, small-TOCTOU
-
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -144,7 +140,6 @@ fn cleanup(url: &str, id: &str) {
 }
 
 /// Poll `http://127.0.0.1:{port}/api/v1/admin/plugins` (any admin GET works — we just need a TCP
-
 fn wait_for_admin_listener(
     client: &reqwest::blocking::Client,
     admin_base: &str,
@@ -181,7 +176,6 @@ fn wait_for_admin_listener(
 }
 
 /// THE REAL END-TO-END PROOF: install the real cdylib over the real admin API, restart onto it
-
 #[test]
 fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     let Some(url) = postgres_url() else { return };

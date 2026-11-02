@@ -32,7 +32,6 @@ impl<T> IntoStoreResult<T> for Result<T, pgwire::Error> {
 }
 
 /// Render a driver error with its CAUSE: `Display` for a server-side failure is just "db error".
-
 fn render_pg_error(e: &pgwire::Error) -> String {
     match e.as_db_error() {
         Some(db) => {
@@ -47,13 +46,11 @@ fn render_pg_error(e: &pgwire::Error) -> String {
 }
 
 /// True when a postgres error is SQLSTATE 42P01 (`undefined_table`), the ONE case `migrate()` reads
-
 fn is_undefined_table(e: &pgwire::Error) -> bool {
     e.code().map(pgwire::SqlState::code) == Some(pgwire::SqlState::UNDEFINED_TABLE)
 }
 
 /// Store schema version. A database older than v6 is refused: no release ever wrote one. v6 -> v19
-
 pub const SCHEMA_VERSION: i64 = 19;
 
 const TICKET_RECORD_KIND: &str = "ticket";
@@ -65,14 +62,12 @@ const MIGRATE_ATTEMPTS: u32 = 3;
 const FIRST_RELEASED_SCHEMA: i64 = 6;
 
 /// The plane-record kinds whose retention is TERMINAL-ONLY: `purge_plane_records_before` drops a
-
 const TERMINAL_ONLY_RETENTION_KINDS: [&str; 1] = ["task"];
 
 /// Rows one purge statement removes (and the ids it holds).
 const PURGE_BATCH: i64 = 1000;
 
 /// `(parent kind, child kind)`: purging a parent takes the child CHAIN hanging off it in the same
-
 const PLANE_CHILD_KINDS: [(&str, &str); 1] = [("task", "task_event")];
 
 const SCHEMA: &str = "
@@ -276,7 +271,6 @@ ALTER TABLE usage_metering ADD COLUMN IF NOT EXISTS priced_from_ms BIGINT NOT NU
 ";
 
 /// Postgres `Store` backend (durable, shared across a cluster): the parsed connection settings and
-
 pub struct PostgresStore {
     shared: std::sync::Arc<Shared>,
 }
@@ -310,7 +304,6 @@ impl std::ops::Deref for Session {
 }
 
 /// The four RESERVED unit classes, in the order of the `usage_ledger` token columns
-
 const RESERVED_COLUMNS: [&str; 4] = [UNIT_INPUT, UNIT_OUTPUT, UNIT_CACHE_READ, UNIT_CACHE_WRITE];
 
 fn is_reserved_unit(unit: &str) -> bool {
@@ -318,7 +311,6 @@ fn is_reserved_unit(unit: &str) -> bool {
 }
 
 /// Current Unix time in seconds (0 before the epoch): the one source of wall-clock stamps, so no
-
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -328,7 +320,6 @@ fn now_secs() -> u64 {
 
 impl PostgresStore {
     /// Capture a borrowed DSN's password before parsing public connection options. Authentication
-
     pub fn new(conn_str: &str) -> RecordStoreResult<Self> {
         let config =
             pgwire::Config::parse(conn_str).map_err(|e| RecordStoreError(e.to_string()))?;
@@ -359,7 +350,6 @@ impl PostgresStore {
 
 impl Session {
     /// Open one op's connection over `wire`: connect through the host's connector, secure it when
-
     pub(crate) async fn open(
         wire: busbar_contract::abi::sdk::store::wire::Wire,
         shared: std::sync::Arc<Shared>,
@@ -374,7 +364,6 @@ impl Session {
     }
 
     /// The op is done: its connection is kept for the next op if the session is idle, else
-
     pub(crate) async fn close(mut self) {
         self.client.release().await;
     }
@@ -384,7 +373,6 @@ impl Session {
     }
 
     /// Open a transaction with ONE consistent snapshot (REPEATABLE READ, not READ COMMITTED's
-
     pub(crate) async fn snapshot_consistent_tx<'a>(
         client: &'a mut Client,
     ) -> RecordStoreResult<Transaction<'a>> {
@@ -646,7 +634,6 @@ impl Session {
     }
 
     /// Bump and return the store-global revision inside the caller's open transaction. Acquire this
-
     async fn lock_revision(tx: &mut Transaction<'_>) -> RecordStoreResult<()> {
         tx.query_one(
             "SELECT revision FROM store_revision WHERE only_row FOR UPDATE",
@@ -750,7 +737,6 @@ fn secret_form_from_storage(s: &str) -> SecretForm {
 
 const CRED_META_COLUMNS: &str = "id,key_id,kind,slot,public_id,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision";
 /// The row index of `secret` in `SELECT {CRED_META_COLUMNS},secret ...`: the column count of
-
 const CRED_SECRET_COLUMN_INDEX: usize = 12;
 
 fn credential_timestamp(value: u64) -> i64 {
@@ -785,7 +771,6 @@ fn row_to_cred_meta(r: &Row) -> RecordStoreResult<CredentialMeta> {
 }
 
 /// The `keys` upsert both key writes run; the conflict branch's `WHERE` is the tombstone
-
 const KEY_UPSERT: &str = "INSERT INTO keys
         (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,
          idp_subject,binding_mode,minted_by,allowed_scopes_by_kind,idp_provider)
@@ -1914,7 +1899,6 @@ fn row_to_audit(r: &Row) -> RecordStoreResult<AuditRecord> {
 
 impl Session {
     /// Shared body of `put_credential`/`put_key_with_credential` (`op` names the caller in every
-
     async fn put_credential_tx(
         tx: &mut Transaction<'_>,
         op: &str,
@@ -2071,7 +2055,6 @@ impl Session {
 /// The writes the store v3 `op_id` slots run inside their dedupe transaction ([`v3`]).
 impl Session {
     /// `add_usage` inside the caller's transaction (the store v3 `op_id` writes and batches run
-
     pub(crate) async fn add_usage_in(
         tx: &mut Transaction<'_>,
         bucket_id: &str,
@@ -2329,7 +2312,6 @@ impl Session {
     }
 
     /// `append_plane_record` inside the caller's transaction: `Ok(true)` once the record is stored
-
     pub(crate) async fn append_plane_record_in(
         tx: &mut Transaction<'_>,
         record: &PlaneRecord,

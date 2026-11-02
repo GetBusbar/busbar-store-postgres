@@ -42,7 +42,6 @@ pub(crate) fn block_on<F: Future>(f: F) -> F::Output {
 }
 
 /// A fresh `op_id` for every bridge write: a node half no other open (in this run or an earlier
-
 fn mint() -> OpId {
     static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

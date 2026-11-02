@@ -33,7 +33,6 @@ const NO_TEXT: AbiStr = AbiStr {
 };
 
 /// The store's one need: the server, dialled over `tcp` at the DSN's `host:port`, in the
-
 pub const NEEDS: &[Need] = &[Need {
     direction: DIRECTION_OUTBOUND,
     egress_class: EGRESS_OPERATOR_INFRASTRUCTURE,
@@ -127,7 +126,6 @@ fn refused(e: RecordStoreError) -> OpRefused {
 }
 
 /// An apply error the server decided from the values (SQLSTATE class 22 data exception, 23
-
 fn decided(r: OpRefused) -> OpRefused {
     match r {
         OpRefused::Failed(t) if decided_text(&t) => OpRefused::Refused(t),
@@ -145,7 +143,6 @@ fn decided_text(t: &str) -> bool {
 }
 
 /// Claim `op` for `body` (its [`Dedupe::body_hex`]) inside `tx`: insert its row (`None`), or read
-
 async fn claim(tx: &mut Transaction<'_>, op: OpId, body: &str) -> Result<Option<String>, String> {
     let id: &[u8] = &op.0;
     let inserted = tx
@@ -320,7 +317,6 @@ impl Session {
     }
 
     /// One `op_id`-carrying write in ONE transaction with its dedupe row: a new op runs `apply` and
-
     async fn deduped(
         &mut self,
         op: OpId,
@@ -623,7 +619,6 @@ fn record(bytes: Vec<u8>) -> Result<RecordBytes, String> {
 }
 
 /// Parse with the SDK's wiping settings reader: a host secret marker is restored from its
-
 fn parse_settings(settings: &[u8], secrets: &[&[u8]]) -> Result<PostgresStore, String> {
     use busbar_contract::abi::sdk::cred::{settings_lent, PostgresUrl, SettingsError};
 
@@ -713,7 +708,6 @@ impl StoreSlots for PostgresStore {
     }
 
     /// Reach the server and ensure the schema (connect + migrate, at the same moment: the load),
-
     fn connect(&self, cx: &mut Op<'_>) -> Step<Result<(), String>> {
         on_conn!(self, cx, |e| e, |s| s.migrate().await.map_err(|e| e.0))
     }

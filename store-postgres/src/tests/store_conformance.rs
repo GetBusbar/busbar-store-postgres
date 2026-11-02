@@ -69,7 +69,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 /// A per-`ns` `(old_ts, new_ts)` pair for the two `purge_plane_records_before` checks below, straddling
-
 fn ns_purge_window(ns: &str, cutoff: u64, high_span: u64) -> (u64, u64) {
     let mut hasher = DefaultHasher::new();
     ns.hash(&mut hasher);
@@ -80,7 +79,6 @@ fn ns_purge_window(ns: &str, cutoff: u64, high_span: u64) -> (u64, u64) {
 }
 
 /// Every `VirtualKey` id the suite writes under `ns`. A shared-database backend must delete these
-
 pub fn key_ids(ns: &str) -> Vec<String> {
     vec![
         format!("{ns}_resurrect"),
@@ -144,7 +142,6 @@ pub fn credential(id: &str, key_id: &str) -> CredentialSecret {
 }
 
 /// **`put_key` must not clear a tombstone.** Writing a LIVE key over a tombstoned row resurrects a
-
 pub fn assert_put_key_does_not_resurrect_a_tombstone(store: &dyn RecordStore, ns: &str) {
     let id = format!("{ns}_resurrect");
     let key = live_key(&id);
@@ -184,7 +181,6 @@ pub fn assert_put_key_does_not_resurrect_a_tombstone(store: &dyn RecordStore, ns
 }
 
 /// **`delete_key` on an unknown id is an error.** Distinct from the documented idempotent case:
-
 pub fn assert_delete_key_unknown_id_is_an_error(store: &dyn RecordStore, ns: &str) {
     assert!(
         store.delete_key(&format!("{ns}_no_such_key")).is_err(),
@@ -201,7 +197,6 @@ pub fn assert_delete_key_unknown_id_is_an_error(store: &dyn RecordStore, ns: &st
 }
 
 /// **`revoke_credential` on an unknown id is an error, on an already-revoked id is `Ok`.** A backend
-
 pub fn assert_revoke_credential_unknown_id_is_an_error(store: &dyn RecordStore, ns: &str) {
     assert!(
         store
@@ -226,7 +221,6 @@ pub fn assert_revoke_credential_unknown_id_is_an_error(store: &dyn RecordStore, 
 }
 
 /// **`put_credential` requires a LIVE owning key.** A credential minted onto a key that names no
-
 pub fn assert_put_credential_requires_a_live_key(store: &dyn RecordStore, ns: &str) {
     let absent = format!("{ns}_no_such_owner");
     assert!(
@@ -258,7 +252,6 @@ pub fn assert_put_credential_requires_a_live_key(store: &dyn RecordStore, ns: &s
 }
 
 /// **`put_key_with_credential` is ATOMIC.** When the credential leg is refused — a `public_id`
-
 pub fn assert_put_key_with_credential_is_atomic(store: &dyn RecordStore, ns: &str) {
     let incumbent_key = format!("{ns}_mintowner");
     let incumbent_cred = format!("{ns}_mintcred");
@@ -443,7 +436,6 @@ fn body<T: serde::Serialize>(row: &T) -> Vec<u8> {
 }
 
 /// **`upsert_plane_record`/`get_plane_record` (kind `task`) round-trip.** A task written through the
-
 pub fn assert_plane_task_upsert_get_list(store: &dyn RecordStore, ns: &str) {
     let record = plane_task(ns, "working");
     let task_id = record.id.clone();
@@ -484,7 +476,6 @@ pub fn assert_plane_task_upsert_get_list(store: &dyn RecordStore, ns: &str) {
 }
 
 /// **`append_plane_record`/`list_plane_records(Parent)` (kind `task_event`) orders by `seq`.** Events
-
 pub fn assert_plane_event_chain_is_ordered_by_seq(store: &dyn RecordStore, ns: &str) {
     let parent = format!("{ns}_pchain");
 
@@ -507,7 +498,6 @@ pub fn assert_plane_event_chain_is_ordered_by_seq(store: &dyn RecordStore, ns: &
 }
 
 /// **`list_plane_record_parents` (kind `call`) enumerates every parent with a record.** The boot
-
 pub fn assert_plane_call_parents_enumerated(store: &dyn RecordStore, ns: &str) {
     let p1 = format!("{ns}_prinA");
     let p2 = format!("{ns}_prinB");
@@ -532,7 +522,6 @@ pub fn assert_plane_call_parents_enumerated(store: &dyn RecordStore, ns: &str) {
 }
 
 /// **`upsert_plane_record`/`list_plane_records(All)`/`delete_plane_record` (kind `demotion`).** A
-
 pub fn assert_plane_demotion_upsert_list_delete(store: &dyn RecordStore, ns: &str) {
     let s1 = format!("{ns}_srvA");
     let s2 = format!("{ns}_srvB");
@@ -575,7 +564,6 @@ pub fn assert_plane_demotion_upsert_list_delete(store: &dyn RecordStore, ns: &st
 }
 
 /// **`purge_plane_records_before` (kind `call`) HONOURS THE CUTOFF.** The retention sweep drops rows
-
 pub fn assert_plane_purge_honours_the_cutoff(store: &dyn RecordStore, ns: &str) {
     let parent = format!("{ns}_purgeprin");
 
@@ -632,7 +620,6 @@ pub fn assert_plane_purge_honours_the_cutoff(store: &dyn RecordStore, ns: &str) 
 }
 
 /// **`purge_plane_records_before` (kind `task`) drops only TERMINAL rows.** Age alone is not the
-
 pub fn assert_plane_purge_task_keeps_active_rows(store: &dyn RecordStore, ns: &str) {
     const CUTOFF: u64 = 100_000;
     let (old_ts, fresh_ts) = ns_purge_window(ns, CUTOFF, 100_000);
@@ -683,7 +670,6 @@ pub fn assert_plane_purge_task_keeps_active_rows(store: &dyn RecordStore, ns: &s
 }
 
 /// **`redeem_plane_token` (kind `ask`) is a single-use test-and-set.** The FIRST redemption of a
-
 pub fn assert_plane_token_is_single_use(store: &dyn RecordStore, ns: &str) {
     let token = format!("{ns}_asknonce");
     let expires_at = u64::MAX;

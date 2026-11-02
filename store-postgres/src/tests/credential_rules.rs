@@ -50,7 +50,6 @@ fn isolated(tag: &str) -> (TestStore, String, IsolatedSchema) {
 }
 
 /// R3: a revoked credential id is never minted again; a NEW id into the revoked occupant's slot
-
 #[test]
 fn a_revoked_credential_id_is_never_reminted_but_its_slot_is_reclaimed() {
     if live_url().is_none() {
@@ -83,7 +82,6 @@ fn a_revoked_credential_id_is_never_reminted_but_its_slot_is_reclaimed() {
 }
 
 /// R4: re-putting a live credential with identical content is Ok and writes nothing; different
-
 #[test]
 fn reputting_a_live_credential_is_ok_when_identical_and_refused_when_different() {
     if live_url().is_none() {

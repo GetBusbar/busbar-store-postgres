@@ -92,7 +92,6 @@ fn config_err(what: impl Into<String>) -> Error {
 }
 
 /// How long the host's connector lets a dialled socket sit idle before the OS probes it
-
 const KEEPALIVE_IDLE_SECS: i64 = 60;
 
 /// Why a socket-tuning option has no effect.
@@ -101,13 +100,11 @@ const INERT_SOCKET: &str = "the host's connector dials every connection with TCP
                             per-store setting for it";
 
 /// Log, at debug (below the default level), that the accepted option `key=value` has no effect,
-
 fn inert(key: &str, value: &str, why: &str) {
     tracing::debug!("postgres connection option {key}={value} has no effect: {why}");
 }
 
 /// The most a message may declare: Postgres' own ceiling on a value (1 GiB) plus the four bytes
-
 const MAX_MESSAGE_LEN: u32 = (1 << 30) + 4;
 
 /// The handshake bound when the DSN has no `connect_timeout`.
@@ -121,7 +118,6 @@ impl Config {
     }
 
     /// Parse a libpq connection string: `postgres[ql]://user:pass@host:port/db?key=value&...` or
-
     pub fn parse(s: &str) -> Result<Self, Error> {
         Self::captured(CredUrl::parse_postgres(s).map_err(config_err)?)
     }
@@ -389,7 +385,6 @@ fn target(host: &str, port: u16) -> String {
 }
 
 /// libpq's host, hostaddr and port lists, paired by position: one port for every endpoint, or one
-
 fn endpoints(
     hosts: Option<&str>,
     hostaddrs: Option<&str>,
@@ -470,7 +465,6 @@ fn decode(s: &str) -> Result<String, Error> {
 }
 
 /// The libpq keyword form: `key=value` pairs, whitespace around `=` allowed, single-quoted values
-
 pub(super) fn keywords(s: &str) -> Result<Vec<(String, String)>, Error> {
     let mut out = Vec::new();
     let mut it = s.chars().peekable();
@@ -728,7 +722,6 @@ pub struct Row {
 
 impl Row {
     /// Column `idx` as `T`.
-
     pub fn try_get<'a, I: RowIndex, T: FromSql<'a>>(&'a self, idx: I) -> Result<T, Error> {
         let Some(i) = idx.index(&self.columns) else {
             return Err(Error::new(Kind_::Column(idx.to_string())));
@@ -770,7 +763,6 @@ struct Statement {
 }
 
 /// How many statements a connection keeps prepared: past it, the least recently run is closed
-
 const STATEMENTS_KEPT: usize = 256;
 
 /// The connection's prepared statements, by SQL text. Kept WITH the connection (the wire's session:
@@ -828,13 +820,11 @@ impl Cache {
 }
 
 /// A cached statement's run failed because the server no longer has it as prepared: `26000`
-
 fn is_stale_statement(e: &Error) -> bool {
     matches!(e.code().map(SqlState::code), Some("26000" | "0A000"))
 }
 
 /// One connection to the server, over the op's wire. The connection is KEPT for the instance's
-
 pub struct Client {
     wire: Wire,
     buf: BytesMut,
@@ -869,7 +859,6 @@ fn auth_err(why: impl fmt::Display) -> Error {
 }
 
 /// Keep postgres-protocol's ordered, extension-free server-first grammar and its 100,000
-
 fn scram_server_first(bytes: &[u8]) -> Result<&str, Error> {
     let bad = || auth_err("malformed SCRAM server-first message");
     let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
@@ -913,7 +902,6 @@ fn scram_base64(b: u8) -> bool {
 }
 
 /// No ambiguous attributes: the server-final is one verifier or one refusal. Peer-provided
-
 fn scram_server_final(bytes: &[u8]) -> Result<&str, Error> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| auth_err("malformed SCRAM server-final message"))?;
@@ -935,7 +923,6 @@ pub type Param<'a> = &'a (dyn ToSql + Sync);
 
 impl Client {
     /// Connect over `wire` (its need 0) to the server `cfg` names, secure the connection when
-
     pub async fn connect(
         wire: Wire,
         cfg: &Config,
@@ -1034,7 +1021,6 @@ impl Client {
     }
 
     /// Secure the stream after the server's `S`: verified against the host's trust anchors for
-
     async fn upgrade(&mut self, cfg: &Config, endpoint: &Endpoint) -> Result<(), Error> {
         if !self.buf.is_empty() {
             return Err(Error::new(Kind_::Tls(
@@ -1189,7 +1175,6 @@ impl Client {
     }
 
     /// The op is done with the connection: keep it if the session is idle, else it is discarded
-
     pub async fn release(&mut self) {
         if self.rollback_pending
             && self.at_ready
@@ -1210,7 +1195,6 @@ impl Client {
     }
 
     /// A whole credential-bearing frame stays inside the SDK through partial writes and Pending.
-
     async fn send_sealed(&mut self, message: Seal) -> Result<(), Error> {
         self.at_ready = false;
         self.wire
@@ -1311,7 +1295,6 @@ impl Client {
     }
 
     /// Run `sql` (one or more statements, no parameters) through the simple query protocol.
-
     pub async fn batch_execute(&mut self, sql: &str) -> Result<(), Error> {
         self.settle().await?;
         self.simple(sql).await
@@ -1324,7 +1307,6 @@ impl Client {
     }
 
     /// Run one statement with `params`: its rows and the rows it affected. A statement the
-
     async fn run(&mut self, sql: &str, params: &[Param<'_>]) -> Result<(Vec<Row>, u64), Error> {
         self.settle().await?;
         let cached = self.cache().get(sql);
@@ -1350,7 +1332,6 @@ impl Client {
     }
 
     /// Prepare `sql` under a new name (the parameter and column types: one round trip, which also
-
     async fn prepare(&mut self, sql: &str) -> Result<Arc<Statement>, Error> {
         let name = {
             let mut c = self.cache();
@@ -1500,19 +1481,16 @@ impl Client {
     }
 
     /// The rows `sql` answers.
-
     pub async fn query(&mut self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>, Error> {
         self.run(sql, params).await.map(|(r, _)| r)
     }
 
     /// How many rows `sql` affected.
-
     pub async fn execute(&mut self, sql: &str, params: &[Param<'_>]) -> Result<u64, Error> {
         self.run(sql, params).await.map(|(_, n)| n)
     }
 
     /// The one row `sql` answers.
-
     pub async fn query_one(&mut self, sql: &str, params: &[Param<'_>]) -> Result<Row, Error> {
         let mut rows = self.query(sql, params).await?;
         if rows.len() != 1 {
@@ -1522,7 +1500,6 @@ impl Client {
     }
 
     /// The row `sql` answers, if one.
-
     pub async fn query_opt(
         &mut self,
         sql: &str,
@@ -1537,7 +1514,6 @@ impl Client {
     }
 
     /// Begin a READ COMMITTED transaction.
-
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         self.batch_execute(begin_sql(None)).await?;
         Ok(Transaction {
@@ -1567,7 +1543,6 @@ pub enum IsolationLevel {
 }
 
 /// The one simple-query batch that begins a transaction at `isolation` (`None` = READ COMMITTED,
-
 #[must_use]
 pub fn begin_sql(isolation: Option<IsolationLevel>) -> &'static str {
     match isolation {
@@ -1600,7 +1575,6 @@ impl<'a> TransactionBuilder<'a> {
     }
 
     /// Begin it.
-
     pub async fn start(self) -> Result<Transaction<'a>, Error> {
         self.client.batch_execute(begin_sql(self.isolation)).await?;
         Ok(Transaction {
@@ -1626,14 +1600,12 @@ impl Drop for Transaction<'_> {
 
 impl Transaction<'_> {
     /// Commit.
-
     pub async fn commit(mut self) -> Result<(), Error> {
         self.done = true;
         self.client.batch_execute("COMMIT").await
     }
 
     /// Roll back, awaiting the server's completion before releasing this transaction's locks.
-
     pub async fn rollback(mut self) -> Result<(), Error> {
         self.client.batch_execute("ROLLBACK").await?;
         self.done = true;
@@ -1641,31 +1613,26 @@ impl Transaction<'_> {
     }
 
     /// [`Client::batch_execute`] inside the transaction.
-
     pub async fn batch_execute(&mut self, sql: &str) -> Result<(), Error> {
         self.client.batch_execute(sql).await
     }
 
     /// [`Client::query`] inside the transaction.
-
     pub async fn query(&mut self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>, Error> {
         self.client.query(sql, params).await
     }
 
     /// [`Client::execute`] inside the transaction.
-
     pub async fn execute(&mut self, sql: &str, params: &[Param<'_>]) -> Result<u64, Error> {
         self.client.execute(sql, params).await
     }
 
     /// [`Client::query_one`] inside the transaction.
-
     pub async fn query_one(&mut self, sql: &str, params: &[Param<'_>]) -> Result<Row, Error> {
         self.client.query_one(sql, params).await
     }
 
     /// [`Client::query_opt`] inside the transaction.
-
     pub async fn query_opt(
         &mut self,
         sql: &str,

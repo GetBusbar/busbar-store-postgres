@@ -41,7 +41,6 @@ fn what_the_host_cannot_dial_is_refused() {
 }
 
 /// libpq's MULTI-HOST list (busbar oracle store.boot|postgres|multi-host): every endpoint, in
-
 #[test]
 fn a_multi_host_list_names_every_endpoint_in_order() {
     let c = Config::parse("postgres://u:p@127.0.0.1:1,db:5433,[::1]/d").unwrap();
@@ -55,7 +54,6 @@ fn a_multi_host_list_names_every_endpoint_in_order() {
 }
 
 /// D11 (RED before: `host` and `hostaddr` shared one slot, the last won): `hostaddr` is the
-
 #[test]
 fn hostaddr_is_dialled_and_host_is_the_name() {
     let c = Config::parse("host=db.internal hostaddr=10.1.2.3 port=6000 user=u").unwrap();
@@ -79,7 +77,6 @@ fn hostaddr_is_dialled_and_host_is_the_name() {
 }
 
 /// D10 (RED before: any value was accepted and ignored): `target_session_attrs` is `any`,
-
 #[test]
 fn target_session_attrs_takes_the_drivers_values_only() {
     for ok in ["any", "read-write", "read-only"] {
@@ -94,7 +91,6 @@ fn target_session_attrs_takes_the_drivers_values_only() {
 }
 
 /// D9 (RED before: both were accepted and silently ignored): this client has no SCRAM-PLUS, so
-
 #[test]
 fn what_this_client_cannot_honour_is_refused_not_ignored() {
     let e = Config::parse("host=db user=u channel_binding=require").unwrap_err();
@@ -109,7 +105,6 @@ fn what_this_client_cannot_honour_is_refused_not_ignored() {
 }
 
 /// libpq's `prefer` and `allow` parse (1.5.5 accepted them); the password is never echoed by a
-
 #[test]
 fn sslmode_prefer_and_allow_parse() {
     for mode in ["prefer", "allow"] {
@@ -123,7 +118,6 @@ fn sslmode_prefer_and_allow_parse() {
 }
 
 /// Each `sslmode` maps to its libpq behaviour: `disable` and `allow` are plaintext, `prefer` asks
-
 #[test]
 fn sslmode_values_map_to_their_modes() {
     for (mode, want) in [("allow", SslMode::Plain), ("prefer", SslMode::Prefer)] {
@@ -142,7 +136,6 @@ fn sslmode_values_map_to_their_modes() {
 }
 
 /// The libpq socket options a 1.5.5 DSN carried are ACCEPTED (1.5.5's driver accepted them; a 1.5.5
-
 #[test]
 fn socket_options_are_accepted_and_what_cannot_apply_is_logged() {
     let logged = |dsn: &str| -> (Result<(), String>, String) {
@@ -261,7 +254,6 @@ impl std::io::Write for Sink {
 }
 
 /// D37 (RED before: accepted and ignored): `connect_timeout` is whole seconds as the driver
-
 #[test]
 fn connect_timeout_is_whole_seconds() {
     for ok in ["5", "0", "-1"] {
@@ -282,7 +274,6 @@ fn connect_timeout_is_whole_seconds() {
 }
 
 /// A DSN without `connect_timeout` still bounds the handshake (30 s); the DSN's value wins, and 0
-
 #[test]
 fn an_unset_connect_timeout_defaults_to_thirty_seconds() {
     let bound = |dsn: &str| Config::parse(dsn).unwrap().connect_bound_ms();
@@ -293,7 +284,6 @@ fn an_unset_connect_timeout_defaults_to_thirty_seconds() {
 }
 
 /// D26 (RED before: the unparsed fragment was echoed): a configuration error never repeats a
-
 #[test]
 fn a_config_error_never_echoes_a_password_tail() {
     for dsn in [
@@ -325,7 +315,6 @@ fn a_config_error_never_echoes_a_password_tail() {
 }
 
 /// B9: the store reaches its server over TCP, so a Unix-socket host is refused in the URL
-
 #[test]
 fn a_unix_socket_host_is_refused_in_every_url_form() {
     let e = Config::parse("postgres://u@%2Fvar%2Frun%2Fpostgresql/d").unwrap_err();
@@ -337,7 +326,6 @@ fn a_unix_socket_host_is_refused_in_every_url_form() {
 }
 
 /// 1.5.5 dialled `hostaddr` and used `host` only as a name, so a socket-path host beside a
-
 #[test]
 fn a_socket_path_host_beside_a_hostaddr_is_dialled_by_address() {
     let c = Config::parse("host=/tmp hostaddr=127.0.0.1 user=u").unwrap();
@@ -348,7 +336,6 @@ fn a_socket_path_host_beside_a_hostaddr_is_dialled_by_address() {
 }
 
 /// D28 (RED before: `ranges[i]` indexed out of bounds, a panic): a DataRow with fewer fields
-
 #[test]
 fn a_data_row_short_of_its_columns_is_an_error_not_a_panic() {
     use bytes::BytesMut;
@@ -397,7 +384,6 @@ fn a_snapshot_transaction_begins_repeatable_read() {
 }
 
 /// The connection's prepared statements stay bounded: past `STATEMENTS_KEPT` the least recently
-
 #[test]
 fn prepared_statements_drop_the_least_recently_run_past_the_bound() {
     use std::sync::Arc;

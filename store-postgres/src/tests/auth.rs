@@ -179,7 +179,6 @@ fn request(code: u32, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Credential messages remain byte-for-byte PostgreSQL frames under partial host writes and a
-
 #[test]
 fn cleartext_and_md5_frames_survive_partial_and_pending_host_writes() {
     for (method, code, salt) in [("password", 3, Vec::new()), ("md5", 5, vec![1, 2, 3, 4])] {
@@ -245,7 +244,6 @@ fn the_signed_default_floor_refuses_cleartext_and_md5_before_a_password_write() 
 }
 
 /// A failed write after a credential prefix cannot return the half-authenticated socket to the
-
 #[test]
 fn a_partial_authentication_write_failure_discards_the_connection() {
     let (tx, rx) = mpsc::channel();
@@ -275,7 +273,6 @@ fn a_partial_authentication_write_failure_discards_the_connection() {
 }
 
 /// The nonce is fresh on reconnect, n,, remains the unsupported channel-binding header even
-
 #[test]
 fn scram_uses_a_fresh_nonce_and_rejects_an_invalid_server_verifier() {
     let (tx, rx) = mpsc::channel();
@@ -378,7 +375,6 @@ fn malformed_scram_continue_and_wrong_authentication_stage_write_no_proof() {
 }
 
 /// Valid legacy configurations below 4096 keep working through the PostgreSQL-specific recipe;
-
 #[test]
 fn valid_legacy_scram_iteration_counts_reach_the_proof_write() {
     for iterations in [1, 4095] {
