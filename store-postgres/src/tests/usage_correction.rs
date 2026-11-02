@@ -8,7 +8,7 @@ use busbar_contract::abi::sdk::store::correction::{
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
 use busbar_contract::abi::sdk::store::OpRefused;
 use busbar_contract::abi::store::OpId;
-use busbar_contract::store_calls::{StoreCalls, StoreFailure};
+use busbar_contract::store_calls::StoreFailure;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -53,7 +53,9 @@ fn request(expected: UsageLedger, replacement: UsageLedger) -> Request {
     }
 }
 fn apply(store: &TestStore, request: &Request) -> Result<Decision, StoreFailure> {
-    harness::block_on(StoreCalls::apply_usage_correction(&**store, request))
+    harness::block_on(
+        busbar_contract::store_calls::StoreCalls::apply_usage_correction(&**store, request),
+    )
 }
 fn receipts(store: &TestStore) -> i64 {
     store
@@ -108,7 +110,7 @@ fn exact_rows_receipts_conflicts_and_full_unsigned_values_survive_reopen() {
     let Some(url) = live_url() else { return };
     let db = TempDb::create(&url, "spg_correction_exact");
     let store = seed(&db);
-    assert!(StoreCalls::supports_usage_correction(&*store));
+    assert!(busbar_contract::store_calls::StoreCalls::supports_usage_correction(&*store));
     let before = revision(&store);
     let r = request(UsageLedger::default(), ledger(u64::MAX));
     assert_eq!(apply(&store, &r).unwrap(), Decision::Applied);
@@ -409,9 +411,11 @@ fn absent_insert_metering_phantom_purge_and_key_delete_are_serialized_with_corre
     store.put_usage(BUCKET, DAY, &ledger(100)).unwrap();
     assert_eq!(
         writer_before_correction(&db, request(ledger(100), ledger(40)), |s| {
-            harness::block_on(StoreCalls::purge_usage_before(&*s, DAY + 1))
-                .map(drop)
-                .map_err(|e| e.to_string())
+            harness::block_on(
+                busbar_contract::store_calls::StoreCalls::purge_usage_before(&*s, DAY + 1),
+            )
+            .map(drop)
+            .map_err(|e| e.to_string())
         }),
         Decision::ConditionConflict
     );
@@ -479,9 +483,9 @@ fn a_lost_commit_reply_retains_exact_replay_custody_after_the_loaded_future_is_d
     let sent = r.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let _ = tx.send(harness::block_on(StoreCalls::apply_usage_correction(
-            &loaded, &sent,
-        )));
+        let _ = tx.send(harness::block_on(
+            busbar_contract::store_calls::StoreCalls::apply_usage_correction(&loaded, &sent),
+        ));
     });
     let witnessed = until(|| {
         gate.is_held()
@@ -531,7 +535,8 @@ fn cancelling_a_pending_authority_wait_drops_the_uncommitted_transaction_without
         .batch_execute("BEGIN; SELECT revision FROM store_revision WHERE only_row FOR UPDATE")
         .unwrap();
     let r = request(UsageLedger::default(), ledger(40));
-    let mut pending = Box::pin(StoreCalls::apply_usage_correction(&loaded, &r));
+    let mut pending =
+        Box::pin(busbar_contract::store_calls::StoreCalls::apply_usage_correction(&loaded, &r));
     let mut cx = Context::from_waker(Waker::noop());
     let reached_wait = until(|| {
         assert!(matches!(pending.as_mut().poll(&mut cx), Poll::Pending));

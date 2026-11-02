@@ -4,7 +4,6 @@
 use super::*;
 use busbar_contract::abi::sdk::store::OpRefused;
 use busbar_contract::abi::store::OpId;
-use busbar_contract::store_calls::StoreCalls;
 
 const KEYS: [u64; 8] = [
     0,
@@ -157,7 +156,10 @@ fn unsigned_usage_purge_preserves_zero_equal_cutoffs_and_metering() {
             .filter(|key| *key != 0 && *key < cutoff)
             .count();
         assert_eq!(
-            harness::block_on(StoreCalls::purge_usage_before(&*store, cutoff)).unwrap(),
+            harness::block_on(
+                busbar_contract::store_calls::StoreCalls::purge_usage_before(&*store, cutoff)
+            )
+            .unwrap(),
             removed as u64
         );
         for key in KEYS {
@@ -201,7 +203,10 @@ fn unsigned_usage_purge_preserves_zero_equal_cutoffs_and_metering() {
          FOR EACH ROW EXECUTE FUNCTION reject_unsigned_purge();",
         )
         .unwrap();
-    assert!(harness::block_on(StoreCalls::purge_usage_before(&*store, u64::MAX)).is_err());
+    assert!(harness::block_on(
+        busbar_contract::store_calls::StoreCalls::purge_usage_before(&*store, u64::MAX)
+    )
+    .is_err());
     for key in KEYS {
         assert_eq!(store.get_usage("bucket", key).unwrap(), ledger(5));
     }
