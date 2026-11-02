@@ -12,6 +12,7 @@ description = "The Postgres backend for busbar's durable governance store — th
 workspace = true
 
 [dependencies]
+serde = { workspace = true }
 # The ONE busbar crate this plugin names (#40: contract only; DECISIONS #84 merged the plugin SDK
 # into it as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`;
 # a busbar build that links this crate `[patch]`es the busbar git source to its own tree, so ONE
@@ -36,7 +37,6 @@ tracing = { workspace = true }
 # this crate owns its copy at `src/tests/store_conformance.rs` (verbatim from busbar's in-tree copy).
 # Its plane-record checks serialize stand-in rows with serde derive, hence this one dev-dependency;
 # no busbar crate beyond `busbar-contract` is needed.
-serde = { workspace = true }
 # The unavailable-reason log test installs a capturing subscriber.
 tracing-subscriber = { workspace = true }
 # The live tests open the store through the REAL loader on a dispatcher, its connections over the
