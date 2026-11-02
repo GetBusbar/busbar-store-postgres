@@ -705,7 +705,7 @@ fn record_keys_are_raw_bytes_scanned_in_byte_order() {
     assert!(scan(&[0xC3, 0x29]).is_empty());
 }
 
-/// AN EMPTY PUT REMOVES THE ROW (slot 26's rule, ARCHITECT 2026-10-21): the host writes every
+/// An empty put removes the stored row.
 
 #[test]
 fn an_empty_put_removes_the_row() {

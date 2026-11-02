@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! TLS THROUGH THE HOST, and the KEPT connection, live (ARCHITECT rulings 2026-10-03: TLS,
+//! Exercises host-provided TLS and reuse of a kept connection.
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
