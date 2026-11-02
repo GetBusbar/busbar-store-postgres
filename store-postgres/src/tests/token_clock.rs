@@ -156,7 +156,7 @@ pub(super) fn assert_strict_boundary(kind: &str) {
         .redeem_plane_token(kind, WINNER_TOKEN, RETAINED_EXPIRY, FAST_CALLER)
         .unwrap());
     drop(reopened);
-    // A broken authoritative clock is an error; it does not become a false-successful claim.
+
     const INVALID_CLOCK: &str = "invalid-clock-fixture";
     raw.batch_execute(&format!(
         "ALTER DATABASE {} SET {TEST_CLOCK_SETTING} = '{INVALID_CLOCK}'",
@@ -235,7 +235,7 @@ fn ticket_retention_caps_fast_callers_and_preserves_other_kinds() {
         store.get_plane_record(ORDINARY_KIND, LIVE_ID).unwrap(),
         None
     );
-    // Model the later persisted expiry without changing any caller clock or global server clock.
+
     store
         .upsert_plane_record(record(TICKET_KIND, LIVE_ID, EXPIRED_AT_EPOCH).view())
         .unwrap();

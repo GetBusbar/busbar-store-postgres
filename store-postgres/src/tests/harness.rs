@@ -2,11 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! THE STORE UNDER TEST, AS BUSBAR RUNS IT: the store's door loaded through the real loader on a
-//! dispatcher, every connection over the host's connection path (the loader's test connection
-//! table, `tcp_conns::TcpConns`, plain TCP), opened with `open`'s connect step. [`TestStore`]
-//! answers the 1.5.5 op set through the loader's synchronous bridge (`RecordStore`, by deref) and
-//! the `op_id` and record slots through `StoreCalls`, in the slots' own result types; [`TestStore::lock`] is
-//! an INDEPENDENT `postgres` driver connection for the raw SQL a test sets up or verifies with.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -47,7 +42,7 @@ pub(crate) fn block_on<F: Future>(f: F) -> F::Output {
 }
 
 /// A fresh `op_id` for every bridge write: a node half no other open (in this run or an earlier
-/// one) used, the store dedupes `op_id`s DURABLY.
+
 fn mint() -> OpId {
     static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

@@ -151,7 +151,7 @@ fn all_predicates_use_prestate_and_receipts_replay_before_rechecking_conditions(
         "a condition conflict records no receipt"
     );
     assert_eq!(revision(&reopened), before);
-    // That definitively unused id can be replanned; an Applied id above cannot.
+
     let mut replanned = losing;
     replanned.predicates[0].expected = Expected::Bytes(b"new".to_vec());
     assert_eq!(apply(&reopened, &replanned).unwrap(), Decision::Applied);
@@ -195,10 +195,9 @@ fn malformed_requests_leave_rows_revisions_and_receipts_unchanged() {
 }
 
 fn race(db: &TempDb, left: Request, right: Request) -> [Decision; 2] {
-    // Both opens precede the blocker and workers. Actual server lock waits establish the schedule.
     let a = TestStore::open(&db.url()).unwrap();
     let b = TestStore::open(&db.url()).unwrap();
-    // The blocker transaction would cache pg_stat_activity on its first observation.
+
     let mut observer = connect_client_with_retry(&db.url());
     let mut blocker = connect_client_with_retry(&db.url());
     blocker
@@ -221,7 +220,7 @@ fn race(db: &TempDb, left: Request, right: Request) -> [Decision; 2] {
          AND pid<>pg_backend_pid() AND wait_event_type='Lock' AND query LIKE '%store_revision%FOR UPDATE%'", &[],
     ).unwrap().get::<_, i64>(0) == 2
     });
-    blocker.batch_execute("ROLLBACK").unwrap(); // Always release before assertions or worker joins.
+    blocker.batch_execute("ROLLBACK").unwrap();
     assert!(
         blocked,
         "both distinct op_ids must lock before reading even an absent predicate"
@@ -307,8 +306,7 @@ fn writer_and_retirement_compete_on_the_same_prestate_without_resurrection_or_cu
         let first_worker = std::thread::spawn(move || {
             let _ = first_tx.send((0, apply(&a, &first)));
         });
-        // The first transaction has checked its predicate and reached its mutation; its result
-        // is unpublished. The second must wait before evaluating the same old predicate.
+
         let paused = until(|| {
             blocker.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event='advisory' AND pid<>pg_backend_pid())", &[]).unwrap().get::<_,bool>(0)
         });
@@ -477,7 +475,7 @@ fn range_retirement_is_binary_exact_length_scoped_atomic_and_receipt_replayable(
     assert!(store.record_get("other-schema", &a).unwrap().is_some());
     assert_eq!(apply(&store, &r).unwrap(), Decision::Applied);
     assert_eq!(receipts(&store), 1);
-    // A declared full-u64 length has no BYTEA matches; it is never truncated to a smaller width.
+
     let impossible = request(
         vec![predicate(b"state", Expected::Absent)],
         vec![Mutation::DeleteRange {
@@ -488,7 +486,7 @@ fn range_retirement_is_binary_exact_length_scoped_atomic_and_receipt_replayable(
     );
     assert_eq!(apply(&store, &impossible).unwrap(), Decision::Applied);
     assert!(store.record_get(SCHEMA, &neighbour).unwrap().is_some());
-    // Point/range overlap is a malformed batch, not an order-dependent deletion plan.
+
     let overlapping = request(
         vec![predicate(b"state", Expected::Absent)],
         vec![range, put(&a, b"rewrite")],
@@ -507,7 +505,7 @@ fn ordinary_record_put_and_delete_cannot_bypass_the_conditional_serialization_lo
     let before = revision(&store);
     for value in [b"new".to_vec(), Vec::new()] {
         store.record_put(SCHEMA, b"state", b"old").unwrap();
-        // Observe each lock wait in autocommit rather than the blocker's cached snapshot.
+
         let mut observer = connect_client_with_retry(&db.url());
         let mut blocker = connect_client_with_retry(&db.url());
         blocker

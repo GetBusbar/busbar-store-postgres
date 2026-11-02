@@ -3,8 +3,6 @@
 
 use super::*;
 
-// d3a6ec4 (schema v10) wrote both None and Some(id) as parent=id. Its task_event
-// and call fixtures routinely used Some(id); the opaque body carried no envelope bit.
 fn envelope(kind: &str, id: &str, parent: Option<&str>) -> PlaneRecord {
     PlaneRecord {
         kind: kind.into(),
@@ -51,7 +49,6 @@ fn legacy_v13(raw: &mut postgres::Client) {
     .unwrap();
 }
 
-// The schema-v10-v13 write statement, with the same parent fallback as d3a6ec4.
 fn append_v13(raw: &mut postgres::Client, record: &PlaneRecord) {
     let parent = record.parent.as_deref().unwrap_or(&record.id);
     raw.execute(
@@ -73,8 +70,7 @@ fn append_v13(raw: &mut postgres::Client, record: &PlaneRecord) {
 #[test]
 fn pre14_ambiguous_parent_presence_refuses_without_rewriting_and_retries_identically() {
     let Some(url) = live_url() else { return };
-    // The same legacy SQL shape represents a normal historical task/call with a parent OR
-    // a neutral caller's parentless append. Neither case may be guessed from kind or body.
+
     for (kind, parented) in [("task_event", true), ("call", true), ("opaque", false)] {
         let db = TempDb::create(&url, "spg_parent_ambiguous");
         let store = TestStore::open(&db.url()).unwrap();

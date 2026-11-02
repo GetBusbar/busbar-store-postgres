@@ -114,7 +114,7 @@ fn v15_positive_timestamp_migration_changes_neither_row_bits_nor_revisions() {
     let store = TestStore::open(&db.url()).unwrap();
     store.put_key(&sample_key("owner")).unwrap();
     let mut credential = sample_cred("owner", 0, "public");
-    // MAX might be an original MAX or an old clamp; migration cannot infer another value.
+
     credential.meta.created_at = i64::MAX as u64;
     credential.meta.updated_at = 17;
     credential.meta.expires_at = Some(99);

@@ -2,41 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! **ONE POSTGRES STORE, BOTH DOORS, ONE TABLE** — the store's linked + dropped-in conformance on
-//! the store kind's door (THE DESIGN §11), run against the busbar rev this repo pins
-//! (`.busbar-ref`).
-//!
-//! The store is held two ways at once: COMPILED IN (the logic crate's `door`, the row a busbar build
-//! that links it registers) and DROPPED IN (this crate's built cdylib, admitted against the same
-//! Statement). Each is opened through the store v3 table and must agree, byte for byte, on:
-//!
-//! * the Statement both doors render;
-//! * every refusal the store's own `open` gives (no config, an empty object, malformed JSON, a
-//!   non-string url, and an unreachable server — which proves the plugin's own connect path runs,
-//!   and that it scrubs nothing it should not);
-//! * with a live Postgres (`BUSBAR_TEST_POSTGRES_URL`, the same gate the rest of this repo's live
-//!   tests use: unset under CI is a FAILURE, unset locally skips only this scenario), one durable
-//!   scenario per door — upsert, point read, a child chain, single-use token redemption, delete.
-//!
-//! RED ARMS, each its own test and always run (no database needed): the library asked for as
-//! `kind: secret` is refused before any slot is called, and DIFFERENT bytes (the cdylib with its
-//! object magic broken) are not the store — so the comparison above cannot pass vacuously.
 
 mod common;
 
-// THE PUBLISHED SUITE (busbar-plugin-loader's `conformance` feature, at the pin): the linked door and
-// the built cdylib, each through the one loader, driven by the store kind's script over the live
-// Postgres `conformance.json` names; exact crossing counts, the two folds equal, its RED arms.
-//
-// Each fold opens over its own schema: conformance.json's url names `search_path={fold}`, and the
-// hooks below create that schema before the fold and drop it after, on an independent connection
-// of the `postgres` driver (the store never creates a schema; nothing in its behaviour changes).
-//
-// THE HOST (ARCHITECT Q-P4-9): the store's `tcp` need is served by busbar's own connector, composed
-// as the root composes it (`conformance_host`, rendered by the fleet template), and the store asks
-// for TLS (`sslmode=require`): its `SSLRequest` is answered by the suite's TLS front, whose
-// certificate chains to the suite's test CA, the anchors only the HOST's TLS is handed (`tls:`);
-// the front carries the secured connection to the live Postgres. So every fold proves the store's
-// connection is secured by the host, verified against the anchors.
 #[path = "support/conformance_host.rs"]
 mod conformance_host;
 
@@ -51,7 +19,7 @@ busbar_test_kit::conformance_suite! {
 }
 
 /// The live Postgres's address (`BUSBAR_TEST_POSTGRES_URL`'s authority; the service container's
-/// default when unset).
+
 fn upstream() -> &'static str {
     static AT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     AT.get_or_init(|| {
@@ -67,7 +35,7 @@ fn upstream() -> &'static str {
 }
 
 /// Postgres's cleartext negotiation: the client's `SSLRequest` (length 8, code 80877103) answered
-/// `S`; anything else is not a TLS client.
+
 fn ssl_request(tcp: &mut std::net::TcpStream) -> bool {
     use std::io::{Read, Write};
     let mut req = [0_u8; 8];
@@ -92,7 +60,7 @@ fn fold_client(settings: &[u8]) -> postgres::Client {
     let url = v["url"]
         .as_str()
         .expect("conformance.json's settings name a url");
-    // Straight to the live server, in the clear: the TLS front is the store's, not this client's.
+
     let url = url
         .replace(conformance_host::FAR_END, upstream())
         .replace("sslmode=require", "sslmode=disable");
@@ -117,7 +85,7 @@ fn create_fold_schema(namespace: &str, settings: &[u8]) {
 }
 
 /// The suite's namespace hook: the fold's schema and everything the store made in it, dropped after
-/// the fold.
+
 fn drop_fold_schema(namespace: &str, settings: &[u8]) {
     fold_client(settings)
         .batch_execute(&format!("DROP SCHEMA IF EXISTS \"{namespace}\" CASCADE"))
@@ -133,8 +101,7 @@ use busbar_plugin_loader::store_v3::LoadedStore;
 use std::sync::Arc;
 
 /// The live Postgres, by this repo's one gate: set → `Some`; unset under CI → a FAILURE (the
-/// service container must provision it); unset locally → `None` (the durable scenario is skipped,
-/// everything else still runs).
+
 fn live_url() -> Option<String> {
     match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
         Ok(url) => Some(url),
@@ -150,7 +117,7 @@ fn live_url() -> Option<String> {
 }
 
 /// One durable scenario through `store`, every id namespaced by `ns` so the two doors (and
-/// concurrent runs) never read each other's rows; the transcript names ids WITHOUT the namespace.
+
 fn scenario(store: &dyn RecordStore, ns: &str) -> serde_json::Value {
     let kind = "conformance_task";
     let child = "conformance_event";
@@ -200,8 +167,7 @@ fn scenario(store: &dyn RecordStore, ns: &str) -> serde_json::Value {
         .redeem_plane_token("conformance_token", &token, u64::MAX, 1_900_000_000)
         .expect("redeem again");
     store.delete_plane_record(kind, &id).expect("delete");
-    // The events hang off the task by parent, in their own kind: delete_plane_record of that kind
-    // takes the chain, so the run leaves no rows behind.
+
     store
         .delete_plane_record(child, &id)
         .expect("delete the event chain");
@@ -246,7 +212,7 @@ fn transcript(
 }
 
 /// The Postgres store behaves as ONE store through either door; the RED arms below show the
-/// comparison is not vacuous.
+
 #[test]
 fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
     let live = live_url();
@@ -255,7 +221,6 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
     let dropped_in = transcript("dropped", &common::dropped, live.as_deref());
     assert_eq!(linked, dropped_in, "the two doors are not one store");
 
-    // The refusals are the store's OWN words, and the unreachable-server one scrubs the password.
     let refusals = linked["refusals"].as_array().unwrap();
     assert_eq!(
         refusals[0],
@@ -299,8 +264,7 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
 }
 
 /// RED: DIFFERENT bytes (the object's magic broken) are not the store. The foreign image is
-/// written under its own directory, so the loader `dlopen`s a path no good image was ever loaded
-/// from, whatever order the tests in this target run in.
+
 #[test]
 fn foreign_bytes_dropped_in_are_not_the_postgres_store() {
     let lib = common::plugin_path();

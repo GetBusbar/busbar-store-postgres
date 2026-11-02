@@ -2,25 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store v3 slots this backend answers beyond the base op set ([`StoreSlots`]): the
-//! `op_id`-carrying writes (the usage and metering batches and the plane-record append), the
-//! kernel-held records, and the door (`store_door!`) over all of it. The store keeps ledger counts
-//! and records only; money is a view on ledger x rate card.
-//!
-//! DEDUPE (`abi::store` S1-S4), DURABLE: every `op_id` this store APPLIED is a `store_ops` row
-//! holding the op's body ([`Dedupe::body_hex`]; `answer` is written empty and never read). The row
-//! is inserted before the effect in the op's transaction: a racing call with the same
-//! `op_id` (on this node or another) waits on the primary key, then reads the committed body, which
-//! [`Dedupe::answer`] judges a replay or a conflict. A failed op rolls its row back with its
-//! effect. Rows are kept [`OP_ID_RETENTION_SECS`] and swept at most once a minute per instance.
-//!
-//! CONNECTIONS: every slot runs on one of the instance's kept connections over the host's connector, as
-//! straight-line async code by the store SDK's `wire::drive_kept`. The door declares one outbound
-//! `tcp` need (`NEEDS`); `open` parses the settings and its connect step reaches the server and
-//! ensures the schema, so an unreachable or refusing server fails the load.
-//!
-//! Every `u64` this module's own record and dedupe columns take is stored BIT-FOR-BIT in a BIGINT
-//! (`as i64`). Raw usage counters use exact decimal NUMERIC storage and u64 saturation;
-//! metering totals retain their signed-column saturation, and appends refuse out-of-range values.
 
 use std::sync::atomic::Ordering;
 
@@ -52,7 +33,7 @@ const NO_TEXT: AbiStr = AbiStr {
 };
 
 /// The store's one need: the server, dialled over `tcp` at the DSN's `host:port`, in the
-/// `operator-infrastructure` egress class.
+
 pub const NEEDS: &[Need] = &[Need {
     direction: DIRECTION_OUTBOUND,
     egress_class: EGRESS_OPERATOR_INFRASTRUCTURE,
@@ -75,8 +56,6 @@ pub const NEEDS: &[Need] = &[Need {
     deny_response_headers_len: 0,
 }];
 
-// `url` is reference-capable, not secret: a `{env:}`/`{file:}`/`{module:}` reference resolves in
-// place (a 1.5.5 `url: {env: VAR}` keeps booting) and a literal passes as written.
 busbar_contract::statement_extensions!(EXTENSIONS: [
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
     (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
@@ -148,9 +127,7 @@ fn refused(e: RecordStoreError) -> OpRefused {
 }
 
 /// An apply error the server decided from the values (SQLSTATE class 22 data exception, 23
-/// integrity constraint; the text leads with its code, `render_pg_error`) is a refusal: the
-/// transaction rolled back and a retry of the same values fails the same way. Anything else
-/// (a deadlock, a serialization failure, the chain fork) stays `Failed`.
+
 fn decided(r: OpRefused) -> OpRefused {
     match r {
         OpRefused::Failed(t) if decided_text(&t) => OpRefused::Refused(t),
@@ -168,7 +145,7 @@ fn decided_text(t: &str) -> bool {
 }
 
 /// Claim `op` for `body` (its [`Dedupe::body_hex`]) inside `tx`: insert its row (`None`), or read
-/// the body a committed call recorded.
+
 async fn claim(tx: &mut Transaction<'_>, op: OpId, body: &str) -> Result<Option<String>, String> {
     let id: &[u8] = &op.0;
     let inserted = tx
@@ -188,8 +165,7 @@ async fn claim(tx: &mut Transaction<'_>, op: OpId, body: &str) -> Result<Option<
         .map_err(pg)?;
     match row {
         Some(r) => Ok(Some(r.try_get(0).map_err(pg)?)),
-        // Swept between the insert and the read (it was past retention): nothing applied, and a
-        // retry claims the op afresh.
+
         None => Err(format!("op_id {op:?} was swept while being claimed; retry")),
     }
 }
@@ -253,8 +229,7 @@ impl Session {
                 .await
                 .map_err(decided)?;
         }
-        // A lost COMMIT response remains Failed/unknown. The exact request then replays the
-        // durable receipt; no caller may turn that failure into a definitive condition conflict.
+
         tx.commit().await.map_err(|e| OpRefused::Failed(pg(e)))?;
         self.sweep_ops().await;
         Ok(correction::Decision::Applied)
@@ -328,8 +303,7 @@ impl Session {
             return;
         }
         let before = bits(now.saturating_sub(OP_ID_RETENTION_SECS));
-        // Best effort: a failed sweep leaves rows that the next sweep takes. Batched and bounded, so
-        // the first sweep after a long stop is not one huge delete ahead of an admitted write.
+
         for _ in 0..SWEEP_MAX_BATCHES {
             let removed = self
                 .client()
@@ -346,8 +320,7 @@ impl Session {
     }
 
     /// One `op_id`-carrying write in ONE transaction with its dedupe row: a new op runs `apply` and
-    /// commits (`None`); an op already recorded applies nothing and answers the body found, for
-    /// [`Dedupe::answer`]. A refusal from `apply` rolls the row back with the effect.
+
     async fn deduped(
         &mut self,
         op: OpId,
@@ -362,8 +335,6 @@ impl Session {
             .await
             .map_err(|e| OpRefused::Failed(pg(e)))?;
         if matches!(authority, DedupeAuthority::Ledger) {
-            // The same first lock as correction and key mutation. It also covers absent rows
-            // and the entire metering selection, which per-row/advisory cell locks cannot do.
             Session::lock_revision(&mut tx).await.map_err(failed)?;
         }
         let found = claim(&mut tx, op, body).await.map_err(OpRefused::Failed)?;
@@ -380,7 +351,6 @@ impl Session {
         body: &str,
         record: &busbar_contract::records::PlaneRecord,
     ) -> OpResult<Option<String>> {
-        // Decided before BEGIN: a seq or ts the column cannot hold is refused, nothing written.
         storable_i64("append_plane_record", "seq", record.seq).map_err(refused)?;
         storable_i64("append_plane_record", "ts", record.ts).map_err(refused)?;
         self.deduped(op, body, DedupeAuthority::Receipt, async |tx| {
@@ -411,8 +381,7 @@ impl Session {
             .transaction()
             .await
             .map_err(|e| OpRefused::Failed(pg(e)))?;
-        // Different op_ids and absent addresses must serialize before either reads a predicate.
-        // Ordinary record_put uses this same lock; row locks alone cannot lock an absent address.
+
         Session::lock_revision(&mut tx).await.map_err(failed)?;
         if let Some(recorded) = claim(&mut tx, request.op_id, &dedupe.body_hex())
             .await
@@ -439,7 +408,6 @@ impl Session {
                 Expected::Bytes(expected) => value.as_ref() == Some(expected),
             };
             if !matches {
-                // The tentative receipt is not an applied operation and must disappear too.
                 tx.rollback().await.map_err(|e| OpRefused::Failed(pg(e)))?;
                 return Ok(Decision::ConditionConflict);
             }
@@ -461,8 +429,7 @@ impl Session {
             .map_err(OpRefused::Failed)?;
         }
         tx.commit().await.map_err(|e| OpRefused::Failed(pg(e)))?;
-        // Keep the existing applied-only retention policy. A condition conflict changes no receipt,
-        // including unrelated rows that an opportunistic sweep could otherwise remove.
+
         self.sweep_ops().await;
         Ok(Decision::Applied)
     }
@@ -514,8 +481,6 @@ impl Session {
         prefix: &[u8],
         exact_key_length: u64,
     ) -> Result<(), String> {
-        // PostgreSQL BYTEA lengths cannot reach this value; preserve the full accepted domain
-        // as a no-match instead of clamping it into a different range or refusing the request.
         let Ok(length) = i64::try_from(exact_key_length) else {
             return Ok(());
         };
@@ -563,11 +528,10 @@ impl Session {
         prefix: &[u8],
         limit: u32,
     ) -> Result<Scanned, String> {
-        // `limit` 0 is nothing, never everything.
         if limit == 0 {
             return Ok(Vec::new());
         }
-        // A key range on the primary key, not a per-row prefix compare.
+
         let limit = i64::from(limit);
         let client = self.client();
         let rows = match prefix_end(prefix) {
@@ -609,12 +573,9 @@ impl Session {
         body: &str,
         cells: &[(String, u64, UsageDelta)],
     ) -> OpResult<Option<String>> {
-        // Key order, whatever the caller's: two nodes' overlapping batches then lock rows in one
-        // order and cannot deadlock (40P01). Stable, so a repeated cell keeps its order.
         let mut ordered: Vec<&(String, u64, UsageDelta)> = cells.iter().collect();
         ordered.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
         self.deduped(op, body, DedupeAuthority::Ledger, async |tx| {
-            // An old exact receipt remains replayable; only fresh unconditional adjustments fail.
             if ordered
                 .iter()
                 .any(|(bucket, _, _)| correction::reserved_bucket(bucket))
@@ -643,7 +604,7 @@ impl Session {
             storable_i64("add_metering_batch", "priced_from_ms", d.priced_from_ms)
                 .map_err(refused)?;
         }
-        // Primary-key order, as the usage batch (stable).
+
         let mut ordered: Vec<&MeteringDelta> = deltas.iter().collect();
         ordered.sort_by_key(|d| (&d.key_id, d.bucket, &d.model, &d.provider, d.priced_from_ms));
         self.deduped(op, body, DedupeAuthority::Ledger, async |tx| {
@@ -662,7 +623,7 @@ fn record(bytes: Vec<u8>) -> Result<RecordBytes, String> {
 }
 
 /// Parse with the SDK's wiping settings reader: a host secret marker is restored from its
-/// lent slot, and every DSN is captured before any public connection option is parsed.
+
 fn parse_settings(settings: &[u8], secrets: &[&[u8]]) -> Result<PostgresStore, String> {
     use busbar_contract::abi::sdk::cred::{settings_lent, PostgresUrl, SettingsError};
 
@@ -680,8 +641,7 @@ fn parse_settings(settings: &[u8], secrets: &[&[u8]]) -> Result<PostgresStore, S
         };
         format!("{BAD}: {path}{e}")
     };
-    // Reject unknown keys before their values can be mistaken for connection strings.
-    // IgnoredAny drops each value inside the SDK reader, which wipes its owned strings.
+
     let keys: Option<std::collections::HashMap<String, serde::de::IgnoredAny>> =
         settings_lent(settings, secrets).map_err(&parse_error)?;
     if let Some(k) = keys
@@ -753,7 +713,7 @@ impl StoreSlots for PostgresStore {
     }
 
     /// Reach the server and ensure the schema (connect + migrate, at the same moment: the load),
-    /// in the driver's words when it cannot.
+
     fn connect(&self, cx: &mut Op<'_>) -> Step<Result<(), String>> {
         on_conn!(self, cx, |e| e, |s| s.migrate().await.map_err(|e| e.0))
     }
@@ -861,8 +821,6 @@ impl StoreSlots for PostgresStore {
         .map(|r| d.answer(r))
     }
 
-    // The base op set: each the store's own body, on the op's connection, over owned copies of its
-    // arguments (`:` marks a borrowed argument, `=` one passed by value).
     legacy_slots! {
         put_key(key: &VirtualKey) -> ();
         get_key(id: &str) -> Option<VirtualKey>;

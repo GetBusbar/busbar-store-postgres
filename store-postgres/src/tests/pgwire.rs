@@ -41,8 +41,7 @@ fn what_the_host_cannot_dial_is_refused() {
 }
 
 /// libpq's MULTI-HOST list (busbar oracle store.boot|postgres|multi-host): every endpoint, in
-/// order, each with its own port or the one shared; a connect the first refuses tries the next.
-/// RED before: "multiple hosts are not supported".
+
 #[test]
 fn a_multi_host_list_names_every_endpoint_in_order() {
     let c = Config::parse("postgres://u:p@127.0.0.1:1,db:5433,[::1]/d").unwrap();
@@ -56,9 +55,7 @@ fn a_multi_host_list_names_every_endpoint_in_order() {
 }
 
 /// D11 (RED before: `host` and `hostaddr` shared one slot, the last won): `hostaddr` is the
-/// address that is dialled and `host` the name the TLS check and the errors use (libpq, and the
-/// 1.5.5 driver), paired by position; a hostaddr that is no IP, or a list of another length, is
-/// refused.
+
 #[test]
 fn hostaddr_is_dialled_and_host_is_the_name() {
     let c = Config::parse("host=db.internal hostaddr=10.1.2.3 port=6000 user=u").unwrap();
@@ -76,13 +73,13 @@ fn hostaddr_is_dialled_and_host_is_the_name() {
     let e = Config::parse("host=db hostaddr=not-an-ip user=u").unwrap_err();
     assert!(e.to_string().contains("hostaddr"), "{e}");
     assert!(Config::parse("host=a,b hostaddr=10.0.0.1 user=u").is_err());
-    // The port list matches the longer of the two lists.
+
     let c = Config::parse("hostaddr=10.0.0.1,10.0.0.2 port=1,2 user=u").unwrap();
     assert_eq!(c.targets()[1].1, "10.0.0.2:2");
 }
 
 /// D10 (RED before: any value was accepted and ignored): `target_session_attrs` is `any`,
-/// `read-write` or `read-only` (the 1.5.5 driver's set); anything else is refused naming them.
+
 #[test]
 fn target_session_attrs_takes_the_drivers_values_only() {
     for ok in ["any", "read-write", "read-only"] {
@@ -97,8 +94,7 @@ fn target_session_attrs_takes_the_drivers_values_only() {
 }
 
 /// D9 (RED before: both were accepted and silently ignored): this client has no SCRAM-PLUS, so
-/// `channel_binding=require` could not be honoured, and the connection is verified against
-/// busbar's trust anchors, so a per-store `sslrootcert` could not be. 1.5.5 refused both.
+
 #[test]
 fn what_this_client_cannot_honour_is_refused_not_ignored() {
     let e = Config::parse("host=db user=u channel_binding=require").unwrap_err();
@@ -113,7 +109,7 @@ fn what_this_client_cannot_honour_is_refused_not_ignored() {
 }
 
 /// libpq's `prefer` and `allow` parse (1.5.5 accepted them); the password is never echoed by a
-/// later refusal.
+
 #[test]
 fn sslmode_prefer_and_allow_parse() {
     for mode in ["prefer", "allow"] {
@@ -127,8 +123,7 @@ fn sslmode_prefer_and_allow_parse() {
 }
 
 /// Each `sslmode` maps to its libpq behaviour: `disable` and `allow` are plaintext, `prefer` asks
-/// for TLS and takes plaintext on `N`, the `require` family insists. An ABSENT `sslmode` is
-/// plaintext too (documented in the README).
+
 #[test]
 fn sslmode_values_map_to_their_modes() {
     for (mode, want) in [("allow", SslMode::Plain), ("prefer", SslMode::Prefer)] {
@@ -147,10 +142,7 @@ fn sslmode_values_map_to_their_modes() {
 }
 
 /// The libpq socket options a 1.5.5 DSN carried are ACCEPTED (1.5.5's driver accepted them; a 1.5.5
-/// config keeps booting): what the host's connector does anyway is accepted quietly, what it cannot
-/// apply is accepted and logged at debug, naming the option and why. A value the driver refused is
-/// refused, and `keepalives=0`, which the connector cannot honour, is refused with the reason; no
-/// message echoes the password.
+
 #[test]
 fn socket_options_are_accepted_and_what_cannot_apply_is_logged() {
     let logged = |dsn: &str| -> (Result<(), String>, String) {
@@ -167,7 +159,7 @@ fn socket_options_are_accepted_and_what_cannot_apply_is_logged() {
         let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         (r, text)
     };
-    // Applied (the connector already does it): accepted, nothing logged.
+
     for opt in [
         "keepalives=1",
         "keepalives=7",
@@ -189,7 +181,7 @@ fn socket_options_are_accepted_and_what_cannot_apply_is_logged() {
             assert!(!text.contains("has no effect"), "{dsn}: {text}");
         }
     }
-    // Cannot apply: accepted, ONE debug line naming the option and why.
+
     for (opt, why) in [
         ("keepalives_idle=30", "after 60 s idle"),
         ("keepalives_interval=10", "no per-store setting"),
@@ -219,7 +211,7 @@ fn socket_options_are_accepted_and_what_cannot_apply_is_logged() {
             );
         }
     }
-    // keepalives=0 cannot be honoured: refused, with the reason.
+
     for dsn in [
         "host=db user=u password=zq9pw keepalives=0",
         "postgres://u:zq9pw@db/d?keepalives=0",
@@ -232,7 +224,7 @@ fn socket_options_are_accepted_and_what_cannot_apply_is_logged() {
             "{dsn}: {e}"
         );
     }
-    // A value the driver refused is refused.
+
     for opt in [
         "keepalives=yes",
         "keepalives=-1",
@@ -269,7 +261,7 @@ impl std::io::Write for Sink {
 }
 
 /// D37 (RED before: accepted and ignored): `connect_timeout` is whole seconds as the driver
-/// reads it, a number that is not one is refused.
+
 #[test]
 fn connect_timeout_is_whole_seconds() {
     for ok in ["5", "0", "-1"] {
@@ -278,7 +270,7 @@ fn connect_timeout_is_whole_seconds() {
     let e = Config::parse("host=db user=u connect_timeout=soon").unwrap_err();
     assert!(e.to_string().contains("connect_timeout"), "{e}");
     assert!(Config::parse("postgres://u@db/d?connect_timeout=2.5").is_err());
-    // Zero or less is no bound (libpq's reading); more than zero is whole seconds.
+
     let ms = |v: &str| {
         Config::parse(&format!("host=db user=u connect_timeout={v}"))
             .unwrap()
@@ -290,7 +282,7 @@ fn connect_timeout_is_whole_seconds() {
 }
 
 /// A DSN without `connect_timeout` still bounds the handshake (30 s); the DSN's value wins, and 0
-/// is the explicit "no bound".
+
 #[test]
 fn an_unset_connect_timeout_defaults_to_thirty_seconds() {
     let bound = |dsn: &str| Config::parse(dsn).unwrap().connect_bound_ms();
@@ -301,9 +293,7 @@ fn an_unset_connect_timeout_defaults_to_thirty_seconds() {
 }
 
 /// D26 (RED before: the unparsed fragment was echoed): a configuration error never repeats a
-/// token of the string that is not a well-formed `key=`, because a password with a space, a `?`
-/// or a missing `user:` prefix splits there and its tail would be echoed; an unknown option's
-/// key is named only when the string carries no password.
+
 #[test]
 fn a_config_error_never_echoes_a_password_tail() {
     for dsn in [
@@ -319,7 +309,7 @@ fn a_config_error_never_echoes_a_password_tail() {
             "{dsn}: the error echoed a fragment: {e}"
         );
     }
-    // The key of an unknown option is the operator's, when no password rides along.
+
     let e = Config::parse("host=db user=u zq9key=1")
         .unwrap_err()
         .to_string();
@@ -335,7 +325,7 @@ fn a_config_error_never_echoes_a_password_tail() {
 }
 
 /// B9: the store reaches its server over TCP, so a Unix-socket host is refused in the URL
-/// forms too (RED by mutation: drop the `starts_with('/')` refusal).
+
 #[test]
 fn a_unix_socket_host_is_refused_in_every_url_form() {
     let e = Config::parse("postgres://u@%2Fvar%2Frun%2Fpostgresql/d").unwrap_err();
@@ -347,7 +337,7 @@ fn a_unix_socket_host_is_refused_in_every_url_form() {
 }
 
 /// 1.5.5 dialled `hostaddr` and used `host` only as a name, so a socket-path host beside a
-/// hostaddr worked; the Unix-socket refusal is of what is DIALLED (RED before: refused).
+
 #[test]
 fn a_socket_path_host_beside_a_hostaddr_is_dialled_by_address() {
     let c = Config::parse("host=/tmp hostaddr=127.0.0.1 user=u").unwrap();
@@ -358,7 +348,7 @@ fn a_socket_path_host_beside_a_hostaddr_is_dialled_by_address() {
 }
 
 /// D28 (RED before: `ranges[i]` indexed out of bounds, a panic): a DataRow with fewer fields
-/// than the RowDescription named columns is an error on the missing column, not a panic.
+
 #[test]
 fn a_data_row_short_of_its_columns_is_an_error_not_a_panic() {
     use bytes::BytesMut;
@@ -367,7 +357,6 @@ fn a_data_row_short_of_its_columns_is_an_error_not_a_panic() {
     use postgres_types::Type;
     use std::sync::Arc;
 
-    // A DataRow of ONE field ("ab") against a RowDescription of two columns.
     let mut raw = BytesMut::from(&b"D\0\0\0\x0c\0\x01\0\0\0\x02ab"[..]);
     let Some(Message::DataRow(body)) = Message::parse(&mut raw).unwrap() else {
         panic!("a data row");
@@ -408,8 +397,7 @@ fn a_snapshot_transaction_begins_repeatable_read() {
 }
 
 /// The connection's prepared statements stay bounded: past `STATEMENTS_KEPT` the least recently
-/// run is dropped and its Close queued for the next Parse; a stale statement is dropped the same
-/// way, and `26000` (the session's statements deallocated) drops them all.
+
 #[test]
 fn prepared_statements_drop_the_least_recently_run_past_the_bound() {
     use std::sync::Arc;
@@ -427,7 +415,7 @@ fn prepared_statements_drop_the_least_recently_run_past_the_bound() {
         c.insert(&format!("q{n}"), stmt(n));
     }
     assert!(c.closing.is_empty());
-    // q0 runs again, so q1 is now the least recently run.
+
     assert_eq!(c.get("q0").map(|s| s.name.clone()).as_deref(), Some("s0"));
     c.get("new");
     c.insert("new", stmt(9999));

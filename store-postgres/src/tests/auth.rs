@@ -2,8 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The real loaded store's authentication caller over the host connection table. The wrapper
-//! observes only the initialized slice lent to write, forces short writes and Pending, and
-//! never keeps a credential pointer or a copy of the offered bytes.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -67,8 +65,7 @@ impl Conns for PartialConns {
             progress.auth_written = 0;
             progress.pended = false;
         }
-        // Six bytes includes the header and one byte of a password/proof frame. The output
-        // owner must retain just its unconsumed suffix through this suspension or failure.
+
         if progress.auth_left > 0 && progress.auth_written >= 6 && !progress.pended {
             progress.pended = true;
             if self.fault {
@@ -106,8 +103,6 @@ impl Conns for PartialConns {
     }
 
     fn wait(&self, caller: InstanceId, _set: &[ConnId], ticket: u64) -> Result<usize, ConnError> {
-        // A pending write has the same timed retry as the production connector. Register the
-        // supplied ticket as well if the SDK asks to wait on this table.
         let wake = self.wake.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(1));
@@ -184,7 +179,7 @@ fn request(code: u32, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Credential messages remain byte-for-byte PostgreSQL frames under partial host writes and a
-/// parked write. AuthenticationOk is reached before the peer's deliberate final refusal.
+
 #[test]
 fn cleartext_and_md5_frames_survive_partial_and_pending_host_writes() {
     for (method, code, salt) in [("password", 3, Vec::new()), ("md5", 5, vec![1, 2, 3, 4])] {
@@ -250,7 +245,7 @@ fn the_signed_default_floor_refuses_cleartext_and_md5_before_a_password_write() 
 }
 
 /// A failed write after a credential prefix cannot return the half-authenticated socket to the
-/// kept pool. The server gets EOF after exactly that prefix, and a later load dials afresh.
+
 #[test]
 fn a_partial_authentication_write_failure_discards_the_connection() {
     let (tx, rx) = mpsc::channel();
@@ -280,7 +275,7 @@ fn a_partial_authentication_write_failure_discards_the_connection() {
 }
 
 /// The nonce is fresh on reconnect, n,, remains the unsupported channel-binding header even
-/// when PLUS is offered, and the peer must prove the password before AuthenticationOk is read.
+
 #[test]
 fn scram_uses_a_fresh_nonce_and_rejects_an_invalid_server_verifier() {
     let (tx, rx) = mpsc::channel();
@@ -316,7 +311,7 @@ fn scram_uses_a_fresh_nonce_and_rejects_an_invalid_server_verifier() {
         assert_eq!(proof.len(), 44);
         assert!(!final_text.contains("sealed-wire-secret"));
         tx.send(nonce.to_owned()).unwrap();
-        // A permissive client would accept this verifier, then read the deliberate SQLSTATE.
+
         let mut tail = request(12, b"v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
         tail.extend(request(0, &[]));
         tail.extend(fatal("57P03", "must-not-be-reached"));
@@ -383,7 +378,7 @@ fn malformed_scram_continue_and_wrong_authentication_stage_write_no_proof() {
 }
 
 /// Valid legacy configurations below 4096 keep working through the PostgreSQL-specific recipe;
-/// the generic SDK recipe's minimum does not silently become this caller's policy.
+
 #[test]
 fn valid_legacy_scram_iteration_counts_reach_the_proof_write() {
     for iterations in [1, 4095] {

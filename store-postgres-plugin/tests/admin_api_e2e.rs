@@ -49,7 +49,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Fixed ed25519 signing secret (64 hex = 32 bytes) for this e2e test. 1.5.1 requires an
-/// explicit signing key to mint virtual keys; busbar no longer auto-generates one.
+
 const TEST_SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// RAII guard for a spawned child process: kills and reaps it on drop, including when a panic
@@ -73,7 +73,7 @@ struct ChildGuard(Child, PathBuf);
 
 impl ChildGuard {
     /// The child's captured output, formatted for a panic message. Never panics itself: this runs
-    /// on the failure path, where a second, unrelated panic would bury the first.
+
     fn output(&self) -> String {
         match std::fs::read_to_string(&self.1) {
             Ok(s) if s.trim().is_empty() => "  (the child produced no output)".to_string(),
@@ -95,8 +95,7 @@ impl Drop for ChildGuard {
 }
 
 /// Spawn `busbar` with its stdout+stderr captured to `log`, and wrap it in a `ChildGuard` that
-/// knows where to find them. Every boot in this test goes through here, so the capture cannot be
-/// forgotten on a boot added later.
+
 fn spawn_busbar(cmd: &mut Command, log: PathBuf, what: &str) -> ChildGuard {
     let out = std::fs::File::create(&log)
         .unwrap_or_else(|e| panic!("create the {what} log at {}: {e}", log.display()));
@@ -112,10 +111,7 @@ fn spawn_busbar(cmd: &mut Command, log: PathBuf, what: &str) -> ChildGuard {
 }
 
 /// Reserve a free loopback port for the admin listener (bind-then-drop; the standard, small-TOCTOU
-/// pattern for handing a port to a spawned external process — the same trade-off `listen:
-/// "127.0.0.1:0"` in `e2e.rs` accepts for the data-plane listener, except busbar itself doesn't
-/// report back which port it took for `:0`, so the admin listener needs a port this test can name
-/// in the config file up front).
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -148,7 +144,7 @@ fn cleanup(url: &str, id: &str) {
 }
 
 /// Poll `http://127.0.0.1:{port}/api/v1/admin/plugins` (any admin GET works — we just need a TCP
-/// accept + HTTP response) until the admin listener is up, or the child has already exited.
+
 fn wait_for_admin_listener(
     client: &reqwest::blocking::Client,
     admin_base: &str,
@@ -185,18 +181,12 @@ fn wait_for_admin_listener(
 }
 
 /// THE REAL END-TO-END PROOF: install the real cdylib over the real admin API, restart onto it
-/// (the only real activation mechanism busbar exposes for a store-kind plugin), mint a virtual key
-/// and AWS credential through the running instance over the same admin API, and independently
-/// confirm both rows landed in real Postgres.
+
 #[test]
 fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     let Some(url) = postgres_url() else { return };
-    // `plugin_path()` no longer returns an Option: it panics on a missing-or-stale cdylib rather
-    // than skipping, because a skip here reports green with zero over-the-ABI coverage.
+
     let so_path = plugin_path();
-    // No pre-test `cleanup` of a hardcoded id: the key this test writes is server-generated, so a
-    // fixed id cleans up nothing and only gives a false sense of a clean slate. The real cleanup is
-    // of `minted_id`, at the end, once it exists.
 
     let (busbar_bin, pack_bin) = build_real_binaries();
 
@@ -216,9 +206,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     let plugins_dir = work.join("plugins");
     std::fs::create_dir_all(&plugins_dir).unwrap();
 
-    // Pack the REAL cdylib (never junk bytes) into a real signed-shape tarball, same tool + flags
-    // as `e2e.rs` and CI's own SIGNOFF step use. Read back the bytes here -- this test uploads them
-    // itself over HTTP, never by copying the file into `plugins_dir` directly.
     let tarball_path = work.join("store-postgres.tar.gz");
     let status = Command::new(&pack_bin)
         .args([
@@ -232,8 +219,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             "--kind",
             "store",
             "--version",
-            // The release version is the plugin's own, the one its Statement states (the pack tool
-            // refuses any other).
             env!("CARGO_PKG_VERSION"),
             "--publisher",
             "busbar",
@@ -274,9 +259,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         plugins_dir.display()
     );
 
-    // BOOT #1: the compiled-in `memory` store (`store: {module: memory}`; busbar 1.6.0 refuses a
-    // config without a `store:` block, BUSBAR-9007). The postgres plugin is NOT on disk yet: this
-    // process only exists to serve the admin API that installs it.
     let config1 = work.join("config1.yaml");
     std::fs::write(
         &config1,
@@ -290,9 +272,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             .env("BUSBAR_PROVIDERS", &providers)
             .env("BUSBAR_ADMIN_TOKEN", admin_token)
             .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
-            // busbar 1.6.0 REFUSES BOOT on a provider credential that cannot resolve (BUSBAR-9007),
-            // and the fixture's provider names `env: MOCK_KEY`. Any value will do: the mock
-            // upstream is never dialled.
             .env(
                 "MOCK_KEY",
                 "0000000000000000000000000000000000000000000000000000000000000001",
@@ -303,8 +282,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     );
     wait_for_admin_listener(&client, &admin_base, admin_token, &mut guard1, "boot #1");
 
-    // REAL ADMIN-API INSTALL: POST the real cdylib tarball, base64, exactly the wire shape
-    // `install_plugin`/its own admin test use -- never a file-drop.
     let install_body = serde_json::json!({
         "file": file,
         "tarball_b64": base64::engine::general_purpose::STANDARD.encode(&tarball_bytes),
@@ -328,18 +305,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
          (this test never writes it there itself)"
     );
 
-    // A mutation WITHOUT the admin token must be rejected -- the surface really is guarded, not
-    // open, mirroring the exact assertion busbar core's own
-    // `test_admin_v1_plugin_install_list_reload_remove` makes. Over a REAL out-of-process TCP
-    // connection (unlike that in-process axum test), a server that rejects before reading the
-    // full request body can legitimately close the connection rather than complete a clean 401
-    // response -- so either outcome (a 401 status, or the connection itself being refused/reset)
-    // counts as proof the write was rejected; only a 2xx success would mean the guard is missing.
-    // Install under a DIFFERENT target filename, so "did the write apply" is observable. Re-posting
-    // the byte-identical body that already installed successfully makes rejection and re-application
-    // indistinguishable: no state check can tell them apart, so the whole block would rest on the
-    // status code alone. With a distinct target, the file must NOT appear in plugins.dir and the
-    // catalog must NOT list it, whichever way the request came back.
     let unauth_file = "store-postgres-unauthorized.tar.gz";
     let unauth_body = serde_json::json!({
         "file": unauth_file,
@@ -356,13 +321,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             "plugin install without x-admin-token must be rejected with 401, not accepted"
         ),
         Err(e) => {
-            // A transport error is only acceptable as "the server closed on us mid-reject". It is
-            // NOT acceptable as "the server was gone", which is what an unqualified `!e.is_status()`
-            // check admits: this call never runs `error_for_status`, so `is_status()` is false for
-            // EVERY error it can produce, including connection-refused because the process had
-            // already died -- a dead server would have read as proof the guard held. Prove the
-            // server is still there and still serving, so the only surviving explanation is a
-            // deliberate reject.
             assert!(
                 !e.is_status(),
                 "an unauthenticated install must never be accepted: {e}"
@@ -379,8 +337,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             );
         }
     }
-    // THE assertion that carries the weight, and it holds on both arms: whatever the transport did,
-    // the unauthenticated write must not have taken effect.
+
     assert!(
         !plugins_dir.join(unauth_file).exists(),
         "an unauthenticated install must not write a tarball into plugins.dir"
@@ -401,7 +358,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         "an unauthenticated install must not appear in the real catalog"
     );
 
-    // Confirm the real catalog reports it (not just a 201 with no lasting effect).
     let list: serde_json::Value = client
         .get(format!("{admin_base}/plugins?type=store"))
         .header("x-admin-token", admin_token)
@@ -417,14 +373,8 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         "the installed postgres plugin must be listed in the real catalog: {items:?}"
     );
 
-    // Install alone does NOT hot-swap the active store (confirmed against busbar core's own
-    // `reload_plugins`/`PUT /config/settings` doc comments -- `store` is on the restart_required
-    // list, and there is no live-swap endpoint for it). A real restart is the only real activation
-    // path, so this test uses one, same as a real operator would.
     drop(guard1);
 
-    // BOOT #2: same plugins.dir (now containing the tarball the ADMIN API itself wrote in the
-    // install call above), config now naming `store: module: postgres` against the real Postgres.
     let config2 = work.join("config2.yaml");
     std::fs::write(
         &config2,
@@ -440,9 +390,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             .env("BUSBAR_PROVIDERS", &providers)
             .env("BUSBAR_ADMIN_TOKEN", admin_token)
             .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
-            // busbar 1.6.0 REFUSES BOOT on a provider credential that cannot resolve (BUSBAR-9007),
-            // and the fixture's provider names `env: MOCK_KEY`. Any value will do: the mock
-            // upstream is never dialled.
             .env(
                 "MOCK_KEY",
                 "0000000000000000000000000000000000000000000000000000000000000001",
@@ -452,14 +399,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         "boot #2 (postgres store, the admin-installed plugin)",
     );
 
-    // Wait for boot #2 to make progress, and fail fast (with its log) if it exits instead. This is
-    // a PROGRESS WAIT, not the load proof: this test shares the CI database with every other live
-    // test in the workspace, so the `keys` table it polls for is already there and the loop breaks
-    // true on its first iteration regardless of what this child did. The actual proof that boot #2
-    // dlopened the admin-installed plugin and is serving on the Postgres store is the admin-API
-    // mint further down, verified by reading the minted key and credential back over a raw client
-    // -- rows that cannot exist unless this process loaded the plugin and wrote them. (e2e.rs's
-    // file-drop test carries the from-empty version of this check, on its own disposable database.)
     let deadline = Instant::now() + Duration::from_secs(15);
     let booted = loop {
         if let Ok(mut raw) = postgres::Client::connect(&url, postgres::NoTls) {
@@ -494,7 +433,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     );
     wait_for_admin_listener(&client, &admin_base, admin_token, &mut guard2, "boot #2");
 
-    // REAL WORK, over the real admin API: mint a virtual key WITH an AWS-shaped credential.
     let mint_body = serde_json::json!({
         "name": "spg-adminapi-e2e-key",
         "labels": {},
@@ -527,8 +465,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         "issue_aws_credential:true must also return an aws_secret_access_key: {mint_json}"
     );
 
-    // INDEPENDENT VERIFICATION: a fresh RAW postgres::Client, bypassing the plugin/ABI/admin-API
-    // entirely, confirms the key AND its credential actually landed in real Postgres.
     let mut raw = postgres::Client::connect(&url, postgres::NoTls)
         .expect("connect directly to confirm persistence, bypassing the plugin entirely");
     let key_row = raw

@@ -2,8 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store v3 slots ([`StoreSlots`]) against a live Postgres: durable `op_id` dedupe (S1-S4)
-//! across a reconnect, and the kernel-held records. Every name is namespaced per run, so the shared test database never carries one run's
-//! rows into another's assertions.
 
 use super::*;
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
@@ -14,8 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A namespace unique to this run.
 fn ns() -> String {
-    // The counter keeps two tests started in the same clock tick apart (they would share a bucket
-    // and push conflicting caps for it).
     static N: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -43,7 +39,7 @@ fn store(url: &str) -> TestStore {
 }
 
 /// `open` is the settings' judge: every refusal starts `invalid postgres plugin config: `, a
-/// type error names the type and never the value.
+
 #[test]
 fn open_refuses_settings_without_a_url() {
     let want = "invalid postgres plugin config: `url` is required (a libpq connection string)";
@@ -61,12 +57,12 @@ fn open_refuses_settings_without_a_url() {
             "{settings:?}"
         );
     }
-    // A present url of the wrong type says so, naming the type, rather than "required".
+
     assert_eq!(
         TestStore::open_slot(br#"{"url": 5}"#).err().as_deref(),
         Some("invalid postgres plugin config: url: settings: invalid type: integer `***`, expected a string")
     );
-    // A non-object names the JSON type it got.
+
     for (settings, ty) in [
         (&br#""x""#[..], "a string"),
         (&b"[1]"[..], "an array"),
@@ -84,7 +80,7 @@ fn open_refuses_settings_without_a_url() {
             "values stay private"
         );
     }
-    // An unknown top-level key is refused, never ignored.
+
     assert_eq!(
         TestStore::open_slot(br#"{"url": "postgres://u@h/d", "x": "public"}"#)
             .err()
@@ -96,7 +92,7 @@ fn open_refuses_settings_without_a_url() {
 }
 
 /// `validate` runs exactly `open`'s parse, the connection string's included, and connects to
-/// nothing; a URL refusal carries the `url: ` prefix.
+
 #[test]
 fn validate_refuses_what_open_refuses() {
     for settings in [
@@ -123,7 +119,7 @@ fn validate_refuses_what_open_refuses() {
         e.starts_with("invalid postgres plugin config: url: "),
         "{e}"
     );
-    // A well-formed URL validates without a server.
+
     <crate::PostgresStore as busbar_contract::abi::sdk::store::StoreSlots>::validate(
         br#"{"url": "postgres://u@127.0.0.1:1/d"}"#,
     )
@@ -131,7 +127,7 @@ fn validate_refuses_what_open_refuses() {
 }
 
 /// Host markers are resolved by settings_lent while the host owns the borrowed bytes; the
-/// resulting store keeps only public options and a sealed credential after that loan ends.
+
 #[test]
 fn open_with_secrets_captures_host_markers_before_the_loan_ends() {
     use busbar_contract::abi::sdk::store::StoreSlots;
@@ -179,7 +175,7 @@ fn settings_capture_keeps_surrounding_url_whitespace_compatibility() {
 }
 
 /// S1/S2/S3/S4: a replay applies nothing and answers the original, a different body is a
-/// conflict, a failed op is not recorded, and the log survives a reconnect.
+
 #[test]
 fn an_op_id_dedupes_durably_across_a_reconnect() {
     let Some(url) = live_url() else {
@@ -187,7 +183,7 @@ fn an_op_id_dedupes_durably_across_a_reconnect() {
     };
     let ns = ns();
     let bucket = format!("{ns}-b");
-    // A window no other test writes.
+
     const WINDOW: u64 = 4_000_000_000_000_000;
     let a = store(&url);
     let delta = UsageDelta {
@@ -219,7 +215,6 @@ fn an_op_id_dedupes_durably_across_a_reconnect() {
         "the replays applied nothing"
     );
 
-    // A fork is FAILED and not recorded: the same op_id with a body that now fits applies.
     let parent = format!("{ns}-chain");
     let rec = |hash: &str| PlaneRecord {
         kind: "call".into(),
@@ -274,7 +269,7 @@ fn an_op_id_dedupes_durably_across_a_reconnect() {
 }
 
 /// S5: a value decided before commit (one a column cannot hold, or a data/integrity error the
-/// server raises) is REFUSED, nothing recorded; the same `op_id` with a valid record applies.
+
 #[test]
 fn a_write_refused_before_commit_answers_refused_and_records_nothing() {
     let Some(url) = live_url() else {
@@ -340,7 +335,6 @@ fn a_write_refused_before_commit_answers_refused_and_records_nothing() {
     s.add_metering_op(op(), &meter)
         .expect("a valid delta applies");
 
-    // A NUL in a text value: the server's data exception (class 22) mid-apply, rolled back.
     let delta = UsageDelta {
         requests: 1,
         ..Default::default()
@@ -413,7 +407,7 @@ fn the_first_sweep_removes_more_rows_than_one_batch() {
         .unwrap()
         .get(0);
     assert_eq!(before, 25_000);
-    // A fresh instance sweeps on its first op.
+
     let s2 = store(&tmp.url());
     let delta = UsageDelta {
         requests: 1,
@@ -430,8 +424,7 @@ fn the_first_sweep_removes_more_rows_than_one_batch() {
 }
 
 /// A batch applies its cells and deltas in key order whatever the caller's order, so two nodes
-/// writing overlapping batches take row locks in one order (no 40P01). Fresh heap rows land in
-/// application order, which `ctid` shows.
+
 #[test]
 fn a_batch_applies_in_key_order() {
     let Some(url) = live_url() else {
@@ -526,7 +519,7 @@ fn a_new_op_records_its_digest() {
 }
 
 /// A body an older build recorded (`<slot>:{:?}`) still replays across the upgrade, and a
-/// different op under its `op_id` is still a conflict; neither applies anything.
+
 #[test]
 fn an_op_recorded_by_an_older_build_replays() {
     let Some(url) = live_url() else {
@@ -543,7 +536,6 @@ fn an_op_recorded_by_an_older_build_replays() {
             .unwrap();
     };
 
-    // Usage.
     const WINDOW: u64 = 4_000_000_000_000_002;
     let bucket = format!("{ns}-b");
     let delta = UsageDelta {
@@ -566,7 +558,6 @@ fn an_op_recorded_by_an_older_build_replays() {
     );
     assert_eq!(s.get_usage(&bucket, WINDOW).expect("read").requests, 0);
 
-    // Metering.
     const BUCKET: u64 = 4_000_000_000_000_003;
     let key_id = format!("{ns}-k");
     let m = MeteringDelta {
@@ -602,7 +593,6 @@ fn an_op_recorded_by_an_older_build_replays() {
         .iter()
         .all(|r| r.key_id != key_id));
 
-    // Plane-record append (the older build recorded the owned record).
     let parent = format!("{ns}-chain");
     let rec = |hash: &str| PlaneRecord {
         kind: "call".into(),
@@ -666,7 +656,7 @@ fn records_round_trip() {
 }
 
 /// Record keys are raw bytes: NUL, 0xFF and non-UTF-8 sequences are keys like any other, a scan runs
-/// in byte order, and a prefix equal to a whole key returns that key too.
+
 #[test]
 fn record_keys_are_raw_bytes_scanned_in_byte_order() {
     let Some(url) = live_url() else {
@@ -716,9 +706,7 @@ fn record_keys_are_raw_bytes_scanned_in_byte_order() {
 }
 
 /// AN EMPTY PUT REMOVES THE ROW (slot 26's rule, ARCHITECT 2026-10-21): the host writes every
-/// strike as an empty `record_put` and reads empty as absent, so the row LEAVES the table:
-/// `record_get` answers `None`, `record_scan` never returns it, and the table shrinks. Removing a
-/// row that is not there is `Ok`.
+
 #[test]
 fn an_empty_put_removes_the_row() {
     let Some(url) = live_url() else {

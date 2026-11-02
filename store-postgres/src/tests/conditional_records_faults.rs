@@ -177,8 +177,7 @@ fn a_committed_batch_with_a_lost_reply_replays_its_exact_receipt_after_reopen() 
         let _ = tx.send(answer);
     });
     let mut raw = connect_client_with_retry(&db.url());
-    // One independent SQL snapshot witnesses both rows AND their receipt, after the real COMMIT
-    // was forwarded and before its response can reach the loaded future.
+
     let witnessed = until(|| {
         let held = gate.gate.lock().unwrap().held.is_some();
         held && raw.query_one(
@@ -188,7 +187,7 @@ fn a_committed_batch_with_a_lost_reply_replays_its_exact_receipt_after_reopen() 
     });
     let premature = rx.try_recv();
     let waiting_for_reply = matches!(premature, Err(std::sync::mpsc::TryRecvError::Empty));
-    gate.lose_reply(); // Release before every assertion so a RED cannot strand the withheld read.
+    gate.lose_reply();
     let unknown = premature.unwrap_or_else(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap());
     worker.join().unwrap();
     assert!(

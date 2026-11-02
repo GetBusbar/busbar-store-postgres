@@ -50,18 +50,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// RAII guard for a spawned child process: kills and reaps it on drop, including when a panic
-/// unwinds partway through the test (unlike a manual `child.kill()` call placed after the code that
-/// might panic, which never runs if an earlier assertion fails first).
-///
-/// It also owns the file this child's stdout+stderr were redirected to, and that is load-bearing
-/// rather than bookkeeping. This boot used to run with `.stderr(Stdio::null())`, so a failed boot
-/// could only ever report an exit code while busbar's own explanation was discarded at the point it
-/// was produced. That cost `admin_api_e2e.rs` a qa-gate leg once already, and it matters more here:
-/// this test boots against a database that has never existed before, so a first-run-only failure
-/// has no other trace anywhere.
-///
-/// A FILE, not `Stdio::piped()`: nothing reads the pipe while the child runs, so a child that
-/// out-talked the pipe buffer would block forever on write and turn a clean failure into a hang.
+
 struct ChildGuard(Child, PathBuf);
 
 impl ChildGuard {
@@ -78,8 +67,7 @@ impl Drop for ChildGuard {
 }
 
 /// A disposable database that drops itself on drop, panic path included. Written as a trailing
-/// statement, the cleanup only ran when the test passed, so every red run leaked a fully migrated
-/// database under a pid+nanos name that nothing would ever reclaim.
+
 struct TempDb {
     admin_url: String,
     name: String,
@@ -108,7 +96,7 @@ impl TempDb {
     }
 
     /// Rewrite the admin DSN to name this database, keeping the credentials. The shape is the one
-    /// this crate's own fixtures and `dsn_password` already assume.
+
     fn url(&self) -> String {
         let rest = self
             .admin_url
@@ -139,20 +127,7 @@ fn cfg(url: &str) -> String {
 }
 
 /// Every `env:` secret-ref name a config text references, in first-seen order, de-duplicated.
-///
-/// busbar 1.5.3 made `--validate` RESOLVE built-in (`env`/`file`) secret references and exit 1 when
-/// one cannot resolve, rather than only checking the reference's SHAPE. The fixture below names a
-/// real-looking env var (`MOCK_KEY`), so `--validate` failed on any machine that does not happen to
-/// have it set -- which is every CI runner and most dev machines:
-///
-///   [error] providers.mock.api_key: secret env:MOCK_KEY cannot resolve: environment variable
-///   'MOCK_KEY' is unset
-///
-/// Hardcoding `MOCK_KEY` here would fix today's failure but rot the moment this fixture, or a future
-/// one, names a different variable. Extracting the names generically is the approach the sibling
-/// `GetBusbar/busbar-store-sqlite` and `GetBusbar/busbar-store-mysql` plugin e2e tests already took for this exact
-/// break (and the core repo's `crates/busbar/tests/docs_examples.rs`), so the harness keeps working
-/// no matter what the fixture references.
+
 fn referenced_env_vars(text: &str) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
     for (i, _) in text.match_indices("env:") {
@@ -170,8 +145,7 @@ fn referenced_env_vars(text: &str) -> Vec<String> {
 }
 
 /// Set a harmless placeholder for every `{ env: NAME }` `config_text` references, so `--validate`
-/// (which now resolves built-in secrets, see `referenced_env_vars`) has something to resolve.
-/// 64 hex chars: valid for `auth.signing_key`, and harmless as any other secret's value.
+
 fn set_referenced_secret_envs(cmd: &mut Command, config_text: &str) {
     for name in referenced_env_vars(config_text) {
         cmd.env(
@@ -182,22 +156,15 @@ fn set_referenced_secret_envs(cmd: &mut Command, config_text: &str) {
 }
 
 /// THE REAL END-TO-END INSTALL PROOF: pack the plugin, drop it in a real `plugins.dir`, run the real
-/// `busbar --validate` against a config naming `store: { module: postgres }` (trust/manifest gate
-/// proof), then boot a REAL `busbar` process (no `--validate`) and poll for real Postgres to
-/// actually be touched — via the documented file-drop mechanism, never a direct `load_store()` call.
+
 #[test]
 fn load_and_exercise_postgres_plugin_via_file_drop() {
     let Some(admin_url) = postgres_url() else {
         return;
     };
-    // `plugin_path()` panics on a missing-or-stale cdylib rather than returning None and skipping:
-    // a skip here reports green with zero over-the-ABI coverage, which is the failure mode the
-    // freshness guard exists to make impossible.
+
     let so_path = plugin_path();
 
-    // A DISPOSABLE, genuinely empty database. The schema this test polls for can then only have
-    // come from the boot under test. The guard drops it on the panic path too, so a red run does
-    // not leave a migrated database behind on the shared server forever.
     let tmp = TempDb::create(&admin_url, "spg_filedrop");
     let url = tmp.url();
 
@@ -214,8 +181,6 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     let plugins_dir = work.join("plugins");
     std::fs::create_dir_all(&plugins_dir).unwrap();
 
-    // Pack the real cdylib into a real signed tarball via the same tool CI's SIGNOFF step uses,
-    // signed first-party with the test keypair (`E2E_RELEASE_PRIVKEY`) the busbar above embeds.
     let tarball = work.join("store-postgres.tar.gz");
     let status = Command::new(&pack_bin)
         .args([
@@ -229,8 +194,6 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
             "--kind",
             "store",
             "--version",
-            // The release version is the plugin's own, the one its Statement states (the pack tool
-            // refuses any other).
             env!("CARGO_PKG_VERSION"),
             "--publisher",
             "busbar",
@@ -246,16 +209,11 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
         .expect("run busbar-plugin-pack");
     assert!(status.success(), "packing the plugin must succeed");
 
-    // FILE-DROP: the real boot-time discovery mechanism extracts/reads whatever is in plugins.dir --
-    // dropping the packed tarball here, uninstalled via any admin call, is the documented mechanism.
     std::fs::copy(&tarball, plugins_dir.join("store-postgres.tar.gz")).unwrap();
 
     let config = work.join("config.yaml");
     let providers = work.join("providers.yaml");
-    // providers.yaml is the flat CATALOG (provider name at the document root, no wrapping key) --
-    // config.yaml separately has its OWN `providers:`/`models:` blocks naming which catalog
-    // entries are enabled. Mirrors the known-good fixture in
-    // crates/busbar/tests/cli_validate.rs::write_configs, not invented here.
+
     std::fs::write(
         &providers,
         "mock:\n  protocol: anthropic\n  base_url: \"http://127.0.0.1:9\"\n",
@@ -272,19 +230,6 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     );
     std::fs::write(&config, &config_text).unwrap();
 
-    // `--validate` is DELIBERATELY not used for the load-proof itself: it is manifest-only by
-    // design ("no server, no network, no state, no dlopen" -- crates/busbar/src/main.rs's own
-    // `--help` text) and never opens the store. A clean `--validate` run first proves the
-    // file-dropped plugin passes the trust/manifest gate; then a REAL BOOT (no `--validate` flag,
-    // below) is the only thing that actually `dlopen`s the plugin and runs
-    // `Store::connect`/migration.
-    //
-    // Busbar 1.5.3 made `--validate` RESOLVE built-in (`env`/`file`) secret references and fail
-    // when one cannot, instead of only checking the reference's shape -- so `providers.mock.
-    // api_key: { env: MOCK_KEY }` above now needs MOCK_KEY set, or this call fails on THIS
-    // MACHINE's environment rather than on anything about the plugin under test. Extracted
-    // generically (`set_referenced_secret_envs`) rather than hardcoded, so this fixture gaining or
-    // renaming a variable does not rot the harness.
     let mut validate_cmd = Command::new(&busbar_bin);
     validate_cmd
         .arg("--validate")
@@ -299,14 +244,6 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // REAL BOOT: run the actual gateway process (no --validate) against the same file-dropped
-    // plugin + config, and poll -- via a RAW independent postgres::Client connection, never
-    // the store, so this check can't accidentally create the schema itself -- for the
-    // `keys` table to appear. This is the only genuine proof that boot actually dlopened the plugin
-    // and called Store::connect (which runs migrate()) before ever handling a request, and it is a
-    // proof only because the database above was created empty for this test alone: against the
-    // shared database every other test in this workspace migrates, `keys` already exists and the
-    // poll would succeed on its first iteration no matter what the child process did.
     let boot_log = work.join("boot.log");
     let boot_log_out = std::fs::File::create(&boot_log).expect("create the boot log");
     let boot_log_err = boot_log_out.try_clone().expect("dup the boot log handle");
@@ -314,11 +251,10 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     boot_cmd
         .env("BUSBAR_CONFIG", &config)
         .env("BUSBAR_PROVIDERS", &providers)
-        .env("BUSBAR_STATE_FILE", "") // disable the state-snapshot file; not under test here
+        .env("BUSBAR_STATE_FILE", "")
         .stdout(Stdio::from(boot_log_out))
         .stderr(Stdio::from(boot_log_err));
-    // The REAL BOOT resolves `env:` secret references too, not just `--validate`, so it needs the
-    // same placeholders the validate run above got.
+
     set_referenced_secret_envs(&mut boot_cmd, &config_text);
     let child = boot_cmd.spawn().expect("spawn a real busbar boot");
     let mut guard = ChildGuard(child, boot_log);
@@ -356,10 +292,6 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
         guard.output()
     );
 
-    // The boot did not just create a table, it landed the CURRENT schema: read the version the
-    // plugin-loaded migrate() wrote, over a raw client. Checked before the direct connect below,
-    // because the store's connect step runs migrate() itself and would write this row if the boot
-    // had not.
     let mut raw = postgres::Client::connect(&url, postgres::NoTls)
         .expect("raw connect to the fresh database");
     let version: i64 = raw
@@ -371,8 +303,7 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
         busbar_store_postgres::SCHEMA_VERSION,
         "the plugin-loaded boot must have landed the current schema version"
     );
-    // And the process is still alive, serving on that store, rather than having created the schema
-    // and died: a crashed child is exactly what the poll above cannot distinguish on its own.
+
     assert!(
         matches!(guard.0.try_wait(), Ok(None)),
         "the real busbar boot must still be running on the file-dropped postgres store, not have \
@@ -380,9 +311,6 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
         guard.output()
     );
 
-    // Only AFTER those proofs: a second, independent open of the LINKED door (bypassing the
-    // plugin/ABI/loader entirely) confirms the store type itself can talk to the same schema the
-    // real boot process just created.
     let _direct = common::linked(&cfg(&url)).expect(
         "connect directly, bypassing the plugin entirely, to confirm the schema the real boot \
          created is usable",
@@ -390,13 +318,12 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
 
     drop(_direct);
     drop(raw);
-    drop(guard); // explicit: stop the real busbar process before dropping its database
+    drop(guard);
     let _ = std::fs::remove_dir_all(&work);
 }
 
 /// END-TO-END FAILURE (ABI-contract unit test, see module doc for why this stays a direct
-/// dropped-in load): an `open()` config that cannot produce a usable store surfaces back across
-/// the door as a clean `Err`, never a panic or a silently-succeeded load.
+
 #[test]
 fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
     let path = plugin_path();
@@ -427,7 +354,7 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
 }
 
 /// A non-plugin library (or a missing file) is refused with a clear error, never a crash. Same
-/// ABI-contract-unit-test rationale as above.
+
 #[test]
 fn refuses_non_plugin() {
     let err = match common::dropped_at(std::path::Path::new("/definitely/not/a/plugin.so"), "{}") {
@@ -438,7 +365,7 @@ fn refuses_non_plugin() {
 }
 
 /// Serialize a stand-in plane-record body. The store never decodes a body, so the shape only has to
-/// be something THIS test can decode again on the way back.
+
 fn plane_body(v: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&v).expect("serialize a stand-in body")
 }
@@ -448,22 +375,7 @@ fn plane_decode(b: &[u8]) -> serde_json::Value {
 }
 
 /// THE DURABILITY PROOF FOR THE `call` PLANE KIND (the MCP call log), OVER THE REAL PLUGIN PATH.
-///
-/// busbar 1.6.0 replaced the four protocol-named call-log methods with the kind-tagged plane-record
-/// verbs, and every one of those verbs DEFAULTS to accept-and-keep-nothing. A plugin seam that does
-/// not RELAY them silently substitutes those defaults: every append returns `Ok`, every listing
-/// answers empty, and a deployment loses every tool-call record while reporting success. That is not
-/// hypothetical — the ABI once carried four store methods while the trait carried ten, so exactly
-/// this happened. Every in-process test of `PostgresStore` is blind to it, because in production this
-/// backend is ONLY ever reached as a plugin.
-///
-/// So it goes through the dropped-in door (`common::dropped_at`): a REAL `dlopen` of the built
-/// cdylib, the real store v3 table, the real `LoadedStore`. It writes AT ARITY > 1 (three chained
-/// records for one principal and one for a second), DROPS the handle — which closes the instance, so
-/// nothing this process still holds can answer the reads — then `dlopen`s AGAIN over the same file
-/// and reads everything back. A third leg reads the same rows through the linked door,
-/// never touching the cdylib, the door or the loader — so a plugin that answered from its own
-/// in-process cache still fails here.
+
 #[test]
 fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
@@ -474,12 +386,8 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
     let cfg = cfg(&url);
 
-    // A kind of this run's own: the parent enumeration and the purge are GLOBAL per kind, so
-    // exact assertions on them need a kind no other test or run writes.
     let direct = common::linked(&cfg).expect("connect directly to verify");
 
-    // Per-run principal ids: a read that only THIS run's writes can answer. Two of them, because one
-    // principal's chain leaking into another's is a real defect class.
     let stamp = format!(
         "{}_{}",
         std::process::id(),
@@ -523,7 +431,6 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
 
     {
-        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the door.
         let store = common::dropped_at(&path, &cfg)
             .expect("the postgres plugin must load over the real ABI");
         for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
@@ -534,13 +441,10 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         store
             .append_plane_record(call(&p_other, 1, "", "o1").view())
             .expect("append_plane_record over the ABI");
-        // Dropping the store closes the instance and its connection. Nothing this process still
-        // holds can be answering the reads below.
+
         drop(store);
     }
 
-    // BOOT 2 — a second, independent dlopen over the same file, a fresh `open`, a fresh
-    // connection inside the plugin.
     let store = common::dropped_at(&path, &cfg)
         .expect("the postgres plugin must load again over the real ABI");
 
@@ -562,7 +466,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
             "the chain must still link after the reload"
         );
     }
-    // The whole opaque body rides the seam; a relay that dropped it would still satisfy a seq check.
+
     assert_eq!(calls[2]["content"]["tool_digest"], "sha256:tool3");
     assert_eq!(calls[2]["content"]["request_id"], "req-3");
     assert_eq!(calls[2]["content"]["outcome"], "dispatched");
@@ -573,8 +477,6 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "one principal's chain must not carry another's records"
     );
 
-    // An identical replay is the retry and crosses the ABI as Ok; a different record at an occupied
-    // position is a fork and crosses the ABI as an error.
     store
         .append_plane_record(call(&p_main, 3, "h2", "h3").view())
         .expect("an identical replay is Ok over the ABI");
@@ -594,8 +496,6 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "the boot enumeration must name every principal holding records, exactly once each"
     );
 
-    // Retention crosses the ABI too, COUNT AND ALL — checked for the number it ACTUALLY removed,
-    // because a relay that dropped the return value would read as 0 and look like a no-op sweep.
     assert_eq!(
         store
             .purge_plane_records_before(&kind, 2_002)
@@ -615,8 +515,6 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     );
     drop(store);
 
-    // LEG 3 — read the surviving rows through the LINKED door (`common::linked`), a code path
-    // that never touches the cdylib or its dlopen.
     let direct_calls = chain(&direct, &p_main);
     assert_eq!(
         direct_calls
@@ -633,17 +531,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 }
 
 /// THE DURABILITY PROOF FOR THE `task` / `task_event` PLANE KINDS (the A2A task store), OVER THE REAL
-/// PLUGIN PATH.
-///
-/// The sibling proof above does this for the call log; this one exists because the task records are
-/// a SEPARATE half of the same defaulted seam: the upsert defaults to `Ok(())`, the point-read to
-/// `Ok(None)` and the listing to `Ok(vec![])`, so a seam that does not relay them ACCEPTS EVERY WRITE
-/// AND REPORTS SUCCESS while keeping nothing, and an operator finds "task state survives a restart"
-/// false on their own deployment.
-///
-/// A REAL `dlopen`, the real store v3 table, the real `LoadedStore`. Write at arity > 1 (two tasks, one of them
-/// UPSERTED a second time, plus two independent provenance chains), DROP the handle, `dlopen` again
-/// and read everything back; a third leg reads through the linked door.
+
 #[test]
 fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
@@ -652,8 +540,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let Some(admin_url) = postgres_url() else {
         return;
     };
-    // Retention is global per kind: every load and the linked witness use this private database,
-    // so exact sweep/cascade counts cannot delete another test's active or terminal tasks.
+
     let db = TempDb::create(&admin_url, "spg_task_durability");
     let cfg = cfg(&db.url());
     let direct = common::linked(&cfg).expect("connect directly to verify");
@@ -715,7 +602,6 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     );
 
     {
-        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the door.
         let store = common::dropped_at(&path, &cfg)
             .expect("the postgres plugin must load over the real ABI");
         store
@@ -730,8 +616,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
                 .view(),
             )
             .expect("upsert_plane_record over the ABI");
-        // The SECOND write for the same id must REPLACE the row, never append a second one. An
-        // interrupted task waiting on a human is exactly what a restart has to find.
+
         store
             .upsert_plane_record(interrupted.view())
             .expect("upsert_plane_record over the ABI");
@@ -758,7 +643,6 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         drop(store);
     }
 
-    // BOOT 2 — a second, independent dlopen over the same file.
     let store = common::dropped_at(&path, &cfg)
         .expect("the postgres plugin must load again over the real ABI");
 
@@ -821,8 +705,6 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "one task's chain must not carry another's events"
     );
 
-    // 1.6.0: the append is FORK-DETECTING for every kind — an identical replay is the retry (Ok),
-    // a different record at an occupied (task, seq) is refused rather than silently overwriting.
     store
         .append_plane_record(event(&t_live, 3, "task.working", "h2", "h3").view())
         .expect("an identical replay is Ok");
@@ -831,7 +713,6 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         .is_err());
     assert_eq!(events(&store, &t_live).len(), 3, "no 4th event");
 
-    // Retention crosses the ABI too, COUNT AND ALL.
     assert_eq!(
         store
             .purge_plane_records("task", BASE_TS + 100, busbar_contract::records::Retention::TerminalOnly)
@@ -854,7 +735,6 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     );
     drop(store);
 
-    // LEG 3 — the surviving rows through the linked door.
     let direct_task = RecordStore::get_plane_record(&direct, "task", &t_live)
         .expect("get_plane_record via the direct connection")
         .expect("the task must be physically present in Postgres, not just cached in-process");
@@ -863,7 +743,6 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     assert_eq!(direct_task["state"], "input-required");
     assert_eq!(events(&direct, &t_live).len(), 3);
 
-    // Clean up this run's rows through the contract: mark the survivor terminal, then sweep.
     RecordStore::upsert_plane_record(
         &direct,
         task(
@@ -889,16 +768,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 }
 
 /// THE DURABILITY PROOF FOR THE TRUST STATE — the `demotion` kind and the single-use `ask` token
-/// ledger — OVER THE REAL PLUGIN PATH.
-///
-/// A seam that does not RELAY these substitutes two security failures, both silent: a demotion is
-/// written, reported successful and DISCARDED (a restart hands a quarantined upstream the operator's
-/// approval back), and every redeemer of one single-use approval is told the trait default's answer.
-/// Two simultaneous loads are the fleet; a drop and a reload is the restart; a third leg reads
-/// through the linked door.
-///
-/// PANICS rather than skipping when no Postgres is configured: these are the only over-the-ABI
-/// coverage of two properties whose unimplemented form is silently green.
+
 #[test]
 fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
@@ -927,7 +797,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     let nonce_fleet = format!("nonce_abi_fleet_{stamp}");
     let nonce_fresh = format!("nonce_abi_fresh_{stamp}");
     const NOW: u64 = 4_000_000_000;
-    // A redemption sweeps every entry of its kind below its `now`: a kind of this run's own.
+
     let ask_kind = format!("ask_abi_{stamp}");
 
     let demotion = |server: &str, reason: &str, at: u64| PlaneRecord {
@@ -957,7 +827,6 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     };
 
     {
-        // BOOT 1 — a real dlopen of the cdylib; every call below crosses the door.
         let store = common::dropped_at(&path, &cfg)
             .expect("the postgres plugin must load over the real ABI");
         store
@@ -981,7 +850,6 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         drop(store);
     }
 
-    // BOOT 2 — a second, independent dlopen against the same database.
     let store = common::dropped_at(&path, &cfg)
         .expect("the postgres plugin must load again over the real ABI");
 
@@ -1003,7 +871,6 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "a restart handed a spent approval back over the plugin ABI"
     );
 
-    // THE FLEET: a second, simultaneous dlopen against the same database.
     let node_b = common::dropped_at(&path, &cfg)
         .expect("a second node loads the same plugin against the same database");
     assert!(store
@@ -1015,7 +882,7 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
             .expect("redeem_plane_token"),
         "a second node redeemed an approval the first already spent"
     );
-    // THE CONTROL: a ledger that refused everything would satisfy both cases above.
+
     assert!(
         node_b
             .redeem_plane_token(&ask_kind, &nonce_fresh, u64::MAX, NOW + 4)
@@ -1023,7 +890,6 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "a freshly minted approval is not the one that was spent"
     );
 
-    // LEG 3 — the same rows through the linked door.
     let direct = common::linked(&cfg).expect("connect directly to verify and clean up");
     assert!(
         demotions(&direct)
@@ -1037,9 +903,6 @@ fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
         "the spent-token row must be physically present in Postgres"
     );
 
-    // Clean up this run's demotion through the contract. The ledger entries are left ON PURPOSE:
-    // the contract gives the ledger no delete, only the expiry sweep a redemption carries, and
-    // firing that with a far-future `now` would evict rows a CONCURRENT test process relies on.
     RecordStore::delete_plane_record(&direct, "demotion", &srv_demoted)
         .expect("clean up this run's demotion");
 }

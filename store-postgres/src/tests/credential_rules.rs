@@ -2,7 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The family's credential rules (R3, R4, R5, R7) and the one-text-per-condition refusals (W2),
-//! against a live Postgres.
 
 use super::*;
 
@@ -35,7 +34,6 @@ impl Drop for IsolatedSchema {
     }
 }
 
-// Revision assertions need a private counter: unrelated tests mutate the shared database.
 fn isolated(tag: &str) -> (TestStore, String, IsolatedSchema) {
     let url = live_url().expect("callers return early without a live url");
     let name = format!("credential_{tag}_{}", unique_suffix());
@@ -52,7 +50,7 @@ fn isolated(tag: &str) -> (TestStore, String, IsolatedSchema) {
 }
 
 /// R3: a revoked credential id is never minted again; a NEW id into the revoked occupant's slot
-/// reclaims the slot, its `created_at` the new credential's.
+
 #[test]
 fn a_revoked_credential_id_is_never_reminted_but_its_slot_is_reclaimed() {
     if live_url().is_none() {
@@ -85,7 +83,7 @@ fn a_revoked_credential_id_is_never_reminted_but_its_slot_is_reclaimed() {
 }
 
 /// R4: re-putting a live credential with identical content is Ok and writes nothing; different
-/// content is refused.
+
 #[test]
 fn reputting_a_live_credential_is_ok_when_identical_and_refused_when_different() {
     if live_url().is_none() {

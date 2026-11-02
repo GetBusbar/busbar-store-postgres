@@ -71,7 +71,7 @@ impl Conns for WithheldCommit {
         text: bool,
     ) -> Result<usize, ConnError> {
         let written = self.tcp.write(owner, conn, bytes, end, text)?;
-        // The real pgwire client emits COMMIT as a complete PostgreSQL Simple Query frame.
+
         if bytes.first() == Some(&b'Q')
             && bytes.get(5..) == Some(b"COMMIT\0")
             && written == bytes.len()
@@ -337,7 +337,7 @@ fn cancelling_a_committed_rewrap_with_a_withheld_reply_preserves_its_single_effe
     let (reply, ticket) = submit(&store, &dispatcher, &expected);
     let committed = until(|| replacement_committed(&observer, before));
     let withheld = reply.wait(Duration::ZERO).is_none();
-    drop(reply); // Actual dispatcher client drop reaches the SDK CANCEL path.
+    drop(reply);
     let cancelled =
         until(|| gate.state.lock().unwrap().closed != 0 && quiet(&observer, &application));
     drop(store);
@@ -376,8 +376,7 @@ fn cancelling_a_rewrap_waiting_for_the_revision_row_has_no_effect_to_reconcile()
     });
     drop(reply);
     let cancelled = until(|| gate.state.lock().unwrap().closed != 0);
-    // Always unlock before assertions, including a RED where cancellation did not close the wire.
-    // PostgreSQL need not notice a disconnected client until its blocked statement resumes.
+
     blocker.batch_execute("ROLLBACK").unwrap();
     let retired = until(|| quiet(&observer, &application));
     drop(store);

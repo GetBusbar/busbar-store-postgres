@@ -2,17 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! TLS THROUGH THE HOST, and the KEPT connection, live (ARCHITECT rulings 2026-10-03: TLS,
-//! STORE-KEEP).
-//!
-//! * `sslmode=verify-full` asks the server for TLS (`SSLRequest`), and on its `S` the store secures
-//!   the stream through the host (`Wire::upgrade_secure`); here the host is the loader's test table
-//!   trusting a CA minted for the run, and the server is an in-test TLS proxy in front of the live
-//!   server (it answers the `SSLRequest`, accepts TLS, and forwards the plaintext). A write and a
-//!   read round-trip; without the CA the load fails in the driver's words.
-//! * The connect path against fake servers and the live one: a hostile or silent server, the connect
-//!   timeout, endpoint failover and `target_session_attrs`.
-//! * The instance keeps ONE connection across its ops (1.5.5's one mutex-guarded connection): every
-//!   op of a store runs on the same server backend.
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -30,8 +19,7 @@ use crate::pgwire::Config;
 mod auth;
 
 /// The host's TLS for the test table ([`TcpConns::with_tls`]): rustls trusting `ca_der` alone,
-/// verifying the certificate and the name; the handshake runs to completion on the blocking socket
-/// the table hands it.
+
 type TlsFailure = Arc<Mutex<Option<String>>>;
 
 struct Trusting(Arc<rustls::ClientConfig>, Option<TlsFailure>, bool);
@@ -207,7 +195,7 @@ fn write_all(w: &mut impl Write, mut b: &[u8]) -> std::io::Result<()> {
 }
 
 /// A TLS proxy in front of `upstream` (`host:port`), speaking Postgres's `SSLRequest` opening: its
-/// port.
+
 fn tls_proxy(upstream: String, server: Arc<rustls::ServerConfig>) -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = l.local_addr().expect("addr").port();
@@ -216,7 +204,6 @@ fn tls_proxy(upstream: String, server: Arc<rustls::ServerConfig>) -> u16 {
             let Ok(mut s) = s else { return };
             let (server, upstream) = (server.clone(), upstream.clone());
             std::thread::spawn(move || {
-                // SSLRequest: length 8, code 80877103.
                 let mut req = [0_u8; 8];
                 if s.read_exact(&mut req).is_err() || req != [0, 0, 0, 8, 4, 210, 22, 47] {
                     return;
@@ -249,7 +236,7 @@ fn through_proxy(url: &str, port: u16) -> (String, String) {
 }
 
 /// TLS: `sslmode=verify-full` through the host's TLS (the test table trusting the run's CA) carries
-/// the connect step, a write and a read.
+
 #[test]
 fn verify_full_secures_the_connection_through_the_host() {
     let Some(url) = live_url() else { return };
@@ -273,12 +260,12 @@ fn verify_full_secures_the_connection_through_the_host() {
 }
 
 /// TLS: a host that does not trust the server's certificate refuses the handshake, and the load
-/// fails in the driver's words.
+
 #[test]
 fn an_untrusted_server_certificate_fails_the_load_in_the_drivers_words() {
     let Some(url) = live_url() else { return };
     let (_, server) = minted_by("store-postgres untrusted issuer");
-    // A TLS-capable table trusting a DIFFERENT CA than the one that signed the server's certificate.
+
     let (other_ca, _) = minted_by("store-postgres trusted issuer");
     let (upstream, _) = through_proxy(&url, 0);
     let port = tls_proxy(upstream, server);
@@ -298,8 +285,7 @@ fn an_untrusted_server_certificate_fails_the_load_in_the_drivers_words() {
         ),
         "the verification failure, in the driver's words: {e}"
     );
-    // The host test table maps a SecureDial error to ConnError::Refused. Prove the underlying
-    // verification cause as well, so a generic dial failure cannot satisfy this test.
+
     let failure = failure.lock().unwrap();
     assert!(
         failure
@@ -310,7 +296,7 @@ fn an_untrusted_server_certificate_fails_the_load_in_the_drivers_words() {
 }
 
 /// STORE-KEEP: sequential ops of one store run on the same server backend (a kept connection), and
-/// the store holds one connection while idle.
+
 #[test]
 fn the_store_keeps_one_connection_across_its_ops() {
     let Some(url) = live_url() else { return };
@@ -342,7 +328,7 @@ fn the_store_keeps_one_connection_across_its_ops() {
         after_open,
         "every op ran on the one kept backend"
     );
-    // Dropping the store closes its instance, and its kept connection with it.
+
     drop(store);
     let gone = (0..50).any(|_| {
         std::thread::sleep(Duration::from_millis(20));
@@ -350,8 +336,6 @@ fn the_store_keeps_one_connection_across_its_ops() {
     });
     assert!(gone, "closing the instance closes its kept connection");
 }
-
-// ── the connect path against servers that misbehave ─────────────────────────────────────────
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -431,7 +415,7 @@ fn read_frontend(s: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
 }
 
 /// A server that answers the extended-protocol `SHOW transaction_read_only` with `value`, counting
-/// the statements it was sent (`shows`) and every other one (`others`).
+
 fn read_only_server(value: &'static str, shows: Arc<AtomicUsize>, others: Arc<AtomicUsize>) -> u16 {
     fake_server(move |mut s| {
         if read_startup(&mut s).is_err() || s.write_all(&welcome()).is_err() {
@@ -441,7 +425,6 @@ fn read_only_server(value: &'static str, shows: Arc<AtomicUsize>, others: Arc<At
         while let Ok((tag, body)) = read_frontend(&mut s) {
             match tag {
                 b'P' => {
-                    // Parse: the statement name, then the query text.
                     let text = &body[body.iter().position(|b| *b == 0).unwrap_or(0) + 1..];
                     sql = String::from_utf8_lossy(
                         &text[..text.iter().position(|b| *b == 0).unwrap_or(0)],
@@ -499,7 +482,7 @@ fn read_only_server(value: &'static str, shows: Arc<AtomicUsize>, others: Arc<At
 }
 
 /// Open the store on `settings` on a thread, so a connect that never returns FAILS the test
-/// instead of hanging it: the open's result, or `None` past `within`.
+
 fn open_within(settings: String, within: Duration) -> Option<Result<(), String>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -509,9 +492,8 @@ fn open_within(settings: String, within: Duration) -> Option<Result<(), String>>
 }
 
 /// A connection URL for the live server's credentials at `endpoints` (host, port),
-/// with `extra` options.
+
 fn dsn_at(live: &str, endpoints: &[(&str, u16)], extra: &str) -> String {
-    // Retarget the original fixture DSN without unsealing its captured password.
     let hosts: Vec<&str> = endpoints.iter().map(|e| e.0).collect();
     let ports: Vec<String> = endpoints.iter().map(|e| e.1.to_string()).collect();
     let query_value = |text: &str| -> String {
@@ -551,9 +533,7 @@ fn settings_of(dsn: &str) -> String {
 }
 
 /// D8 (RED before: the plaintext that followed the server's `S` stayed in the client's buffer, the
-/// host's upgrade guard looked only at the wire's input, and startup parsed it as TLS-protected):
-/// a server that answers the SSLRequest with `S` and an authentication-ok in ONE write is refused
-/// before the upgrade (CVE-2021-23222).
+
 #[test]
 fn plaintext_after_the_servers_s_is_refused_before_the_upgrade() {
     let (ca_der, server) = minted();
@@ -562,7 +542,7 @@ fn plaintext_after_the_servers_s_is_refused_before_the_upgrade() {
         if s.read_exact(&mut req).is_err() {
             return;
         }
-        // "S" and the injected AuthenticationOk + ReadyForQuery in ONE write.
+
         let mut first = b"S".to_vec();
         first.extend(welcome());
         if s.write_all(&first).is_err() {
@@ -574,7 +554,7 @@ fn plaintext_after_the_servers_s_is_refused_before_the_upgrade() {
                 return;
             }
         }
-        // Read what the client sends first, then close: nothing here answers the startup.
+
         let mut tls = rustls::StreamOwned::new(conn, s);
         let _ = tls.read(&mut [0_u8; 1024]);
     });
@@ -592,14 +572,14 @@ fn plaintext_after_the_servers_s_is_refused_before_the_upgrade() {
 }
 
 /// B9 (RED by mutation: fall back to plaintext on any answer): a server that answers the
-/// SSLRequest with `N` fails the open, it is not talked to in the clear.
+
 #[test]
 fn a_server_that_declines_tls_fails_the_open() {
     let port = fake_server(|mut s| {
         let mut req = [0_u8; 8];
         if s.read_exact(&mut req).is_ok() {
             let _ = s.write_all(b"N");
-            // A plaintext fallback would send its startup next; answer it so a fallback connects.
+
             if read_startup(&mut s).is_ok() {
                 let _ = s.write_all(&welcome());
                 let _ = read_frontend(&mut s);
@@ -614,7 +594,7 @@ fn a_server_that_declines_tls_fails_the_open() {
 }
 
 /// `sslmode=prefer` asks with an SSLRequest and, on the server's `N`, goes on to the startup in
-/// plaintext (libpq); the open then fails only on the server's own refusal.
+
 #[test]
 fn prefer_continues_in_plaintext_when_the_server_answers_n() {
     let port = fake_server(|mut s| {
@@ -708,7 +688,7 @@ fn startup_options(dsn_query: &str) -> String {
 }
 
 /// A pooler-fronted server (pgbouncer and kin) refuses the startup `options` parameter, so the
-/// store sends none of its own; a DSN's own `options` still goes through untouched.
+
 #[test]
 fn startup_carries_no_options_of_the_stores_own() {
     assert_eq!(
@@ -723,7 +703,7 @@ fn startup_carries_no_options_of_the_stores_own() {
 }
 
 /// A peer that is not Postgres (an HTTP error page) declares a message length of ~1.3 GiB; the
-/// client refuses it by its header, naming the length, rather than waiting to buffer it.
+
 #[test]
 fn an_oversized_declared_message_length_is_refused() {
     let port = fake_server(|mut s| {
@@ -748,7 +728,7 @@ fn an_oversized_declared_message_length_is_refused() {
 }
 
 /// P10: the declared length counts its own four bytes, so a message that carries Postgres' largest
-/// value (1 GiB) declares 1 GiB plus its framing: that is a legitimate peer, waited on, not refused.
+
 #[test]
 fn a_message_declaring_a_maximal_value_plus_framing_is_not_refused() {
     let port = fake_server(|mut s| {
@@ -770,7 +750,7 @@ fn a_message_declaring_a_maximal_value_plus_framing_is_not_refused() {
 }
 
 /// The scrub uses the password the connection parser read, not a second parser's guess: a quoted
-/// keyword password holding an escaped quote and a space is scrubbed whole from a server's refusal.
+
 #[test]
 fn a_quoted_password_with_an_escaped_quote_is_scrubbed_whole() {
     let port = fake_server(|mut s| {
@@ -789,8 +769,7 @@ fn a_quoted_password_with_an_escaped_quote_is_scrubbed_whole() {
 }
 
 /// D37 (RED before: `connect_timeout` was ignored, `Wire::bound` never called, and a server that
-/// accepts TCP and never answers held the instance's one connection forever): the dial AND the
-/// handshake are bounded, and the failure is the connection's timeout.
+
 #[test]
 fn connect_timeout_bounds_a_server_that_never_answers() {
     let port = silent_server();
@@ -813,8 +792,7 @@ fn connect_timeout_bounds_a_server_that_never_answers() {
 }
 
 /// D37/B2 (RED before: the first endpoint's handshake hung): the first endpoint accepts and stays
-/// silent, the second is the live server; the open moves on after the bound passes, which needs the
-/// bound lifted before the first connection is closed (a passed bound answers `close` too).
+
 #[test]
 fn an_endpoint_that_times_out_hands_over_to_the_next() {
     let Some(url) = live_url() else { return };
@@ -836,8 +814,7 @@ fn an_endpoint_that_times_out_hands_over_to_the_next() {
 }
 
 /// D37: `connect_timeout` bounds a NEW connection's dial and handshake, never the wait for a
-/// kept connection. Op A holds one longer than the timeout (blocked on a row lock); op B waiting
-/// behind it still succeeds.
+
 #[test]
 fn an_op_held_on_a_lock_past_connect_timeout_is_not_cut() {
     let Some(url) = live_url() else { return };
@@ -875,7 +852,7 @@ fn an_op_held_on_a_lock_past_connect_timeout_is_not_cut() {
 }
 
 /// D12 (RED before: failover covered the dial only): an endpoint that accepts and then refuses the
-/// startup (57P03, the server starting up) hands over to the next.
+
 #[test]
 fn a_startup_refusal_moves_on_to_the_next_endpoint() {
     let Some(url) = live_url() else { return };
@@ -887,7 +864,7 @@ fn a_startup_refusal_moves_on_to_the_next_endpoint() {
     let (host, port) = live_endpoint(&url);
     let dsn = dsn_at(&url, &[("127.0.0.1", starting), (&host, port)], "");
     open_loaded(&settings_of(&dsn)).expect("the second endpoint accepted the connection");
-    // All endpoints refusing: every endpoint's failure is in the error, host and port named.
+
     let a = fake_server(|mut s| {
         if read_startup(&mut s).is_ok() {
             let _ = s.write_all(&fatal("57P03", "first starting up"));
@@ -911,7 +888,7 @@ fn a_startup_refusal_moves_on_to_the_next_endpoint() {
 }
 
 /// D10 (RED before: `target_session_attrs` was ignored): `read-write` refuses a server that is
-/// read-only for the session, `read-only` one that is not.
+
 #[test]
 fn target_session_attrs_refuses_a_server_of_the_wrong_kind() {
     let Some(url) = live_url() else { return };
@@ -939,7 +916,7 @@ fn target_session_attrs_refuses_a_server_of_the_wrong_kind() {
 }
 
 /// D10: a standby listed first is passed over for the primary (the failover the attribute exists
-/// for): the first endpoint answers `on`, the second is the live server.
+
 #[test]
 fn a_read_only_first_endpoint_is_passed_over_for_read_write() {
     let Some(url) = live_url() else { return };
@@ -961,8 +938,7 @@ fn a_read_only_first_endpoint_is_passed_over_for_read_write() {
 }
 
 /// D25 (RED before: an ErrorResponse followed by EOF read as "connection closed" and the server's
-/// reason was dropped): a FATAL answer to the first simple query (the migration's advisory lock)
-/// surfaces the server's SQLSTATE and message.
+
 #[test]
 fn a_fatal_then_eof_on_a_simple_query_surfaces_the_servers_reason() {
     let port = fake_server(|mut s| {
@@ -987,7 +963,7 @@ fn a_fatal_then_eof_on_a_simple_query_surfaces_the_servers_reason() {
 }
 
 /// D25, the extended protocol's first round (`run`): the FATAL answers the Parse, and the drain
-/// that follows hits EOF; the original error is the one reported.
+
 #[test]
 fn a_fatal_then_eof_on_a_parse_surfaces_the_servers_reason() {
     let port = fake_server(|mut s| {
@@ -1025,8 +1001,7 @@ fn a_fatal_then_eof_on_a_parse_surfaces_the_servers_reason() {
 }
 
 /// D44 (RED before: a transaction dropped uncommitted, as an `op_id` conflict leaves it, made the
-/// session non-idle, the kept connection was discarded and the next op dialled TCP+TLS+SCRAM
-/// afresh): after a refused op the next op runs on the same backend.
+
 #[test]
 fn a_refused_op_keeps_the_connection() {
     let Some(url) = live_url() else { return };
@@ -1076,12 +1051,11 @@ fn a_refused_op_keeps_the_connection() {
 }
 
 /// B3: a failover DSN whose first endpoint is down keeps the connection that the second gave:
-/// the next op asks for that endpoint first and reuses the kept connection, instead of dialling
-/// the first, finding the kept connection is for another target and evicting it.
+
 #[test]
 fn a_failover_dsn_keeps_the_endpoint_that_connected() {
     let Some(url) = live_url() else { return };
-    // A port nothing listens on: bound, then released.
+
     let dead = TcpListener::bind("127.0.0.1:0")
         .expect("bind")
         .local_addr()
@@ -1119,10 +1093,7 @@ fn a_failover_dsn_keeps_the_endpoint_that_connected() {
 }
 
 /// Oracle cell `store.boot|postgres|url-options` (RED before: `keepalives` was refused at parse,
-/// so the boot never dialed): the cell's exact URL, against a server that answers its startup as
-/// the oracle's mock does (FATAL 28000), reaches the dial, sends the StartupMessage 1.5.5 sent,
-/// and fails on the server's refusal, as 1.5.5's boot did (1.5.5 printed `db error`; this store
-/// names the SQLSTATE and the server's message).
+
 #[test]
 fn the_oracle_url_options_cell_dials_and_fails_with_the_servers_refusal() {
     let sent = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));

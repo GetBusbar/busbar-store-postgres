@@ -139,7 +139,7 @@ fn exact_rows_receipts_conflicts_and_full_unsigned_values_survive_reopen() {
         ledger(u64::MAX),
         "ordinary absolute writes share the exact codec"
     );
-    // A signed legacy accrual/refund on a corrected high row must not narrow its raw counts.
+
     reopened
         .add_usage(
             BUCKET,
@@ -298,7 +298,7 @@ fn every_replacement_and_receipt_roll_back_together_and_legacy_adjustments_are_c
         Err(OpRefused::Refused(_))
     ));
     assert_eq!(receipts(&store), 1);
-    // An actual legacy receipt must replay before the new reserved-bucket rule is checked.
+
     let body = Dedupe::usage(&cells).body_hex();
     store
         .lock()
@@ -330,7 +330,7 @@ fn writer_before_correction(
 ) -> Decision {
     let writer = TestStore::open(&db.url()).unwrap();
     let correction = TestStore::open(&db.url()).unwrap();
-    // Autocommit observations must see each new waiter, not a transaction's cached activity.
+
     let mut observer = connect_client_with_retry(&db.url());
     let mut blocker = connect_client_with_retry(&db.url());
     blocker
@@ -532,7 +532,7 @@ fn cancelling_a_pending_authority_wait_drops_the_uncommitted_transaction_without
     let store = seed(&db);
     let settings = serde_json::json!({"url": db.url()}).to_string();
     let loaded = harness::open_loaded(&settings).unwrap();
-    // Keep lock observations outside the transaction holding the serialization row.
+
     let mut observer = connect_client_with_retry(&db.url());
     let mut blocker = connect_client_with_retry(&db.url());
     blocker
@@ -579,7 +579,7 @@ fn v18_usage_counters_migrate_in_place_before_exact_corrections_are_accepted() {
          ALTER TABLE usage_ledger_units ALTER COLUMN count TYPE BIGINT;",
         )
         .unwrap();
-    // Seed a real v18 version stamp rather than relying on an inferred missing schema.
+
     const PRECISE_METERING_SCHEMA: i64 = 18;
     store
         .lock()

@@ -2,17 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The Postgres frontend protocol over the host's connector: a small async client whose every byte
-//! goes through the op's one connection ([`Wire`], the store SDK's `wire`), so this store opens no
-//! socket of its own. The codec is `postgres-protocol` (public messages); authentication uses
-//! the SDK credential recipes and sealed writes. The value encodings are `postgres-types`
-//! (the same binary `ToSql`/`FromSql` the `postgres` crate uses).
-//!
-//! The surface mirrors the `postgres` crate's (`Client`, `Transaction`, `Row`, `Error`) with every
-//! call `async`. A statement is prepared under a name the first time its connection runs its text
-//! (Parse/Describe/Sync for the parameter and column types) and kept with the connection (the
-//! wire's session), so every later run of the same text is ONE round trip (Bind/Execute/Sync),
-//! every parameter and column in the binary format. A `Transaction` dropped without `commit` is
-//! rolled back before the connection's next statement.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -103,7 +92,7 @@ fn config_err(what: impl Into<String>) -> Error {
 }
 
 /// How long the host's connector lets a dialled socket sit idle before the OS probes it
-/// (`busbar-core-connector`'s `KEEPALIVE_IDLE`, 1.5.5's `tcp_keepalive(60s)`), in seconds.
+
 const KEEPALIVE_IDLE_SECS: i64 = 60;
 
 /// Why a socket-tuning option has no effect.
@@ -112,13 +101,13 @@ const INERT_SOCKET: &str = "the host's connector dials every connection with TCP
                             per-store setting for it";
 
 /// Log, at debug (below the default level), that the accepted option `key=value` has no effect,
-/// and why. `value` is a validated number or keyword, never a secret.
+
 fn inert(key: &str, value: &str, why: &str) {
     tracing::debug!("postgres connection option {key}={value} has no effect: {why}");
 }
 
 /// The most a message may declare: Postgres' own ceiling on a value (1 GiB) plus the four bytes
-/// of the length word, which the declared length counts.
+
 const MAX_MESSAGE_LEN: u32 = (1 << 30) + 4;
 
 /// The handshake bound when the DSN has no `connect_timeout`.
@@ -132,12 +121,7 @@ impl Config {
     }
 
     /// Parse a libpq connection string: `postgres[ql]://user:pass@host:port/db?key=value&...` or
-    /// `host=... port=... user=... password=... dbname=... sslmode=...`.
-    ///
-    /// # Errors
-    /// A malformed string, an unknown option, an option value the driver would refuse,
-    /// `keepalives=0`, a Unix-socket host (this store reaches its server over the host's connector,
-    /// which dials TCP) or no user.
+
     pub fn parse(s: &str) -> Result<Self, Error> {
         Self::captured(CredUrl::parse_postgres(s).map_err(config_err)?)
     }
@@ -167,8 +151,6 @@ impl Config {
                 pairs.push(("user".into(), decode(u)?));
             }
             if !hostport.is_empty() {
-                // libpq's multi-host list, `host1:port1,host2:port2`, kept as its keyword form's
-                // comma lists (`host=a,b port=1,2`) for the option loop below.
                 let (mut hosts, mut ports) = (Vec::new(), Vec::new());
                 for one in hostport.split(',') {
                     let (host, port) = if let Some(v6) = one.strip_prefix('[') {
@@ -206,8 +188,6 @@ impl Config {
             }
             if let Some(q) = query {
                 for kv in q.split('&').filter(|kv| !kv.is_empty()) {
-                    // The malformed pair is NOT echoed: a password holding a `?` or `&` splits
-                    // here, and its tail would land in the error (and the log).
                     let (k, v) = kv.split_once('=').ok_or_else(|| {
                         config_err("invalid query parameter (expected key=value)")
                     })?;
@@ -243,7 +223,7 @@ impl Config {
                 "hostaddr" => hostaddrs = Some(v),
                 "port" => ports = v,
                 "user" => c.user = v,
-                // A password reaching this parser would violate the capture contract.
+
                 "password" => return Err(config_err("password was not captured")),
                 "require_auth" => {
                     RequireAuth::parse(&v).map_err(config_err)?;
@@ -253,8 +233,6 @@ impl Config {
                 "options" => c.options = Some(v),
                 "sslmode" => {
                     c.ssl = match v.as_str() {
-                        // `allow` would try plaintext first and TLS on refusal; this store goes
-                        // straight to plaintext, as libpq does against a server that takes it.
                         "disable" | "allow" => SslMode::Plain,
                         "prefer" => SslMode::Prefer,
                         "require" | "verify-ca" | "verify-full" => SslMode::Require,
@@ -263,8 +241,7 @@ impl Config {
                         }
                     }
                 }
-                // Whole seconds: more than zero bounds the dial and
-                // the handshake of a new connection, zero or less is no bound.
+
                 "connect_timeout" => {
                     let secs: i64 = v.parse().map_err(|_| {
                         config_err(
@@ -272,7 +249,7 @@ impl Config {
                              seconds; 0 or less means no bound)",
                         )
                     })?;
-                    // Some(0) is the explicit "no bound"; unset takes the default.
+
                     c.connect_timeout_ms = Some(if secs > 0 {
                         u32::try_from(secs.saturating_mul(1000)).unwrap_or(u32::MAX)
                     } else {
@@ -292,9 +269,7 @@ impl Config {
                         }
                     }
                 }
-                // Refused rather than ignored: the store has no TLS client of its own, so no channel
-                // binding, and a server that gets no binding could not be the one the operator
-                // required.
+
                 "channel_binding" => match v.as_str() {
                     "disable" | "prefer" => {}
                     "require" => {
@@ -306,17 +281,14 @@ impl Config {
                     }
                     _ => return Err(config_err("invalid value for option `channel_binding`")),
                 },
-                // Refused rather than ignored: the connection is verified against busbar's trust
-                // anchors through the host, so a root certificate named here would never apply.
+
                 "sslrootcert" => {
                     return Err(config_err(
                         "sslrootcert is not supported: the connection is verified against \
                          busbar's trust anchors, not a per-store root certificate",
                     ));
                 }
-                // The host's connector owns the sockets: it turns TCP keepalive on for every
-                // connection it dials and offers no way to turn it off, so `keepalives=1` (any
-                // non-zero, as the driver read it) is what happens and `keepalives=0` is refused.
+
                 "keepalives" => {
                     let on: u64 = v
                         .parse()
@@ -329,14 +301,12 @@ impl Config {
                         ));
                     }
                 }
-                // Accepted as the driver accepted them; the ones the connector cannot apply are
-                // logged at debug (once per option, naming why), never refused and never silent.
+
                 "keepalives_idle" | "keepalives_interval" | "tcp_user_timeout" => {
                     let n: i64 = v
                         .parse()
                         .map_err(|_| config_err(format!("invalid value for option `{k}`")))?;
-                    // Zero or less is the default (the driver's reading); the connector's own
-                    // idle time is KEEPALIVE_IDLE_SECS.
+
                     let applied = n <= 0 || (k == "keepalives_idle" && n == KEEPALIVE_IDLE_SECS);
                     if !applied {
                         inert(&k, &v, INERT_SOCKET);
@@ -350,7 +320,7 @@ impl Config {
                         inert(&k, &v, INERT_SOCKET);
                     }
                 }
-                // `disable` is what this store does: the endpoints are tried in the order given.
+
                 "load_balance_hosts" => match v.as_str() {
                     "disable" => {}
                     "random" => inert(
@@ -361,7 +331,7 @@ impl Config {
                     ),
                     _ => return Err(config_err("invalid value for option `load_balance_hosts`")),
                 },
-                // `postgres` is what this store does: TLS is asked for with an SSLRequest.
+
                 "sslnegotiation" => match v.as_str() {
                     "postgres" => {}
                     "direct" => inert(
@@ -419,9 +389,7 @@ fn target(host: &str, port: u16) -> String {
 }
 
 /// libpq's host, hostaddr and port lists, paired by position: one port for every endpoint, or one
-/// per endpoint; a hostaddr is the address to dial (an IP) and its host the name. An endpoint with
-/// neither is `localhost`, an empty port 5432. A `host` list and a `hostaddr` list must be as long
-/// as each other.
+
 fn endpoints(
     hosts: Option<&str>,
     hostaddrs: Option<&str>,
@@ -502,7 +470,7 @@ fn decode(s: &str) -> Result<String, Error> {
 }
 
 /// The libpq keyword form: `key=value` pairs, whitespace around `=` allowed, single-quoted values
-/// with `\'` and `\\` escapes.
+
 pub(super) fn keywords(s: &str) -> Result<Vec<(String, String)>, Error> {
     let mut out = Vec::new();
     let mut it = s.chars().peekable();
@@ -525,8 +493,6 @@ pub(super) fn keywords(s: &str) -> Result<Vec<(String, String)>, Error> {
             it.next();
         }
         if it.next() != Some('=') {
-            // The token is NOT echoed: it is not a well-formed `key=`, so it may be the tail of a
-            // password that held a space, or a userinfo without its scheme.
             return Err(config_err(
                 "unexpected EOF: a connection parameter without `=` (expected key=value)",
             ));
@@ -762,9 +728,7 @@ pub struct Row {
 
 impl Row {
     /// Column `idx` as `T`.
-    ///
-    /// # Errors
-    /// An unknown column, a type `T` does not accept, or a value that does not convert.
+
     pub fn try_get<'a, I: RowIndex, T: FromSql<'a>>(&'a self, idx: I) -> Result<T, Error> {
         let Some(i) = idx.index(&self.columns) else {
             return Err(Error::new(Kind_::Column(idx.to_string())));
@@ -781,8 +745,7 @@ impl Row {
                 ),
             )));
         }
-        // A DataRow with fewer fields than the RowDescription named columns is the server's
-        // protocol violation: an error on the missing column, never an out-of-bounds panic.
+
         let Some(range) = self.ranges.get(i) else {
             return Err(Error::new(Kind_::FromSql(
                 name.clone(),
@@ -807,7 +770,7 @@ struct Statement {
 }
 
 /// How many statements a connection keeps prepared: past it, the least recently run is closed
-/// (the store's variable-arity batches would otherwise prepare one per batch size, without end).
+
 const STATEMENTS_KEPT: usize = 256;
 
 /// The connection's prepared statements, by SQL text. Kept WITH the connection (the wire's session:
@@ -865,24 +828,19 @@ impl Cache {
 }
 
 /// A cached statement's run failed because the server no longer has it as prepared: `26000`
-/// (`invalid_sql_statement_name`, the session's statements were deallocated) or `0A000` (a schema
-/// change altered its result type, "cached plan must not change result type").
+
 fn is_stale_statement(e: &Error) -> bool {
     matches!(e.code().map(SqlState::code), Some("26000" | "0A000"))
 }
 
 /// One connection to the server, over the op's wire. The connection is KEPT for the instance's
-/// next op (the store SDK's kept set) only when [`Client::release`] finds the session idle: the
-/// last message read was `ReadyForQuery` with status `I` (no transaction open or failed), nothing
-/// is left unread and no transaction awaits its rollback. Dropped any other way (an early return,
-/// a protocol failure), it is discarded and the next op dials fresh.
+
 pub struct Client {
     wire: Wire,
     buf: BytesMut,
     /// A `Transaction` was dropped uncommitted: roll it back before the next statement.
     rollback_pending: bool,
     /// The transaction status of the last `ReadyForQuery` (`I` idle, `T` in a transaction, `E` in
-    /// a failed one).
     status: u8,
     /// The last message read was `ReadyForQuery` and nothing was sent after it.
     at_ready: bool,
@@ -911,7 +869,7 @@ fn auth_err(why: impl fmt::Display) -> Error {
 }
 
 /// Keep postgres-protocol's ordered, extension-free server-first grammar and its 100,000
-/// iteration ceiling. Reject zero and leading zeroes as malformed RFC 5802 posit-number syntax.
+
 fn scram_server_first(bytes: &[u8]) -> Result<&str, Error> {
     let bad = || auth_err("malformed SCRAM server-first message");
     let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
@@ -955,7 +913,7 @@ fn scram_base64(b: u8) -> bool {
 }
 
 /// No ambiguous attributes: the server-final is one verifier or one refusal. Peer-provided
-/// refusal text is withheld because it may echo credential material.
+
 fn scram_server_final(bytes: &[u8]) -> Result<&str, Error> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| auth_err("malformed SCRAM server-final message"))?;
@@ -977,14 +935,7 @@ pub type Param<'a> = &'a (dyn ToSql + Sync);
 
 impl Client {
     /// Connect over `wire` (its need 0) to the server `cfg` names, secure the connection when
-    /// `cfg` asks, and authenticate. The endpoints are tried in order (libpq's list), the one that
-    /// last connected first (`preferred`, so a failover DSN does not evict the kept connection to
-    /// try its first endpoint again on every op): any failure of one endpoint's connect (the dial,
-    /// the TLS refusal, the server's startup error, a `target_session_attrs` mismatch) closes it
-    /// and moves on to the next. If all fail, the error names every endpoint and its failure.
-    ///
-    /// # Errors
-    /// The connector's failure (as a connect error), a TLS refusal, or the server's refusal.
+
     pub async fn connect(
         wire: Wire,
         cfg: &Config,
@@ -1001,17 +952,13 @@ impl Client {
                     return Ok(c);
                 }
                 Err(e) => {
-                    // The bound comes off BEFORE the close: a bound that has passed answers every
-                    // wire call with its timeout, the close included, which would leave this
-                    // endpoint's socket in place under the next one's connect.
                     wire.unbound();
                     wire.close().await;
                     failures.push((i, e));
                 }
             }
         }
-        // One endpoint: its error as it came. Several: every one, so the operator sees why each
-        // was passed over, not only the last.
+
         if failures.len() > 1 {
             let joined: Vec<String> = failures
                 .iter()
@@ -1029,16 +976,12 @@ impl Client {
 
     /// One endpoint's connect: dial, secure, authenticate, check the session's kind.
     async fn attempt(wire: &Wire, cfg: &Config, endpoint: &Endpoint) -> Result<Client, Error> {
-        // `connect_timeout` bounds a NEW connection's dial (the connector's own timeout for it) and
-        // its handshake (`Wire::bound`); never the wait for one of the instance's kept connections,
-        // which another op may hold for as long as its statement runs.
         let ms = cfg.connect_bound_ms();
         wire.connect_timed(0, Some(&target(&endpoint.dial, endpoint.port)), ms)
             .await
             .map_err(Error::connect)?;
         let reused = wire.reused();
-        // A kept connection's statements come with it; a new connection's start empty and ride
-        // with it from here on.
+
         let statements = match wire.session::<Statements>() {
             Some(s) if reused => s,
             _ => {
@@ -1057,8 +1000,6 @@ impl Client {
             statements,
         };
         if reused {
-            // A kept connection: secured and authenticated by the op that established it, and
-            // idle when it was kept.
             return Ok(c);
         }
         if ms > 0 {
@@ -1093,12 +1034,8 @@ impl Client {
     }
 
     /// Secure the stream after the server's `S`: verified against the host's trust anchors for
-    /// `require` and up, unverified for `prefer` (libpq).
+
     async fn upgrade(&mut self, cfg: &Config, endpoint: &Endpoint) -> Result<(), Error> {
-        // Anything the server sent after its `S` went out in the clear, and would be parsed
-        // after the upgrade as if the secured server had sent it (CVE-2021-23222, STARTTLS
-        // response injection). The host's guard sees only the wire's input, which this
-        // client's reads have already moved into its own buffer: the check is here.
         if !self.buf.is_empty() {
             return Err(Error::new(Kind_::Tls(
                 "server sent unencrypted data after accepting TLS".to_string(),
@@ -1191,8 +1128,7 @@ impl Client {
                     if !password.floor().pg().allows(PgAuth::ScramSha256) {
                         return Err(auth_err("require_auth does not allow SCRAM-SHA-256"));
                     }
-                    // The nonce and the empty SCRAM username are public, as in postgres-protocol.
-                    // Channel binding stays unsupported (GS2 n,,), including when PLUS is offered.
+
                     let first_bare = format!("n=,r={}", pg_scram_nonce().map_err(auth_err)?);
                     let first = format!("n,,{first_bare}");
                     let mut out = BytesMut::new();
@@ -1253,11 +1189,7 @@ impl Client {
     }
 
     /// The op is done with the connection: keep it if the session is idle, else it is discarded
-    /// when the client drops. A transaction the op dropped uncommitted (a replay, a conflict, a
-    /// refusal: the common ends of a write) is rolled back first, when the connection is
-    /// otherwise whole, so those ends keep the connection instead of costing the next op a fresh
-    /// TCP, TLS and SCRAM handshake; a rollback that fails
-    /// (even one the server answers and then returns to idle) is not kept.
+
     pub async fn release(&mut self) {
         if self.rollback_pending
             && self.at_ready
@@ -1278,7 +1210,7 @@ impl Client {
     }
 
     /// A whole credential-bearing frame stays inside the SDK through partial writes and Pending.
-    /// Mark the connection busy before awaiting so cancellation cannot return it to the pool.
+
     async fn send_sealed(&mut self, message: Seal) -> Result<(), Error> {
         self.at_ready = false;
         self.wire
@@ -1316,8 +1248,6 @@ impl Client {
     /// The next message the server sent; asynchronous notices and parameter changes skipped.
     async fn read(&mut self) -> Result<Message, Error> {
         loop {
-            // The declared length is the peer's word: past Postgres' own 1 GiB ceiling it is not a
-            // Postgres peer, and is refused before anything is reserved for it.
             if let Some(h) = self.buf.get(1..5) {
                 let len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
                 if len > MAX_MESSAGE_LEN {
@@ -1373,8 +1303,7 @@ impl Client {
                     failed = Some(Error::new(Kind_::Db(DbError::parse(&e))));
                 }
                 Ok(_) => {}
-                // A FATAL (57P01 admin shutdown, 53300) is followed by the server closing the
-                // socket: the reason it gave is the error, not the close.
+
                 Err(e) => return Err(failed.unwrap_or(e)),
             }
         }
@@ -1382,9 +1311,7 @@ impl Client {
     }
 
     /// Run `sql` (one or more statements, no parameters) through the simple query protocol.
-    ///
-    /// # Errors
-    /// The first statement's failure.
+
     pub async fn batch_execute(&mut self, sql: &str) -> Result<(), Error> {
         self.settle().await?;
         self.simple(sql).await
@@ -1397,9 +1324,7 @@ impl Client {
     }
 
     /// Run one statement with `params`: its rows and the rows it affected. A statement the
-    /// connection has prepared runs in one round trip; one it has not is prepared first. A cached
-    /// statement the server no longer has ([`is_stale_statement`]) is dropped and, outside a
-    /// transaction (nothing was aborted), prepared afresh and run once more.
+
     async fn run(&mut self, sql: &str, params: &[Param<'_>]) -> Result<(Vec<Row>, u64), Error> {
         self.settle().await?;
         let cached = self.cache().get(sql);
@@ -1425,7 +1350,7 @@ impl Client {
     }
 
     /// Prepare `sql` under a new name (the parameter and column types: one round trip, which also
-    /// closes the statements the cache dropped) and cache it.
+
     async fn prepare(&mut self, sql: &str) -> Result<Arc<Statement>, Error> {
         let name = {
             let mut c = self.cache();
@@ -1464,8 +1389,7 @@ impl Client {
                 }
                 Message::ErrorResponse(e) => {
                     let err = Error::new(Kind_::Db(DbError::parse(&e)));
-                    // The connection is unusable when the drain fails (not idle, so not kept);
-                    // the server's error is still the one to report.
+
                     let _ = self.drain().await;
                     return Err(err);
                 }
@@ -1576,25 +1500,19 @@ impl Client {
     }
 
     /// The rows `sql` answers.
-    ///
-    /// # Errors
-    /// The statement's failure.
+
     pub async fn query(&mut self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>, Error> {
         self.run(sql, params).await.map(|(r, _)| r)
     }
 
     /// How many rows `sql` affected.
-    ///
-    /// # Errors
-    /// The statement's failure.
+
     pub async fn execute(&mut self, sql: &str, params: &[Param<'_>]) -> Result<u64, Error> {
         self.run(sql, params).await.map(|(_, n)| n)
     }
 
     /// The one row `sql` answers.
-    ///
-    /// # Errors
-    /// The statement's failure, or not exactly one row.
+
     pub async fn query_one(&mut self, sql: &str, params: &[Param<'_>]) -> Result<Row, Error> {
         let mut rows = self.query(sql, params).await?;
         if rows.len() != 1 {
@@ -1604,9 +1522,7 @@ impl Client {
     }
 
     /// The row `sql` answers, if one.
-    ///
-    /// # Errors
-    /// The statement's failure, or more than one row.
+
     pub async fn query_opt(
         &mut self,
         sql: &str,
@@ -1621,9 +1537,7 @@ impl Client {
     }
 
     /// Begin a READ COMMITTED transaction.
-    ///
-    /// # Errors
-    /// The `BEGIN`'s failure.
+
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         self.batch_execute(begin_sql(None)).await?;
         Ok(Transaction {
@@ -1653,10 +1567,7 @@ pub enum IsolationLevel {
 }
 
 /// The one simple-query batch that begins a transaction at `isolation` (`None` = READ COMMITTED,
-/// stated, so a DSN's `default_transaction_isolation` cannot change what the store's statements
-/// assume). It also bounds the transaction server-side with `SET LOCAL`, which a pooler passes
-/// where a startup `options` parameter is refused: a peer stalled while holding a lock (the
-/// `store_revision` row, say) must not block the fleet forever.
+
 #[must_use]
 pub fn begin_sql(isolation: Option<IsolationLevel>) -> &'static str {
     match isolation {
@@ -1689,9 +1600,7 @@ impl<'a> TransactionBuilder<'a> {
     }
 
     /// Begin it.
-    ///
-    /// # Errors
-    /// The `BEGIN`'s failure.
+
     pub async fn start(self) -> Result<Transaction<'a>, Error> {
         self.client.batch_execute(begin_sql(self.isolation)).await?;
         Ok(Transaction {
@@ -1717,18 +1626,14 @@ impl Drop for Transaction<'_> {
 
 impl Transaction<'_> {
     /// Commit.
-    ///
-    /// # Errors
-    /// The `COMMIT`'s failure.
+
     pub async fn commit(mut self) -> Result<(), Error> {
         self.done = true;
         self.client.batch_execute("COMMIT").await
     }
 
     /// Roll back, awaiting the server's completion before releasing this transaction's locks.
-    ///
-    /// # Errors
-    /// The `ROLLBACK`'s failure. An unfinished rollback retains Drop's pending cleanup.
+
     pub async fn rollback(mut self) -> Result<(), Error> {
         self.client.batch_execute("ROLLBACK").await?;
         self.done = true;
@@ -1736,41 +1641,31 @@ impl Transaction<'_> {
     }
 
     /// [`Client::batch_execute`] inside the transaction.
-    ///
-    /// # Errors
-    /// As there.
+
     pub async fn batch_execute(&mut self, sql: &str) -> Result<(), Error> {
         self.client.batch_execute(sql).await
     }
 
     /// [`Client::query`] inside the transaction.
-    ///
-    /// # Errors
-    /// As there.
+
     pub async fn query(&mut self, sql: &str, params: &[Param<'_>]) -> Result<Vec<Row>, Error> {
         self.client.query(sql, params).await
     }
 
     /// [`Client::execute`] inside the transaction.
-    ///
-    /// # Errors
-    /// As there.
+
     pub async fn execute(&mut self, sql: &str, params: &[Param<'_>]) -> Result<u64, Error> {
         self.client.execute(sql, params).await
     }
 
     /// [`Client::query_one`] inside the transaction.
-    ///
-    /// # Errors
-    /// As there.
+
     pub async fn query_one(&mut self, sql: &str, params: &[Param<'_>]) -> Result<Row, Error> {
         self.client.query_one(sql, params).await
     }
 
     /// [`Client::query_opt`] inside the transaction.
-    ///
-    /// # Errors
-    /// As there.
+
     pub async fn query_opt(
         &mut self,
         sql: &str,

@@ -2,10 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store's two doors, as this repo's tests open them: COMPILED IN (the logic crate's `door`,
-//! through the loader's `load_linked`) and DROPPED IN (this crate's built cdylib, `dlopen`ed by the
-//! loader's `load_dropped`, which resolves `busbar_plugin_door` and admits it against the Statement
-//! the signed manifest would carry). Either way the store is one [`LoadedStore`], called through
-//! the store v3 table.
 
 #![allow(dead_code)]
 
@@ -22,7 +18,7 @@ use busbar_plugin_loader::store_v3::LoadedStore;
 use busbar_test_kit::tcp_conns::TcpConns;
 
 /// This crate's built cdylib (uplifted or under `deps`, newest wins). A missing artifact is a
-/// failure, never a skip: the dropped-in door is what these tests prove.
+
 pub fn cdylib() -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let profile = exe
@@ -39,15 +35,13 @@ pub fn cdylib() -> PathBuf {
 }
 
 /// The Statement rendering the signed manifest states: the linked door's own (the cdylib is the
-/// same crate).
+
 pub fn stated() -> Vec<u8> {
     rendering_of(busbar_store_postgres::door).expect("the store renders its Statement")
 }
 
 /// A fresh `op_id` for every bridge write: a node half no other open (in this run or an earlier
-/// one) used. The store dedupes `op_id`s DURABLY, so two opens sharing a node half against one
-/// database would replay or refuse each other's writes; a kernel's node id is unique per node, and
-/// this stands in for it.
+
 fn mint() -> busbar_contract::abi::store::OpId {
     static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -65,7 +59,7 @@ fn mint() -> busbar_contract::abi::store::OpId {
 }
 
 /// The instance's binding: its connections over the loader's test connection table (plain TCP),
-/// woken through the dispatcher, as busbar's one connector serves a store's `tcp` need.
+
 fn bind(d: &Dispatcher) -> Bind {
     Bind {
         instance: Arc::from("store-postgres-test"),
@@ -85,7 +79,7 @@ pub fn linked(settings: &str) -> Result<LoadedStore, String> {
 }
 
 /// The library at `path` through the DROPPED-IN door, admitted against [`stated`] and opened on
-/// `settings`.
+
 pub fn dropped_at(path: &Path, settings: &str) -> Result<LoadedStore, String> {
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let p = load_dropped::<Store>(path, &stated(), bind(&d)).map_err(|e| e.to_string())?;
@@ -183,7 +177,7 @@ pub fn newest_source_mtime() -> std::time::SystemTime {
 }
 
 pub fn plugin_path() -> PathBuf {
-    let exe = std::env::current_exe().expect("current_exe"); // .../target/<profile>/deps/<test>-<hash>
+    let exe = std::env::current_exe().expect("current_exe");
     let deps_dir = exe.parent().expect("the test binary always lives in deps/");
     let name = busbar_plugin_loader::plugin_library_filename("busbar_store_postgres_plugin");
     let fresh = deps_dir.join(&name);
@@ -195,12 +189,7 @@ pub fn plugin_path() -> PathBuf {
          ABI reads as green.",
         fresh.display()
     );
-    // FRESHNESS, ASSERTED — not assumed. Under `cargo test` the artifact above is rebuilt by the
-    // same graph that built this binary (proven: delete it, re-run, cargo re-emits it). But this
-    // test binary can also be executed DIRECTLY out of `deps/`, where nothing rebuilds anything,
-    // and a stale cdylib there produces empty reads — indistinguishable from the unrelayed-ABI
-    // defect. So compare it against the sources and fail with a message that says STALE ARTIFACT,
-    // explicitly NOT a durability verdict.
+
     let built = std::fs::metadata(&fresh)
         .and_then(|m| m.modified())
         .expect("cdylib mtime");
@@ -218,9 +207,7 @@ pub fn plugin_path() -> PathBuf {
 }
 
 /// The busbar checkout the real binaries are built from: `BUSBAR_CHECKOUT` when set, else a sibling
-/// `busbar/` beside this repo. It must be busbar at the rev `.busbar-ref` pins (ci.yml checks it out
-/// there), so the binary these tests drive is the one this plugin's contract dependency names. A
-/// missing checkout FAILS the test, never skips it.
+
 pub fn busbar_root() -> PathBuf {
     let root = std::env::var_os("BUSBAR_CHECKOUT")
         .map(PathBuf::from)
@@ -235,13 +222,10 @@ pub fn busbar_root() -> PathBuf {
 }
 
 /// Build (once, cached by cargo) and return the path to the real `busbar` binary and the real
-/// `busbar-plugin-pack` binary, both from the sibling busbar checkout — never a fixture, never a
-/// stub, the exact binaries a real release ships.
+
 pub fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
-    // `busbar-plugin-pack` is a feature-gated [[bin]] of `busbar-plugin-loader` (roster def 14:
-    // author-side packaging). Two invocations, because `--features` applies to the one package it
-    // names. `--locked`: the checkout's own lockfile, never rewritten.
+
     for args in [
         &[
             "build",
@@ -269,7 +253,6 @@ pub fn build_real_binaries() -> (PathBuf, PathBuf) {
         let status = Command::new("cargo")
             .args(args)
             .env("BUSBAR_RELEASE_PUBKEY", E2E_RELEASE_PUBKEY)
-            // Both binaries are read back from `<checkout>/target/release` below.
             .env_remove("CARGO_TARGET_DIR")
             .current_dir(&root)
             .status()
@@ -284,11 +267,7 @@ pub fn build_real_binaries() -> (PathBuf, PathBuf) {
 }
 
 /// THE TEST-ONLY FIRST-PARTY KEYPAIR (ed25519, `busbar-plugin-pack keygen`), never the release key.
-/// busbar grants the `operator-infrastructure` egress class this store's `tcp` need declares to a
-/// FIRST-PARTY plugin only (`busbar_plugin_loader::sign::egress_grant`): the busbar built here
-/// embeds the public half (`BUSBAR_RELEASE_PUBKEY`, compile time, as busbar's signing gate builds
-/// it) and the tarball is signed with the private half, so the plugin under test is first-party.
-/// Fixed, so the cached busbar build is reused across runs.
+
 pub const E2E_RELEASE_PUBKEY: &str =
     "9209607c315f66473c8cca8bf9a7b8031115d01bb47341613cebf57f0e4f271c";
 pub const E2E_RELEASE_PRIVKEY: &str =

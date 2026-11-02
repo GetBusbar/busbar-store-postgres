@@ -2,30 +2,6 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The **Postgres** backend for busbar's durable governance store: the shared, multi-node store.
-//! Serves the store kind's table (`StoreSlots`) over the HOST'S CONNECTOR: every op runs on the
-//! instance's kept connection as straight-line async code (`pgwire`, the Postgres frontend protocol
-//! over the store SDK's `wire`), so the store opens no socket of its own and no op blocks a thread.
-//! It depends only on `busbar-contract` (plus the sans-IO `postgres-protocol`/`postgres-types`
-//! codec). One door (`store_door!` in `v3`): linked into a build as `door`, or dropped in as the
-//! sibling plugin cdylib. Schema history: see `SCHEMA_VERSION`.
-//!
-//! ## Connections
-//!
-//! Up to [`KEPT_CONNECTIONS`] (8) kept connections, so a slow op does not hold up the others.
-//! `open`'s connect step dials through the host (one declared `tcp` need), authenticates
-//! (SCRAM-SHA-256, md5 or cleartext) and ensures the schema, so an unreachable or refusing server
-//! fails the load. A connection is kept only while its session is idle; one that failed or was left
-//! mid-transaction is closed and the next op connects afresh.
-//!
-//! ## Known limitations
-//!
-//! - `sslmode=require` / `verify-ca` / `verify-full` secure the connection through the host's
-//!   connector and ALWAYS verify the certificate and name (libpq's `require` would not); a server
-//!   answering the `SSLRequest` with `N` fails the load. `disable` and `allow` connect in plaintext
-//!   (no `SSLRequest`); `prefer` sends the `SSLRequest`, secures the connection WITHOUT verifying the
-//!   certificate on `S` and goes on in plaintext on `N` (libpq).
-//! - No partitioning, LISTEN/NOTIFY-accelerated hydration or column-level secret grants: all three
-//!   are internal and can be added without a schema bump.
 
 #![forbid(unsafe_code)]
 
@@ -46,8 +22,6 @@ use postgres_types::ToSql;
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
 
-// postgres driver error -> the api's backend-agnostic `RecordStoreError` (the contract crate stays
-// storage-free, so the `From` impl that powers `?` cannot live there).
 trait IntoStoreResult<T> {
     fn store(self) -> RecordStoreResult<T>;
 }
@@ -58,7 +32,7 @@ impl<T> IntoStoreResult<T> for Result<T, pgwire::Error> {
 }
 
 /// Render a driver error with its CAUSE: `Display` for a server-side failure is just "db error".
-/// The server's `detail` is deliberately omitted (on a unique violation it holds ROW VALUES).
+
 fn render_pg_error(e: &pgwire::Error) -> String {
     match e.as_db_error() {
         Some(db) => {
@@ -73,30 +47,15 @@ fn render_pg_error(e: &pgwire::Error) -> String {
 }
 
 /// True when a postgres error is SQLSTATE 42P01 (`undefined_table`), the ONE case `migrate()` reads
-/// as an unversioned database; any other class must never be read as "fresh" and drop a populated one.
+
 fn is_undefined_table(e: &pgwire::Error) -> bool {
     e.code().map(pgwire::SqlState::code) == Some(pgwire::SqlState::UNDEFINED_TABLE)
 }
 
 /// Store schema version. A database older than v6 is refused: no release ever wrote one. v6 -> v19
-/// upgrades in place:
-/// - v10: `keys` gains `idp_subject`/`binding_mode`/`minted_by`/`idp_provider`/
-///   `allowed_scopes_by_kind`; open usage units get `usage_ledger_units` and `usage_metering_units`;
-///   `usage_metering.priced_from_ms` joins its key; the kind-tagged `plane_records`, `plane_chain`
-///   and `plane_tokens`.
-/// - v11-v13: `store_ops` (the durable `op_id` dedupe log) and `store_records`.
-/// - v14: `plane_chain.has_parent` (a parentless append is stored under its own id, unlisted as a
-///   parent).
-/// - v15: erase historical revoked-credential secrets, preserving revocation metadata.
-/// - v16: credential timestamps use their complete u64 bit pattern in the BIGINT column.
-/// - v17: usage-window and metering-bucket keys retain their complete u64 bit pattern.
-
-/// - v18: metering parent and unit keys retain historical group and pricing version.
-/// - v19: raw usage counters retain the complete unsigned domain for exact corrections.
 
 pub const SCHEMA_VERSION: i64 = 19;
 
-// Built-in ticket records store an absolute expiry in ts.
 const TICKET_RECORD_KIND: &str = "ticket";
 
 /// How many times the migration transaction runs when it is chosen as a deadlock victim.
@@ -106,15 +65,14 @@ const MIGRATE_ATTEMPTS: u32 = 3;
 const FIRST_RELEASED_SCHEMA: i64 = 6;
 
 /// The plane-record kinds whose retention is TERMINAL-ONLY: `purge_plane_records_before` drops a
-/// row of one only once its `disposition` is `Terminal` (an interrupted task waiting on a human sits
-/// still longest). Every other kind drops any row older than the cutoff.
+
 const TERMINAL_ONLY_RETENTION_KINDS: [&str; 1] = ["task"];
 
 /// Rows one purge statement removes (and the ids it holds).
 const PURGE_BATCH: i64 = 1000;
 
 /// `(parent kind, child kind)`: purging a parent takes the child CHAIN hanging off it in the same
-/// transaction (a task's event chain has no retention path of its own).
+
 const PLANE_CHILD_KINDS: [(&str, &str); 1] = [("task", "task_event")];
 
 const SCHEMA: &str = "
@@ -318,8 +276,7 @@ ALTER TABLE usage_metering ADD COLUMN IF NOT EXISTS priced_from_ms BIGINT NOT NU
 ";
 
 /// Postgres `Store` backend (durable, shared across a cluster): the parsed connection settings and
-/// the kept connection, reached over the host's connector, so the store opens no socket of its own.
-/// The schema is ensured once, by `open`'s connect step.
+
 pub struct PostgresStore {
     shared: std::sync::Arc<Shared>,
 }
@@ -334,10 +291,8 @@ pub(crate) struct Shared {
     /// When this instance last swept `store_ops` past its retention (`v3`).
     pub(crate) ops_swept_at: AtomicU64,
     /// The instance's kept connections, bounded at [`KEPT_CONNECTIONS`] (there is no pool setting).
-    /// An op waits for one while all are held.
     pub(crate) pool: std::sync::Arc<busbar_contract::abi::sdk::store::wire::Pool>,
     /// The endpoint (an index into the DSN's list) that last connected: the next connect tries it
-    /// first, so a failover DSN keeps asking for the kept connection's own endpoint.
     pub(crate) endpoint: std::sync::atomic::AtomicUsize,
 }
 
@@ -355,8 +310,7 @@ impl std::ops::Deref for Session {
 }
 
 /// The four RESERVED unit classes, in the order of the `usage_ledger` token columns
-/// (`tokens_input`, `tokens_output`, `tokens_cache_read`, `tokens_cache_write`). Every other unit
-/// class is an OPEN one and lives in `usage_ledger_units`.
+
 const RESERVED_COLUMNS: [&str; 4] = [UNIT_INPUT, UNIT_OUTPUT, UNIT_CACHE_READ, UNIT_CACHE_WRITE];
 
 fn is_reserved_unit(unit: &str) -> bool {
@@ -364,7 +318,7 @@ fn is_reserved_unit(unit: &str) -> bool {
 }
 
 /// Current Unix time in seconds (0 before the epoch): the one source of wall-clock stamps, so no
-/// write path binds a nearby BIGINT such as `revision` to a timestamp column.
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -374,7 +328,7 @@ fn now_secs() -> u64 {
 
 impl PostgresStore {
     /// Capture a borrowed DSN's password before parsing public connection options. Authentication
-    /// and peer-error redaction use the sealed SDK credential; the store keeps no plaintext copy.
+
     pub fn new(conn_str: &str) -> RecordStoreResult<Self> {
         let config =
             pgwire::Config::parse(conn_str).map_err(|e| RecordStoreError(e.to_string()))?;
@@ -405,8 +359,7 @@ impl PostgresStore {
 
 impl Session {
     /// Open one op's connection over `wire`: connect through the host's connector, secure it when
-    /// the settings ask, authenticate. A failure is the driver's words (`error connecting to
-    /// server: ...`, or the server's SQLSTATE and message), scrubbed of the DSN password.
+
     pub(crate) async fn open(
         wire: busbar_contract::abi::sdk::store::wire::Wire,
         shared: std::sync::Arc<Shared>,
@@ -421,7 +374,7 @@ impl Session {
     }
 
     /// The op is done: its connection is kept for the next op if the session is idle, else
-    /// discarded ([`Client::release`]).
+
     pub(crate) async fn close(mut self) {
         self.client.release().await;
     }
@@ -431,7 +384,7 @@ impl Session {
     }
 
     /// Open a transaction with ONE consistent snapshot (REPEATABLE READ, not READ COMMITTED's
-    /// per-statement snapshot, which tears multi-statement reads like `get_usage`).
+
     pub(crate) async fn snapshot_consistent_tx<'a>(
         client: &'a mut Client,
     ) -> RecordStoreResult<Transaction<'a>> {
@@ -443,7 +396,7 @@ impl Session {
             .store()
     }
 
-    const MIGRATE_LOCK_KEY: i64 = 0x6275_7362_6172_5f70; // ASCII "busbar_p"
+    const MIGRATE_LOCK_KEY: i64 = 0x6275_7362_6172_5f70;
 
     pub(crate) async fn migrate(&mut self) -> RecordStoreResult<()> {
         let client = self.client();
@@ -461,8 +414,7 @@ impl Session {
                 Self::MIGRATE_LOCK_KEY
             ))
             .await;
-        // Report a migration failure first; but an unlock failure after a successful migration must
-        // not be swallowed: a held session advisory lock can hang a sibling node's connect.
+
         match (result, unlocked) {
             (Ok(()), Err(e)) => Err(RecordStoreError(format!(
                 "migrate: schema migration succeeded but releasing the advisory lock failed ({e}); \
@@ -486,12 +438,8 @@ impl Session {
             Err(e) if is_undefined_table(&e) => 0,
             Err(e) => return Err(RecordStoreError(render_pg_error(&e))),
         };
-        // ALREADY CURRENT: run no DDL. Every node migrates on connect, and `CREATE INDEX IF NOT EXISTS`
-        // takes a SHARE lock before it finds the index exists, in the opposite order to `delete_key`
-        // (observed: `40P01` deadlock against a node merely connecting).
+
         if version > SCHEMA_VERSION {
-            // A newer build owns this database: this one would ignore its newer rules (the epoch
-            // fence among them), so it must not serve it.
             return Err(RecordStoreError(format!(
                 "postgres store: database schema v{version} is newer than this build \
                  (v{SCHEMA_VERSION}); refusing to open"
@@ -506,8 +454,7 @@ impl Session {
                  oldest released schema; refusing to open"
             )));
         }
-        // A rolling upgrade can deadlock (40P01) this DDL against an old node's `delete_key`, which
-        // takes its locks in the other order: the victim is this transaction, and it is retried.
+
         let mut attempt = 1;
         loop {
             match Self::migrate_tx(client, version).await {
@@ -521,8 +468,6 @@ impl Session {
         let mut tx = client.transaction().await.store()?;
         tx.batch_execute(SCHEMA).await.store()?;
         if version < 17 {
-            // Older supported writers emitted only nonnegative keys. Preserve those bits,
-            // including an already-clamped MAX whose original input cannot be reconstructed.
             let incompatible: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM usage_windows WHERE window_start < 0)
@@ -545,9 +490,6 @@ impl Session {
             }
         }
         if version < 16 {
-            // Supported older writes produced nonnegative timestamps only. Those bits are already
-            // the v16 encoding; a negative historical value has unknown provenance, so refuse it.
-            // An old saturated MAX stays MAX: its original input cannot be reconstructed.
             let incompatible: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM credentials WHERE created_at < 0 OR updated_at < 0
@@ -566,14 +508,10 @@ impl Session {
                 ));
             }
         }
-        // v10: `SCHEMA`'s `CREATE TABLE IF NOT EXISTS` never alters an existing table, so on a v6
-        // database these statements ARE the upgrade. Gated on crossing INTO v10 because `ALTER TABLE`
-        // takes an ACCESS EXCLUSIVE lock even as a no-op, and every node's connect runs `migrate()`.
-        // One transaction with the version stamp, so a crash re-runs it from the start.
+
         if version < 10 {
             tx.batch_execute(MIGRATE_V10_COLUMNS).await.store()?;
-            // `priced_from_ms` joins the metering primary key; every existing row carries 0, so the
-            // old key was already unique and the widened key admits every row unchanged.
+
             tx.batch_execute(
                 "ALTER TABLE usage_metering DROP CONSTRAINT IF EXISTS usage_metering_pkey;
                  ALTER TABLE usage_metering ADD CONSTRAINT usage_metering_pkey
@@ -582,9 +520,7 @@ impl Session {
             .await
             .store()?;
         }
-        // v13: the deleted slots' tables and `op_id` rows go (digest bodies carry no ':'), but only
-        // from a pre-release v11/v12 database that made them: elsewhere a table of that name is
-        // another application's.
+
         if (11..13).contains(&version) {
             tx.batch_execute(
                 "DROP TABLE IF EXISTS money_slices;
@@ -599,8 +535,7 @@ impl Session {
             .await
             .store()?;
         }
-        // Before v14, None and Some(id) both stored parent=id. Opaque bodies cannot restore
-        // the missing presence bit. Refuse ambiguous rows before changing their interpretation.
+
         if version < 14 {
             let ambiguous: bool = tx
                 .query_one(
@@ -649,7 +584,6 @@ impl Session {
             }
         }
         if version < 18 {
-            // The old parent key identifies the sole recorded attribution; no history is guessed.
             let orphan: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM usage_metering_units u
@@ -712,9 +646,7 @@ impl Session {
     }
 
     /// Bump and return the store-global revision inside the caller's open transaction. Acquire this
-    /// row before any key/credential row lock; a compare-only operation may lock it with SELECT
-    /// first and increment only after its comparison succeeds.
-    /// Serialize a conditional decision with every revision-ordered writer without spending a revision.
+
     async fn lock_revision(tx: &mut Transaction<'_>) -> RecordStoreResult<()> {
         tx.query_one(
             "SELECT revision FROM store_revision WHERE only_row FOR UPDATE",
@@ -787,7 +719,7 @@ fn usage_add(a: &str, b: &str) -> String {
 
 fn usage_count(row: &Row, column: usize) -> RecordStoreResult<u64> {
     let text: String = row.try_get(column).store()?;
-    // Preserve the legacy treatment of a hand-edited negative counter as zero.
+
     if text.starts_with('-') {
         return Ok(0);
     }
@@ -795,7 +727,6 @@ fn usage_count(row: &Row, column: usize) -> RecordStoreResult<u64> {
         .map_err(|_| RecordStoreError("invalid unsigned usage counter".into()))
 }
 
-// Equality keys keep all bits; range comparisons must compare the sign partitions unsigned.
 fn usage_key(value: u64) -> i64 {
     value as i64
 }
@@ -819,10 +750,9 @@ fn secret_form_from_storage(s: &str) -> SecretForm {
 
 const CRED_META_COLUMNS: &str = "id,key_id,kind,slot,public_id,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision";
 /// The row index of `secret` in `SELECT {CRED_META_COLUMNS},secret ...`: the column count of
-/// CRED_META_COLUMNS. Guarded by `cred_secret_column_index_matches_cred_meta_columns_count`.
+
 const CRED_SECRET_COLUMN_INDEX: usize = 12;
 
-// Timestamp bits are bijective over u64; signed counter saturation is a different storage rule.
 fn credential_timestamp(value: u64) -> i64 {
     value as i64
 }
@@ -855,7 +785,7 @@ fn row_to_cred_meta(r: &Row) -> RecordStoreResult<CredentialMeta> {
 }
 
 /// The `keys` upsert both key writes run; the conflict branch's `WHERE` is the tombstone
-/// precondition (a write not carrying a tombstone never overwrites one).
+
 const KEY_UPSERT: &str = "INSERT INTO keys
         (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,
          idp_subject,binding_mode,minted_by,allowed_scopes_by_kind,idp_provider)
@@ -923,17 +853,12 @@ impl Session {
         let client = self.client();
         let mut tx = client.transaction().await.store()?;
         let rev = Self::next_revision(&mut tx).await?;
-        // The conflict branch's `WHERE` is the TOMBSTONE PRECONDITION: a live-shaped write must not
-        // overwrite a tombstoned row (that would reissue a never-reissued id and revive its tokens).
-        // It rides on the statement, not a prior SELECT, so under READ COMMITTED it closes the TOCTOU
-        // window. A write that CARRIES a tombstone still applies.
+
         let changed = tx
             .execute(KEY_UPSERT, &cols.params(key, &rev))
             .await
             .store()?;
         if changed == 0 {
-            // The conflict branch matched a row but its WHERE rejected the write: the stored row is
-            // tombstoned and this one is not. That is the only way to reach 0 here.
             return Err(RecordStoreError(format!(
                 "put_key: '{}' is tombstoned and its id is never reissued; refusing to clear the \
                  tombstone",
@@ -951,9 +876,6 @@ impl Session {
     }
 
     pub(crate) async fn list_keys(&mut self) -> RecordStoreResult<Vec<VirtualKey>> {
-        // Deliberately UNFILTERED (tombstoned rows included) -- see the trait doc: this serves both
-        // the admin-listing caller (which filters deleted_at.is_none() itself) and list_keys_since's
-        // default fallback, which needs tombstones visible to drive credential eviction downstream.
         let sql = format!("SELECT {KEY_COLUMNS} FROM keys ORDER BY created_at, id");
         let rows = self.client().query(&sql, &[]).await.store()?;
         rows.iter().map(row_to_key).collect()
@@ -971,10 +893,6 @@ impl Session {
     }
 
     pub(crate) async fn delete_key(&mut self, id: &str) -> RecordStoreResult<()> {
-        // TOMBSTONE: the `keys` row survives (attribution keeps resolving) and every credential row
-        // is destroyed, in ONE transaction under the SAME revision, so any one statement sees the
-        // delete whole or not at all; a consumer reading `keys` and `credentials` in two statements
-        // closes the gap between them itself (see `list_credentials_since`).
         let client = self.client();
         let mut tx = client.transaction().await.store()?;
         Self::lock_revision(&mut tx).await?;
@@ -989,26 +907,21 @@ impl Session {
             .transpose()?;
         match already_deleted {
             None => {
-                // Unknown id is an ERROR, unlike already-tombstoned: answering Ok would tell an operator
-                // who typo'd an id that a key was revoked when none was.
                 return Err(RecordStoreError(format!("delete_key: unknown id '{id}'")));
             }
             Some(true) => {
-                // Already tombstoned: no-op, not an error.
                 tx.commit().await.store()?;
                 return Ok(());
             }
             Some(false) => {}
         }
         let rev = Self::next_revision(&mut tx).await?;
-        // `deleted_at` is a wall-clock stamp and `revision` a counter; both BIGINT, so binding one
-        // value to both would compile and pass every "is tombstoned" check. Bound separately
-        // (`delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision`).
+
         let now = clamp(now_secs());
         tx.execute("DELETE FROM credentials WHERE key_id=$1", &[&id])
             .await
             .store()?;
-        // Keep the tombstone precondition on the statement as well as the revision-locked read.
+
         tx.execute(
             "UPDATE keys SET enabled=FALSE, deleted_at=$2, revision=$3 \
                  WHERE id=$1 AND deleted_at IS NULL",
@@ -1066,9 +979,7 @@ impl Session {
             )
             .await
             .store()?;
-        // One ModelTokens per model, in model order. The four reserved classes come off their
-        // columns and every open class off `usage_ledger_units`, all into the one name-keyed map.
-        // Zero counts are left out, so the map stays sparse the way busbar's own ledger keeps it.
+
         let mut models: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
         for r in &rows {
             let units = models
@@ -1222,7 +1133,6 @@ impl Session {
                 tx.execute(&sql, &params).await.store()?;
             }
 
-            // The OPEN unit classes: an absolute set too (the window's rows were cleared above).
             let opens: Vec<(&String, &String, String)> = ledger
                 .models
                 .iter()
@@ -1257,9 +1167,7 @@ impl Session {
                         params.push(*unit);
                         params.push(count);
                     }
-                    // Two ModelTokens entries for one model never reach this statement: the
-                    // reserved-column INSERT above has no ON CONFLICT, so it refuses them (23505)
-                    // first.
+
                     sql.push_str(
                         " ON CONFLICT (bucket_id, window_start, model, unit) DO UPDATE SET \
                      count = usage_ledger_units.count + EXCLUDED.count",
@@ -1277,8 +1185,7 @@ impl Session {
         bucket: u64,
     ) -> RecordStoreResult<Vec<MeteringRow>> {
         let client = self.client();
-        // ONE snapshot for both reads, so a row's open classes are never read from a different
-        // moment than its token columns.
+
         let mut tx = Self::snapshot_consistent_tx(client).await?;
         let rows = Self::list_metering_in(&mut tx, bucket).await?;
         tx.commit().await.store()?;
@@ -1383,8 +1290,7 @@ impl Session {
         }
         let client = self.client();
         let mut tx = client.transaction().await.store()?;
-        // Every key/credential writer takes this row first. Lock without incrementing so a
-        // failed comparison spends no revision and cannot race a revoke, delete, or slot mint.
+
         Self::lock_revision(&mut tx).await?;
         let owner_live: bool = tx
             .query_one(
@@ -1448,9 +1354,6 @@ impl Session {
         key: &VirtualKey,
         secret: &CredentialSecret,
     ) -> RecordStoreResult<()> {
-        // ATOMIC mint: the bearer key and its credential commit together or not at all. A mint
-        // supplies no tombstone, and the credential hangs off this key: refused up front, nothing
-        // written.
         if key.deleted_at.is_some() {
             return Err(RecordStoreError(format!(
                 "put_key_with_credential: key '{}' is tombstoned; a credential is never minted \
@@ -1469,8 +1372,7 @@ impl Session {
         let client = self.client();
         let mut tx = client.transaction().await.store()?;
         let rev = Self::next_revision(&mut tx).await?;
-        // The same TOMBSTONE PRECONDITION as `put_key`, where it matters most: re-minting over a
-        // tombstoned id must be REFUSED, not clear the tombstone and revive every earlier token.
+
         let changed = tx
             .execute(KEY_UPSERT, &cols.params(key, &rev))
             .await
@@ -1515,19 +1417,13 @@ impl Session {
             .try_get(0)
             .store()?;
         if !exists {
-            // NOT idempotent-success: a silent no-op lets an operator believe a leaked secret was
-            // killed. Minting into a revoked slot rewrites the row's primary key, so an id from an
-            // earlier `list_credentials` can stop resolving; success there would leave the credential
-            // authenticating with the audit trail saying it was revoked.
             return Err(RecordStoreError(format!(
                 "revoke_credential: unknown id '{id}'"
             )));
         }
         let rev = Self::next_revision(&mut tx).await?;
         let now = credential_timestamp(now_secs());
-        // `AND revoked_at IS NULL` in the UPDATE's own WHERE: a clean repeat revoke is a true no-op
-        // (no row revision bump, no rewritten reason) and, under READ COMMITTED's row-lock re-check, safe
-        // against a concurrent revoke of the same id.
+
         let changed = tx
             .execute(
                 "UPDATE credentials SET revoked_at=$2, revoke_reason=$3, updated_at=$2, revision=$4,
@@ -1546,10 +1442,7 @@ impl Session {
             )
             .await
             .store()?;
-            // Zero rows is ambiguous: a concurrent mint into the freed slot can rewrite this row's
-            // PRIMARY KEY (`put_credential_tx` sets `id=EXCLUDED.id`) between the EXISTS above and
-            // this UPDATE, and reporting success then is "revoked, yet still authenticating". So ask
-            // again, inside this transaction.
+
             let still_exists: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM credentials WHERE id=$1)",
@@ -1560,15 +1453,10 @@ impl Session {
                 .try_get(0)
                 .store()?;
             if !still_exists {
-                // Deleted (a `delete_key` cascade) or re-keyed by a mint since the check above:
-                // no row answers to this id any more.
                 return Err(RecordStoreError(format!(
                     "revoke_credential: unknown id '{id}'"
                 )));
             }
-            // An already-clean revoked row is unchanged; a historical secret is erased without
-            // rewriting its original revocation. A clean row leaves the revision unused (gaps are
-            // allowed in the monotonic counter).
         }
         tx.commit().await.store()?;
         Ok(())
@@ -1620,7 +1508,6 @@ impl Session {
     }
 
     pub(crate) async fn add_denylist(&mut self, sub: &str, reason: &str) -> RecordStoreResult<()> {
-        // `created_at` is a clock read, not the literal 0 (as store-sqlite writes).
         self.client()
             .execute(
                 "INSERT INTO denylist (sub, reason, created_at) VALUES ($1, $2, $3)
@@ -1641,23 +1528,15 @@ impl Session {
         rows.iter().map(|r| r.try_get(0).store()).collect()
     }
 
-    // The kind-tagged plane-record verbs. Generic over `kind`: an UPSERTED record lives in `plane_records` keyed `(kind, id)`, an
-    // APPENDED one in `plane_chain` keyed `(kind, parent, seq)`. Identity, ordering and retention
-    // read only the typed sidecar columns, never the body.
-
     pub(crate) async fn upsert_plane_record(
         &mut self,
         record: PlaneRecordRef<'_>,
     ) -> RecordStoreResult<()> {
-        // This store binds owned rows: the one copy of the borrowed view happens here.
         let record = &record.to_record();
-        // REFUSED rather than clamped: `clamp` pins a value above i64::MAX, so the row read back
-        // would not be the row written and nothing would ever report it.
+
         let seq = storable_i64("upsert_plane_record", "seq", record.seq)?;
         let ts = storable_i64("upsert_plane_record", "ts", record.ts)?;
-        // UPSERT BY (kind, id): the engine writes through on EVERY transition, so a second write
-        // for one id REPLACES the row — the sidecar columns included, which is how a terminal
-        // transition reaches the retention sweep and the liveness check.
+
         self.client()
             .execute(
                 "INSERT INTO plane_records (kind, id, parent, seq, ts, disposition, body)
@@ -1685,10 +1564,6 @@ impl Session {
         kind: &str,
         id: &str,
     ) -> RecordStoreResult<Option<Vec<u8>>> {
-        // No principal filter, deliberately: caller scoping is ENGINE-side, because an
-        // authorization check living in the backend is one an unauthorized reader bypasses by
-        // configuring a different backend.
-        // An upserted record, else a parentless append at seq 0 (stored under its own id).
         let row = self
             .client()
             .query_opt(
@@ -1710,9 +1585,6 @@ impl Session {
         kind: &str,
         selector: &PlaneSelector<'_>,
     ) -> RecordStoreResult<Vec<Vec<u8>>> {
-        // ONE statement (one snapshot) over both tables, in one order: (seq, identity), the
-        // identity being an upserted record's id and an appended record's chain (its parent, or
-        // its own id when it has none).
         let rows = match selector {
             PlaneSelector::All => {
                 self.client()
@@ -1726,7 +1598,7 @@ impl Session {
                     )
                     .await
             }
-            // Oldest-first by seq: the order the engine's chain verifier reads a parent's chain.
+
             PlaneSelector::Parent(p) => {
                 let p: &str = p;
                 self.client()
@@ -1753,8 +1625,6 @@ impl Session {
         &mut self,
         kind: &str,
     ) -> RecordStoreResult<Vec<String>> {
-        // The boot enumeration a restart resumes chains from: every parent holding a record of
-        // `kind`, each exactly once.
         let rows = self
             .client()
             .query(
@@ -1774,8 +1644,6 @@ impl Session {
         kind: &str,
         before: u64,
     ) -> RecordStoreResult<u64> {
-        // The age-only entry: the kinds in TERMINAL_ONLY_RETENTION_KINDS have always dropped only
-        // their TERMINAL rows here, every other kind every row older than `before`.
         let retention = if TERMINAL_ONLY_RETENTION_KINDS.contains(&kind) {
             Retention::TerminalOnly
         } else {
@@ -1790,10 +1658,6 @@ impl Session {
         before: u64,
         retention: Retention,
     ) -> RecordStoreResult<u64> {
-        // STRICTLY older than the cutoff: a row exactly at `before` is kept. WHICH rows go is the
-        // rule the call carries (never one inferred from the kind's name), read off the typed
-        // `disposition` column and never out of the body.
-
         let terminal_only = retention == Retention::TerminalOnly;
         let client = self.client();
         let mut tx = client.transaction().await.store()?;
@@ -1804,8 +1668,7 @@ impl Session {
         };
         let cutoff = clamp(before);
         let above_sql_maximum = before > i64::MAX as u64;
-        // In batches, so no more than `PURGE_BATCH` ids are ever held or bound at once; each
-        // batch takes its own child chains.
+
         let mut purged = 0_u64;
         loop {
             let ids: Vec<String> = tx
@@ -1830,9 +1693,7 @@ impl Session {
                 .iter()
                 .map(|r| r.try_get(0).store())
                 .collect::<RecordStoreResult<_>>()?;
-            // CASCADE, in the SAME transaction: a purged parent's child chain goes with it, and
-            // only the chains under a record that actually went, so this can never be a second,
-            // wider retention rule in disguise.
+
             if !ids.is_empty() {
                 for (_, child) in PLANE_CHILD_KINDS.iter().filter(|(p, _)| *p == kind) {
                     tx.execute(
@@ -1872,7 +1733,7 @@ impl Session {
             }
         }
         tx.commit().await.store()?;
-        // `execute`/`RETURNING` report the rows actually removed, so the count is one performed.
+
         Ok(purged + chain)
     }
 
@@ -1881,9 +1742,6 @@ impl Session {
         kind: &str,
         id: &str,
     ) -> RecordStoreResult<()> {
-        // Absent is a NO-OP, not an error: the engine clears on every observation that agrees with
-        // the operator rather than tracking whether it had written one. A chain whose parent is
-        // `id` goes too, so deleting a record cannot leave part of its chain behind.
         let client = self.client();
         let mut tx = client.transaction().await.store()?;
         tx.execute(
@@ -1898,7 +1756,7 @@ impl Session {
         )
         .await
         .store()?;
-        // The purge's cascade: a parent's child chain goes with it.
+
         for (_, child) in PLANE_CHILD_KINDS.iter().filter(|(p, _)| *p == kind) {
             tx.execute(
                 "DELETE FROM plane_chain WHERE kind=$1 AND parent=$2",
@@ -1951,7 +1809,7 @@ impl Session {
     ) -> RecordStoreResult<bool> {
         const REPLAY_TOKEN_LOCK_DOMAIN: &str = "busbar:replay-token";
         let mut tx = self.client().transaction().await.store()?;
-        // Serialize the kind's sweep and claim before sampling the database's current time.
+
         tx.query_one(
             "SELECT pg_advisory_xact_lock(hashtextextended(ROW($1::text,$2::text)::text,0))",
             &[&REPLAY_TOKEN_LOCK_DOMAIN, &kind],
@@ -1964,7 +1822,7 @@ impl Session {
             tx.rollback().await.store()?;
             return Ok(false);
         }
-        // Preserve the existing never-expiring representation; no timestamp encoding changes.
+
         let expires = i64::try_from(expires_at).unwrap_or(i64::MAX);
         tx.execute(
             "DELETE FROM plane_tokens WHERE kind=$1 AND expires_at < $2",
@@ -2013,8 +1871,7 @@ impl Session {
             tx.commit().await.store()?;
             return Ok(live);
         }
-        // MULTI-use and SPENDS NOTHING: a plain read of the `(kind, token)` upserted record, live only
-        // while present, `Active`, and at or before `expires_at`. Asking twice answers the same twice.
+
         if now > expires_at {
             return Ok(false);
         }
@@ -2057,11 +1914,7 @@ fn row_to_audit(r: &Row) -> RecordStoreResult<AuditRecord> {
 
 impl Session {
     /// Shared body of `put_credential`/`put_key_with_credential` (`op` names the caller in every
-    /// refusal): upsert on `(key_id, kind, slot)`. `Ok(true)` once a row was written, `Ok(false)`
-    /// for an identical live credential put again (nothing written; the caller drops the
-    /// transaction). Refused: a revoked id (never re-minted), a live occupant of the slot with
-    /// other content (revoke it first), a `public_id` another credential holds. A REVOKED occupant
-    /// of the slot is replaced.
+
     async fn put_credential_tx(
         tx: &mut Transaction<'_>,
         op: &str,
@@ -2069,11 +1922,7 @@ impl Session {
     ) -> RecordStoreResult<bool> {
         let m = &secret.meta;
         let rev = Self::next_revision(tx).await?;
-        // The owning key must EXIST and be LIVE. Checked AFTER `next_revision`, which is what makes it
-        // atomic: every mutating transaction takes the single `store_revision` row lock first, so a
-        // concurrent `delete_key` has either committed before this read (and this sees the tombstone)
-        // or cannot start its cascade until this mint commits (and then removes it). The same lock
-        // makes the credential checks below race-free.
+
         let owner_live: Option<bool> = tx
             .query_opt(
                 "SELECT deleted_at IS NULL FROM keys WHERE id=$1",
@@ -2115,7 +1964,7 @@ impl Session {
                  revoke it first"
             ))
         };
-        // This id, wherever it sits: revoked is never re-minted; live is a retry when identical.
+
         if let Some(r) = tx
             .query_opt(
                 "SELECT key_id, kind, slot, public_id, secret, secret_form, created_at, updated_at,
@@ -2157,7 +2006,7 @@ impl Session {
             }
             return Err(live_refused(&stored.0, &stored.1, stored.2));
         }
-        // The slot: a live occupant (another id) is refused; a revoked one is replaced below.
+
         let occupant: Option<bool> = tx
             .query_opt(
                 "SELECT revoked_at IS NOT NULL FROM credentials
@@ -2171,7 +2020,7 @@ impl Session {
         if occupant == Some(false) {
             return Err(live_refused(&m.key_id, &m.kind, slot));
         }
-        // UNIQUE (kind, public_id), across keys; the revoked occupant being replaced holds no clash.
+
         let holder = tx
             .query_opt(
                 "SELECT key_id, slot FROM credentials WHERE kind=$1 AND public_id=$2",
@@ -2222,7 +2071,7 @@ impl Session {
 /// The writes the store v3 `op_id` slots run inside their dedupe transaction ([`v3`]).
 impl Session {
     /// `add_usage` inside the caller's transaction (the store v3 `op_id` writes and batches run
-    /// it with their dedupe record, in one transaction).
+
     pub(crate) async fn add_usage_in(
         tx: &mut Transaction<'_>,
         bucket_id: &str,
@@ -2245,10 +2094,7 @@ impl Session {
         )
         .await
         .store()?;
-        // `UsageDelta.models` may name one model twice and `apply_delta` folds the entries in order,
-        // flooring after each; one `UPDATE .. FROM (VALUES ..)` applies only one joined row per target.
-        // So apply in ROUNDS: round k holds the k-th occurrence of each model, and a delta without
-        // duplicates is exactly one round.
+
         let mut rounds: Vec<Vec<&busbar_contract::records::ModelTokensDelta>> = Vec::new();
         let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for m in &delta.models {
@@ -2263,10 +2109,6 @@ impl Session {
             .iter()
             .flat_map(|models| models.chunks((pgwire::MAX_BIND_PARAMETERS - 2) / 5))
         {
-            // TWO batched statements, so a NEGATIVE delta (a refund) lands: `INSERT .. ON CONFLICT DO
-            // UPDATE` can only add `EXCLUDED.col`, which is floored at 0 for a first-seen model, so a
-            // refund was lost. Instead ensure every model's row exists at zero, then apply the SIGNED
-            // deltas in one UPDATE floored at 0, as `UsageLedger::apply_model_delta` does.
             let deltas: Vec<[i64; 4]> = models
                 .iter()
                 .map(|m| RESERVED_COLUMNS.map(|u| m.usage_units.get(u).copied().unwrap_or(0)))
@@ -2321,7 +2163,6 @@ impl Session {
             tx.execute(&ensure, &ensure_params).await.store()?;
             tx.execute(&update, &update_params).await.store()?;
 
-            // The OPEN unit classes, the same ensure-then-signed-update shape.
             let opens: Vec<(&String, &String, i64)> = models
                 .iter()
                 .flat_map(|m| {
@@ -2398,9 +2239,7 @@ impl Session {
         let requests = clamp(d.requests);
         let brequests = clamp(d.billable_requests);
         let priced_from = clamp(d.priced_from_ms);
-        // The old key fits the existing index. History stays unindexed TEXT, so adding it to
-        // the logical identity does not introduce an index-tuple limit for historical metadata.
-        // Hash collisions only serialize unrelated cells: every mutation compares the full key.
+
         tx.query_one(
             "SELECT pg_advisory_xact_lock(hashtextextended(ROW($1::text,$2::bigint,$3::text,$4::text,$5::bigint)::text,0))",
             &[&d.key_id, &bucket, &d.model, &d.provider, &priced_from],
@@ -2490,24 +2329,18 @@ impl Session {
     }
 
     /// `append_plane_record` inside the caller's transaction: `Ok(true)` once the record is stored
-    /// (or an identical one already was), `Ok(false)` when the conflicting row vanished before the
-    /// share lock held it (retry in a fresh transaction), `Err` on a fork.
+
     pub(crate) async fn append_plane_record_in(
         tx: &mut Transaction<'_>,
         record: &PlaneRecord,
     ) -> RecordStoreResult<bool> {
         let seq = storable_i64("append_plane_record", "seq", record.seq)?;
         let ts = storable_i64("append_plane_record", "ts", record.ts)?;
-        // The chain a child record hangs off: its parent, or (a parentless append) its own id —
-        // the same identity busbar's reference backends key a chain by.
+
         let parent = record.parent.as_deref().unwrap_or(record.id.as_str());
         let has_parent = record.parent.is_some();
         let disposition = disposition_to_storage(record.disposition);
-        // APPEND-ONLY. A record on an occupied (kind, parent, seq) is IDENTICAL (the write-through
-        // retrying: Ok) or DIFFERENT (a forked chain: an error), as any append-only chain settles a
-        // duplicate seq. The INSERT and the `FOR SHARE` read-back share one transaction so the conflicting row
-        // cannot be purged under the comparison; if it vanishes first this returns `Ok(false)`, never
-        // success, and the v3 caller turns that into a failure the kernel retries.
+
         let inserted = tx
             .execute(
                 "INSERT INTO plane_chain (kind, parent, seq, id, ts, disposition, body, has_parent)
@@ -2547,17 +2380,13 @@ impl Session {
                 if identical {
                     return Ok(true);
                 }
-                // Names the position and nothing else — it must not echo stored (or caller)
-                // content back.
+
                 Err(fork::chain_fork(&record.kind, parent, record.seq))
             }
             None => Ok(false),
         }
     }
 }
-
-// The plugin door: `v3` invokes `store_door!` over this store, which expands to `door`: a build that links this crate
-// registers it, and the sibling `busbar-store-postgres-plugin` cdylib exports it.
 
 mod v3;
 pub use v3::door;
