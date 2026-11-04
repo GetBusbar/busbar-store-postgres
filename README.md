@@ -42,10 +42,10 @@ explicitly in production; do not assume they move together.
 ### Upgrading an existing database
 
 The first connect of this build upgrades an existing database **in place**
-(schema v6 → this build's current schema, inside one transaction, under the same advisory lock every
+(schema v6 → v7, inside one transaction, under the same advisory lock every
 node's migration takes). The compatibility refusals below leave the migration
 transaction unchanged; accepted upgrades preserve existing row meanings except
-for the explicitly listed pre-release table removal and revoked-secret erasure:
+for the explicitly listed revoked-secret erasure:
 
 - `keys` gains `idp_subject`, `binding_mode`, `minted_by`, `idp_provider` (NULL for existing
   keys) and `allowed_scopes_by_kind`, which holds non-pool scope grants
@@ -61,50 +61,44 @@ for the explicitly listed pre-release table removal and revoked-secret erasure:
   plus the store v3 tables `store_ops` and `store_records` (op-id dedupe and
   the kernel's records). The store keeps ledger counts, not money: busbar
   derives money from the counts and its rate card.
-- Schema v13 drops the tables a pre-release v11/v12 build created for the
-  deleted store slots (`money_slots`, `money_slices`, `money_epoch`,
-  `store_journal`, `store_sessions`) and their op-id dedupe rows, and only when
-  upgrading from such a v11/v12 database: a fresh database or a released
-  v6-v10 one never loses a table of those names.
-- Schema v14 adds `plane_chain.has_parent`: new parentless appends are stored
+- The released v6 upgrade preserves tables owned by other applications. Unreleased development
+  schema markers above v7 are refused without deleting tables or operation records.
+- The v7 upgrade adds `plane_chain.has_parent`: new parentless appends are stored
   under their own ID and are not listed as parents. Earlier schemas stored
   both `parent=None` and `parent=Some(id)` as `parent=id`, losing the presence
-  bit. This build refuses a pre-v14 upgrade containing any such row, leaving
+  bit. This build refuses a released-v6 upgrade containing any such row, leaving
   its rows, schema and revision unchanged. Repair requires authoritative
   envelope provenance or a verified backup; neither kind, opaque body nor ID
   equality can establish the original relationship. Rows with `parent!=id`
   migrate as parented without changing their envelopes. This build refuses
   a database stamped with a newer schema at open.
-  Earlier pre-release v14-v16 builds instead guessed that `parent=id` meant
-  parentless. A database upgraded by that heuristic may already have lost
-  relationship information. This build cannot distinguish those rows from
-  legitimate new parentless rows and performs no automatic reconstruction or
-  data repair; affected deployments need the same authoritative provenance.
-- Schema v15 erases retained secret bytes from already-revoked credentials
+  Unreleased development layouts are not production upgrade baselines. Relationship repair
+  requires authoritative provenance; this build never guesses lost relationships.
+- The v7 upgrade erases retained secret bytes from already-revoked credentials
   and sets their secret form to `none`, preserving the revocation metadata.
   Scrubbed rows receive one shared new revision; a database with no dirty
   revoked credentials keeps its revision unchanged.
-- Schema v16 preserves all `u64` credential timestamps as bit patterns in the
+- The v7 upgrade preserves all `u64` credential timestamps as bit patterns in the
   existing BIGINT columns. Existing nonnegative values keep their meaning,
   including old values saturated at `i64::MAX`; their original input cannot be
-  recovered. Negative timestamps in a pre-v16 database are refused because
+  recovered. Negative timestamps in a released-v6 database are refused because
   their encoding is unknown. Counters and revisions keep their existing rules.
-- Schema v17 preserves every `u64` usage-window and metering-bucket key as its
+- The v7 upgrade preserves every `u64` usage-window and metering-bucket key as its
   complete bit pattern in the existing BIGINT columns. Equality and usage
   retention compare the original unsigned values; retention still preserves
   window zero and the exact cutoff. Existing nonnegative keys remain unchanged.
   Previously clamped keys remain at `i64::MAX`: their original identities cannot
   be recovered without authoritative external records. Negative usage keys in a
-  pre-v17 database are refused because their encoding is unknown.
+  released-v6 database are refused because their encoding is unknown.
 
-- Schema v18 includes `key_group_at_use` and `pricing_version` in metering identities,
+- The v7 upgrade includes `key_group_at_use` and `pricing_version` in metering identities,
   including each row's open units. Only the old identity fields remain indexed; a
   transaction advisory lock serializes writes for that old identity, and every update
   compares both complete historical values. History TEXT fields retain their former
   size range. The migration copies the attribution recorded on
   each legacy parent, preserving empty unknown values. Orphan units refuse migration;
   already-collapsed historical attribution cannot be reconstructed from these rows.
-- Schema v19 stores raw usage request and unit counters as `NUMERIC(20,0)` and
+- The v7 upgrade stores raw usage request and unit counters as `NUMERIC(20,0)` and
   reads and writes their complete `u64` domain. Signed accruals and refunds saturate
   at the `u64` bounds, matching `UsageLedger::apply_delta`; previously saturated
   counts retain their existing values. Metering counters retain their existing
