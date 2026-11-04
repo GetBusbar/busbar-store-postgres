@@ -103,7 +103,7 @@ fn legacy_metering(raw: &mut postgres::Client) {
          ALTER TABLE usage_metering_units ADD PRIMARY KEY (key_id,bucket,model,provider,priced_from_ms,unit);
          ALTER TABLE usage_metering DROP CONSTRAINT IF EXISTS usage_metering_pkey;
          ALTER TABLE usage_metering ADD PRIMARY KEY (key_id,bucket,model,provider,priced_from_ms);
-         DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (17);"
+         DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (6);"
     ).unwrap();
 }
 

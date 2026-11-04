@@ -123,7 +123,7 @@ fn v15_positive_timestamp_migration_changes_neither_row_bits_nor_revisions() {
     let before = revision(&store);
     store
         .lock()
-        .batch_execute("DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (15)")
+        .batch_execute("DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (6)")
         .unwrap();
     drop(store);
     let reopened = TestStore::open(&db.url()).unwrap();
@@ -150,7 +150,7 @@ fn v15_negative_timestamp_provenance_is_refused_without_partial_migration() {
             .unwrap();
         let before = revision(&store);
         store.lock().batch_execute(&format!(
-            "UPDATE credentials SET {field}=-1 WHERE public_id='public'; DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (15)"
+            "UPDATE credentials SET {field}=-1 WHERE public_id='public'; DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (6)"
         )).unwrap();
         drop(store);
         let error = TestStore::open(&db.url())
@@ -162,7 +162,7 @@ fn v15_negative_timestamp_provenance_is_refused_without_partial_migration() {
             "SELECT {field},(SELECT MAX(version) FROM busbar_schema),(SELECT revision FROM store_revision WHERE only_row) FROM credentials WHERE public_id='public'"
         ), &[]).unwrap();
         assert_eq!(unchanged.get::<_, i64>(0), -1);
-        assert_eq!(unchanged.get::<_, i64>(1), 15);
+        assert_eq!(unchanged.get::<_, i64>(1), FIRST_RELEASED_SCHEMA);
         assert_eq!(unchanged.get::<_, i64>(2), before);
     }
 }

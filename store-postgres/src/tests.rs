@@ -1414,18 +1414,18 @@ fn the_v13_drops_never_touch_a_fresh_or_a_released_database() {
         "a fresh open dropped another application's table"
     );
 
-    c.batch_execute("DELETE FROM busbar_schema; INSERT INTO busbar_schema (version) VALUES (10);")
+    c.batch_execute("DELETE FROM busbar_schema; INSERT INTO busbar_schema (version) VALUES (6);")
         .unwrap();
-    drop(connect_store_with_retry(&iso_url).expect("v10 upgrade"));
+    drop(connect_store_with_retry(&iso_url).expect("released v6 upgrade"));
     assert!(
         kept(&mut c),
-        "a v10 upgrade dropped another application's table"
+        "a released v6 upgrade dropped another application's table"
     );
 }
 
-/// Schema v13 drops the pre-release money/journal tables and their `op_id` rows (README); the kept
+/// An unreleased schema marker cannot authorize deleting tables or operation records.
 #[test]
-fn the_v13_upgrade_drops_the_money_and_dead_slot_tables() {
+fn an_unreleased_schema_is_refused_without_dropping_tables_or_operation_rows() {
     let Some(url) = live_url() else { return };
     let tmp = TempDb::create(&url, "spg_v13");
     let iso_url = tmp.url();
@@ -1451,7 +1451,13 @@ fn the_v13_upgrade_drops_the_money_and_dead_slot_tables() {
         )
         .unwrap();
     }
-    drop(connect_store_with_retry(&iso_url).expect("v12 upgrade"));
+    let error = match connect_store_with_retry(&iso_url) {
+        Ok(_) => {
+            panic!("an unreleased schema marker must not be treated as a production migration")
+        }
+        Err(error) => error,
+    };
+    assert!(error.contains("newer"));
     let mut c = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
     for t in [
         "money_slots",
@@ -1464,7 +1470,7 @@ fn the_v13_upgrade_drops_the_money_and_dead_slot_tables() {
             .query_one("SELECT to_regclass($1) IS NOT NULL", &[&t])
             .unwrap()
             .get(0);
-        assert!(!there, "{t} must be dropped by the v13 upgrade");
+        assert!(there, "refusing an unreleased schema must preserve {t}");
     }
     let kept: Vec<String> = c
         .query("SELECT body FROM store_ops ORDER BY body", &[])
@@ -1478,7 +1484,9 @@ fn the_v13_upgrade_drops_the_money_and_dead_slot_tables() {
             "abcdef0123",
             "add_metering_batch:x",
             "add_usage_batch:x",
-            "append_plane_record:x"
+            "append_batch:x",
+            "append_plane_record:x",
+            "reserve:cells"
         ]
     );
     let records: i64 = c
@@ -1490,7 +1498,7 @@ fn the_v13_upgrade_drops_the_money_and_dead_slot_tables() {
         .query_one("SELECT MAX(version) FROM busbar_schema", &[])
         .unwrap()
         .get(0);
-    assert_eq!(version, SCHEMA_VERSION);
+    assert_eq!(version, 12);
 }
 
 /// A malformed unsigned usage counter, or a NULL where the store reads a value, answers an
@@ -1674,7 +1682,7 @@ fn a_migration_deadlock_victim_is_retried() {
     drop(connect_store_with_retry(&iso_url).expect("fresh open"));
     let mut node = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
     node.batch_execute(
-        "DELETE FROM busbar_schema; INSERT INTO busbar_schema (version) VALUES (12);",
+        "DELETE FROM busbar_schema; INSERT INTO busbar_schema (version) VALUES (6);",
     )
     .unwrap();
 
@@ -2238,8 +2246,11 @@ fn legacy_revoked_secrets_are_scrubbed_on_upgrade_and_on_repeated_revoke() {
         if upgrade {
             let mut conn = store.lock();
             conn.execute("DELETE FROM busbar_schema", &[]).unwrap();
-            conn.execute("INSERT INTO busbar_schema(version) VALUES ($1)", &[&14_i64])
-                .unwrap();
+            conn.execute(
+                "INSERT INTO busbar_schema(version) VALUES ($1)",
+                &[&FIRST_RELEASED_SCHEMA],
+            )
+            .unwrap();
         }
         drop(store);
         let store = TestStore::open(&tmp.url()).unwrap();

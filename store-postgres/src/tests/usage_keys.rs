@@ -223,7 +223,7 @@ fn pre_v17_usage_keys_migrate_without_reinterpreting_existing_maximum_rows() {
     }
     store
         .lock()
-        .batch_execute("DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (16)")
+        .batch_execute("DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (6)")
         .unwrap();
     drop(store);
     let reopened = TestStore::open(&db.url()).unwrap();
@@ -271,7 +271,7 @@ fn pre_v17_negative_usage_key_provenance_is_not_silently_reinterpreted() {
             .lock()
             .batch_execute(&format!(
                 "UPDATE {table} SET {column}=-1;
-             DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (16)"
+             DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (6)"
             ))
             .unwrap();
         drop(store);
@@ -287,6 +287,6 @@ fn pre_v17_negative_usage_key_provenance_is_not_silently_reinterpreted() {
             )
             .unwrap();
         assert_eq!(row.get::<_, i64>(0), -1);
-        assert_eq!(row.get::<_, i64>(1), 16);
+        assert_eq!(row.get::<_, i64>(1), FIRST_RELEASED_SCHEMA);
     }
 }

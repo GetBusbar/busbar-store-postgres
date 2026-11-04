@@ -580,7 +580,7 @@ fn v18_usage_counters_migrate_in_place_before_exact_corrections_are_accepted() {
         )
         .unwrap();
 
-    const PRECISE_METERING_SCHEMA: i64 = 18;
+    const PRECISE_METERING_SCHEMA: i64 = FIRST_RELEASED_SCHEMA;
     store
         .lock()
         .execute(

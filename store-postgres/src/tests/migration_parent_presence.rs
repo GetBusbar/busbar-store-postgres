@@ -44,7 +44,7 @@ fn schemas(raw: &mut postgres::Client) -> Vec<i64> {
 fn legacy_v13(raw: &mut postgres::Client) {
     raw.batch_execute(
         "ALTER TABLE plane_chain DROP COLUMN has_parent;
-         DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (13)",
+         DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (6)",
     )
     .unwrap();
 }
@@ -155,9 +155,10 @@ fn pre14_unambiguous_parent_migrates_reopens_and_accepts_identical_replay() {
 }
 
 #[test]
-fn v14_and_later_presence_bits_are_preserved_without_guessed_reconstruction() {
+fn current_schema_presence_bits_are_preserved_without_guessed_reconstruction() {
     let Some(url) = live_url() else { return };
-    for version in [14_i64, 15, 16] {
+    let version = SCHEMA_VERSION;
+    {
         let db = TempDb::create(&url, "spg_parent_present");
         let store = TestStore::open(&db.url()).unwrap();
         let parentless = envelope("opaque", "alone", None);

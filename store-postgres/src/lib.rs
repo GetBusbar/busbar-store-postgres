@@ -51,7 +51,7 @@ fn is_undefined_table(e: &pgwire::Error) -> bool {
 }
 
 /// Store schema version. A database older than v6 is refused: no release ever wrote one. v6 -> v19
-pub const SCHEMA_VERSION: i64 = 19;
+pub const SCHEMA_VERSION: i64 = 7;
 
 const TICKET_RECORD_KIND: &str = "ticket";
 
@@ -455,7 +455,7 @@ impl Session {
     async fn migrate_tx(client: &mut Client, version: i64) -> RecordStoreResult<()> {
         let mut tx = client.transaction().await.store()?;
         tx.batch_execute(SCHEMA).await.store()?;
-        if version < 17 {
+        if version < SCHEMA_VERSION {
             let incompatible: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM usage_windows WHERE window_start < 0)
@@ -477,7 +477,7 @@ impl Session {
                 ));
             }
         }
-        if version < 16 {
+        if version < SCHEMA_VERSION {
             let incompatible: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM credentials WHERE created_at < 0 OR updated_at < 0
@@ -497,7 +497,7 @@ impl Session {
             }
         }
 
-        if version < 10 {
+        if version < SCHEMA_VERSION {
             tx.batch_execute(MIGRATE_V10_COLUMNS).await.store()?;
 
             tx.batch_execute(
@@ -524,7 +524,7 @@ impl Session {
             .store()?;
         }
 
-        if version < 14 {
+        if version < SCHEMA_VERSION {
             let ambiguous: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM plane_chain WHERE parent = id)",
@@ -548,7 +548,7 @@ impl Session {
             .await
             .store()?;
         }
-        if version < 15 {
+        if version < SCHEMA_VERSION {
             let dirty: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM credentials WHERE revoked_at IS NOT NULL
@@ -571,7 +571,7 @@ impl Session {
                 .store()?;
             }
         }
-        if version < 18 {
+        if version < SCHEMA_VERSION {
             let orphan: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM usage_metering_units u
