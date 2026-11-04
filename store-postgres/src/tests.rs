@@ -11,6 +11,7 @@ use busbar_contract::records::{
     PlaneSelector, RecordStore, SecretForm,
 };
 
+#[path = "tests/harness.rs"]
 mod harness;
 
 #[path = "tests/credential_rewrap.rs"]
@@ -1936,6 +1937,7 @@ fn two_nodes_opening_a_fresh_database_together_both_migrate_cleanly() {
 }
 
 /// The `Store` contract conformance suite — THIS crate's own copy, at `src/tests/store_conformance.rs`.
+#[path = "tests/store_conformance.rs"]
 mod store_conformance;
 
 /// The cross-backend `Store` conformance checks, answered by this backend — EVERY check the suite
@@ -2087,14 +2089,19 @@ mod conformance {
     }
 }
 
+#[path = "tests/plane_records.rs"]
 mod plane_records;
 
+#[path = "tests/v160_shapes.rs"]
 mod v160_shapes;
 
+#[path = "tests/credential_rules.rs"]
 mod credential_rules;
 
+#[path = "tests/v3_slots.rs"]
 mod v3_slots;
 
+#[path = "tests/tls.rs"]
 mod tls;
 
 #[test]
@@ -2393,8 +2400,10 @@ fn legacy_revoked_secrets_are_scrubbed_on_upgrade_and_on_repeated_revoke() {
     }
 }
 
+#[path = "tests/metering_attribution.rs"]
 mod metering_attribution;
 
+#[path = "tests/token_clock.rs"]
 mod token_clock;
 
 #[path = "../tests-support/postgres_io.rs"]
