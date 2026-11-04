@@ -3,7 +3,7 @@
 
 //! Tests for `pgwire.rs`.
 
-use super::{begin_sql, Config, IsolationLevel, SslMode};
+use super::*;
 
 #[test]
 fn a_url_parses_into_its_parts() {
