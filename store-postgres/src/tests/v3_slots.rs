@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store v3 slots ([`StoreSlots`]) against a live Postgres: durable `op_id` dedupe (S1-S4)
+//! across a reconnect, and the kernel-held records.
 
 use super::*;
 use busbar_contract::abi::sdk::store::dedupe::Dedupe;
@@ -39,6 +40,7 @@ fn store(url: &str) -> TestStore {
 }
 
 /// `open` is the settings' judge: every refusal starts `invalid postgres plugin config: `, a
+/// type error names the type and never the value.
 #[test]
 fn open_refuses_settings_without_a_url() {
     let want = "invalid postgres plugin config: `url` is required (a libpq connection string)";
@@ -91,6 +93,7 @@ fn open_refuses_settings_without_a_url() {
 }
 
 /// `validate` runs exactly `open`'s parse, the connection string's included, and connects to
+/// nothing; a URL refusal carries the `url: ` prefix.
 #[test]
 fn validate_refuses_what_open_refuses() {
     for settings in [
@@ -125,6 +128,7 @@ fn validate_refuses_what_open_refuses() {
 }
 
 /// Host markers are resolved by settings_lent while the host owns the borrowed bytes; the
+/// resulting store keeps only public options and a sealed credential after that loan ends.
 #[test]
 fn open_with_secrets_captures_host_markers_before_the_loan_ends() {
     use busbar_contract::abi::sdk::store::StoreSlots;
@@ -172,6 +176,7 @@ fn settings_capture_keeps_surrounding_url_whitespace_compatibility() {
 }
 
 /// S1/S2/S3/S4: a replay applies nothing and answers the original, a different body is a
+/// conflict, a failed op is not recorded, and the log survives a reconnect.
 #[test]
 fn an_op_id_dedupes_durably_across_a_reconnect() {
     let Some(url) = live_url() else {
@@ -265,6 +270,7 @@ fn an_op_id_dedupes_durably_across_a_reconnect() {
 }
 
 /// S5: a value decided before commit (one a column cannot hold, or a data/integrity error the
+/// server raises) is REFUSED, nothing recorded; the same `op_id` with a valid record applies.
 #[test]
 fn a_write_refused_before_commit_answers_refused_and_records_nothing() {
     let Some(url) = live_url() else {
@@ -419,6 +425,7 @@ fn the_first_sweep_removes_more_rows_than_one_batch() {
 }
 
 /// A batch applies its cells and deltas in key order whatever the caller's order, so two nodes
+/// writing overlapping batches take row locks in one order (no 40P01).
 #[test]
 fn a_batch_applies_in_key_order() {
     let Some(url) = live_url() else {
@@ -513,6 +520,7 @@ fn a_new_op_records_its_digest() {
 }
 
 /// A body an older build recorded (`<slot>:{:?}`) still replays across the upgrade, and a
+/// different op under its `op_id` is still a conflict; neither applies anything.
 #[test]
 fn an_op_recorded_by_an_older_build_replays() {
     let Some(url) = live_url() else {
@@ -649,6 +657,7 @@ fn records_round_trip() {
 }
 
 /// Record keys are raw bytes: NUL, 0xFF and non-UTF-8 sequences are keys like any other, a scan runs
+/// in byte order, and a prefix equal to a whole key returns that key too.
 #[test]
 fn record_keys_are_raw_bytes_scanned_in_byte_order() {
     let Some(url) = live_url() else {

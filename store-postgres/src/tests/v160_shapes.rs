@@ -2,11 +2,15 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The busbar 1.6.0 record shapes against a live Postgres — the kind-tagged `VirtualKey` scopes and
+//! the three new key fields, the name-keyed usage ledger (`ModelTokens::usage_units`), the metering
+//! row's `priced_from_ms` key and open classes — and the IN-PLACE upgrade of a released 1.5.x (schema
+//! v6) database to v7, which must keep every existing row readable and meaning what it meant.
 
 use super::*;
 use busbar_contract::records::{ScopeRef, UsageDelta};
 
 /// The schema a RELEASED 1.5.x build (store-postgres v1.0.0-v1.0.6, schema v6) created, verbatim
+/// from `main` (comments stripped).
 const V6_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS busbar_schema (
     version BIGINT PRIMARY KEY
@@ -137,6 +141,7 @@ fn a_database_stamped_below_v6_is_refused() {
 }
 
 /// A released 1.5.x database upgrades IN PLACE. Nothing is dropped, every existing row reads back
+/// exactly as it meant under 1.5.x, and the new shapes work on it afterwards.
 #[test]
 fn a_released_v6_database_upgrades_in_place_without_losing_a_row() {
     let Some(url) = live_url() else { return };
@@ -307,6 +312,8 @@ fn a_released_v6_database_upgrades_in_place_without_losing_a_row() {
 }
 
 /// Every scope KIND round-trips as itself. The pre-1.6.0 storage kept bare pool names only, so an
+/// `mcp_server` grant came back as a POOL grant — a lost MCP grant and a pool-access escalation in
+/// one row.
 #[test]
 fn scope_grants_of_every_kind_round_trip_without_collapsing_into_pools() {
     let Some(url) = live_url() else { return };
@@ -427,6 +434,8 @@ fn idp_provider_round_trips() {
 }
 
 /// The usage ledger is name-keyed (1.6.0 M1b): the four reserved classes AND every open class
+/// round-trip through `put_usage`, accumulate through `add_usage`, and a NEGATIVE delta (a refund)
+/// actually lands — floored at 0, never below it.
 #[test]
 fn the_usage_ledger_carries_open_units_and_applies_refunds() {
     let Some(url) = live_url() else { return };
@@ -557,6 +566,7 @@ fn the_usage_ledger_carries_open_units_and_applies_refunds() {
 }
 
 /// Metering: `priced_from_ms` is part of the accrual key (a card edit mid-day opens a second row,
+/// DECISION #79) and the open classes accumulate additively per row.
 #[test]
 fn metering_splits_on_priced_from_ms_and_carries_open_classes() {
     let Some(url) = live_url() else { return };
@@ -611,6 +621,8 @@ fn metering_splits_on_priced_from_ms_and_carries_open_classes() {
 }
 
 /// A delete holds the revision transaction while both mints reach that real lock. Once the
+/// observed delete commits, both mints must check the committed tombstone, never an earlier live
+/// owner snapshot, and leave no credential behind.
 #[test]
 fn a_mint_racing_a_delete_never_leaves_a_credential_under_the_tombstone() {
     let Some(url) = live_url() else { return };
@@ -747,6 +759,7 @@ fn fx_str<'a>(row: &'a serde_json::Value, col: &str) -> &'a str {
 }
 
 /// A fresh database holding exactly what the 1.5.5 binary left. `dump.sql` is executed whole by
+/// the crate's own postgres client, nothing stripped.
 fn restore_1_5_5(url: &str) -> TempDb {
     let tmp = TempDb::create(url, "spg_155");
     let mut c = postgres::Client::connect(&tmp.url(), postgres::NoTls).unwrap();
@@ -1033,6 +1046,8 @@ fn migrate_over_the_1_5_5_rows_is_idempotent() {
 }
 
 /// `UsageDelta.models` may name one model twice. `add_usage` must fold the entries sequentially,
+/// flooring each counter at 0 after every entry, exactly as `UsageLedger::apply_delta` does —
+/// a joined `UPDATE … FROM (VALUES …)` alone applies only one row per target and lost the other.
 #[test]
 fn add_usage_folds_a_model_named_twice_sequentially() {
     let Some(url) = live_url() else { return };

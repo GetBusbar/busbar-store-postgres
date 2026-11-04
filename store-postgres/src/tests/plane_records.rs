@@ -10,6 +10,8 @@ const PURGE_BAND_TOP: u64 = 1_000_100_000;
 const LIVE_TS: u64 = 2_000_000_000;
 
 /// Every test that SWEEPS a kind holds this, including the conformance suite's two purge checks:
+/// a sweep reaches every row of the kind below its cutoff, so two sweeping tests running at once
+/// would each count (and delete) the other's rows.
 static PLANE_PURGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(super) fn lock_plane_purge() -> std::sync::MutexGuard<'static, ()> {
@@ -163,6 +165,7 @@ fn reset_tokens(store: &TestStore, kind: &str, tokens: &[&str]) {
 }
 
 /// Own the whole low band of a kind: a previous run's leftovers would otherwise be counted by the
+/// exact-count assertions the purge tests make.
 fn clear_purge_band(store: &TestStore) {
     let top = clamp(PURGE_BAND_TOP);
     let mut c = store.lock();
@@ -211,6 +214,7 @@ fn listed_task_ids(store: &TestStore) -> Vec<String> {
 }
 
 /// THE TEST THAT MATTERS. A round-trip on one live handle cannot distinguish a backend that wrote
+/// to the server from one holding a HashMap behind the same trait.
 #[test]
 fn an_mcp_call_chain_survives_dropping_the_connection_and_reconnecting() {
     let Some(database) = private_database() else {
@@ -263,6 +267,7 @@ fn an_mcp_call_chain_survives_dropping_the_connection_and_reconnecting() {
 }
 
 /// The boot enumeration: a restart has to resume a chain for a principal this process has not yet
+/// seen, so the store must be able to name every principal holding records — each exactly once.
 #[test]
 fn mcp_call_principals_are_enumerable_after_a_reconnect() {
     let Some(database) = private_database() else {
@@ -309,6 +314,7 @@ fn mcp_call_principals_are_enumerable_after_a_reconnect() {
 }
 
 /// Retention must ACTUALLY DELETE and report a real count — a purge that returns a number it did not
+/// perform is worse than one that reports nothing purged.
 #[test]
 fn purge_calls_before_deletes_and_returns_a_real_count() {
     let Some(database) = private_database() else {
@@ -364,6 +370,8 @@ fn purge_calls_before_deletes_and_returns_a_real_count() {
 }
 
 /// A record arriving on an occupied `(kind, parent, seq)` is settled the way `append_audit` settles
+/// a duplicate seq: IDENTICAL is the retry and succeeds; DIFFERENT is a forked or tampered log and is
+/// an error.
 #[test]
 fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
     let Some(database) = private_database() else {
@@ -408,6 +416,7 @@ fn a_replayed_mcp_call_is_idempotent_but_a_forked_one_is_refused() {
 }
 
 /// A live task written, rewritten (the state transition durability exists for: working becoming
+/// interrupted), and read back through a NEW connection.
 #[test]
 fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
     let Some(database) = private_database() else {
@@ -470,6 +479,8 @@ fn an_in_flight_task_survives_dropping_the_store_and_reconnecting() {
 }
 
 /// The kind's listing is deliberately UNFILTERED. The boot rehydrate wants the active rows, the
+/// retention sweep the terminal ones and the scoped listing one principal's; a store that
+/// pre-filtered for any one of those would break the other two.
 #[test]
 fn listing_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
     let Some(database) = private_database() else {
@@ -514,6 +525,7 @@ fn listing_tasks_returns_every_row_including_terminal_ones_after_a_reconnect() {
 }
 
 /// Deleting a task takes its event chain with it (as the purge does): no `task_event` row is left
+/// with the task as its parent.
 #[test]
 fn deleting_a_task_deletes_its_event_chain() {
     let Some(database) = private_database() else {
@@ -540,6 +552,7 @@ fn deleting_a_task_deletes_its_event_chain() {
 }
 
 /// A purge larger than one batch removes every aged row, takes each purged task's event chain,
+/// counts them all, and leaves the active rows.
 #[test]
 fn a_purge_spanning_several_batches_is_whole() {
     let Some(database) = private_database() else {
@@ -660,6 +673,8 @@ fn plane_purge_keeps_strict_cutoffs_above_the_signed_timestamp_boundary() {
 }
 
 /// The per-task provenance chain, read back after a reconnect. It never writes the task itself: an
+/// event and the first task write are independent write-throughs with no ordering between them, so
+/// appending an event for a task with no row yet has to WORK (no foreign key between the tables).
 #[test]
 fn a_task_event_chain_survives_a_reconnect_and_still_links() {
     let Some(database) = private_database() else {
@@ -712,6 +727,7 @@ fn a_task_event_chain_survives_a_reconnect_and_still_links() {
 }
 
 /// A replayed `(task, seq)`: IDENTICAL is the write-through retrying and succeeds without a
+/// duplicate; DIFFERENT is refused as a fork.
 #[test]
 fn a_replayed_task_event_is_idempotent_but_a_forked_one_is_refused() {
     let Some(database) = private_database() else {
@@ -746,6 +762,7 @@ fn a_replayed_task_event_is_idempotent_but_a_forked_one_is_refused() {
 }
 
 /// Retention drops TERMINAL task rows only, strictly older than the cutoff, and returns a count it
+/// actually performed.
 #[test]
 fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
     let Some(database) = private_database() else {
@@ -860,6 +877,8 @@ fn purge_tasks_before_drops_only_terminal_rows_and_returns_a_real_count() {
 }
 
 /// Retention has to bound the EVENT chain too: nothing else ever removes a `task_event` row, so a
+/// purged task takes its chain with it — in the same transaction — and nothing belonging to any
+/// other task.
 #[test]
 fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
     let Some(database) = private_database() else {
@@ -916,6 +935,8 @@ fn purging_a_task_takes_its_provenance_chain_with_it_and_no_other() {
 }
 
 /// Two ids differing ONLY IN CASE are two records, and the same for two chains. Postgres's default
+/// collations are deterministic so this passes without the explicit `COLLATE "C"` too; the point of
+/// pinning it is that this store does not choose the database it is pointed at.
 #[test]
 fn task_ids_differing_only_in_case_are_distinct_tasks() {
     let Some(database) = private_database() else {
@@ -965,6 +986,8 @@ fn task_ids_differing_only_in_case_are_distinct_tasks() {
 }
 
 /// A `u64` a signed BIGINT cannot hold is REFUSED, not clamped: `clamp` would pin it to `i64::MAX`,
+/// so the record read back would not be the record written — a chain position silently moved, a
+/// retention timestamp silently changed — and nothing would ever have reported an error.
 #[test]
 fn a_sidecar_value_beyond_the_storable_range_is_refused_rather_than_clamped() {
     let Some(database) = private_database() else {
@@ -1009,6 +1032,8 @@ fn a_sidecar_value_beyond_the_storable_range_is_refused_rather_than_clamped() {
 }
 
 /// A PRIVATE DATABASE, OR A FAILURE. Deliberately NOT `live_url()`, whose `None` arm lets a case return
+/// green having tested nothing: these are exactly the properties where a skipped test costs an
+/// operator something.
 fn require_live_database() -> TempDb {
     let url = std::env::var("BUSBAR_TEST_POSTGRES_URL").unwrap_or_else(|_| {
         panic!(
@@ -1022,6 +1047,7 @@ fn require_live_database() -> TempDb {
 }
 
 /// Per-process namespacing: a fixed key would have two concurrent runs redeeming each other's
+/// tokens and reading each other's demotions.
 fn trust_ns(tag: &str) -> String {
     format!("{}-{}", tag, std::process::id())
 }
@@ -1030,6 +1056,7 @@ fn trust_ns(tag: &str) -> String {
 const TRUST_NOW: u64 = 1_900_000_000;
 
 /// A sweeping redemption reaches every entry of its kind below its `now`, so each sweeping test has
+/// a kind of its own.
 const SWEEP_KIND_EVICT: &str = "ask_sweep_evict";
 const SWEEP_KIND_EDGE: &str = "ask_sweep_edge";
 
@@ -1043,6 +1070,7 @@ fn demotions(store: &TestStore) -> Vec<serde_json::Value> {
 }
 
 /// A DEMOTION OUTLIVES THE PROCESS THAT RECORDED IT. Without this row on the server a restart hands
+/// a quarantined upstream its approval back.
 #[test]
 fn a_demotion_survives_dropping_the_store_and_reconnecting() {
     let database = require_live_database();
@@ -1105,6 +1133,7 @@ fn a_demotion_survives_dropping_the_store_and_reconnecting() {
 }
 
 /// THE SINGLE-USE LEDGER ACROSS A RESTART. The seal on a single-use approval verifies on its second
+/// presentation exactly as on its first; only a record that the first happened tells them apart.
 #[test]
 fn a_reconnected_store_refuses_a_second_redemption_of_the_same_token() {
     let database = require_live_database();
@@ -1140,6 +1169,7 @@ fn a_reconnected_store_refuses_a_second_redemption_of_the_same_token() {
 }
 
 /// The ledger is keyed by `(kind, token)`: one token string spent under one kind is a different
+/// capability from the same string under another, so neither redemption may refuse the other.
 #[test]
 fn a_token_is_single_use_within_its_kind_not_across_kinds() {
     let database = require_live_database();
@@ -1165,6 +1195,7 @@ fn a_token_is_single_use_within_its_kind_not_across_kinds() {
 }
 
 /// TWO CONNECTIONS ARE TWO NODES OF A FLEET. They share the signing key, so they share the SEAL, and
+/// the second redemption is an ordinary request a load balancer sends somewhere else.
 #[test]
 fn a_second_node_cannot_redeem_a_token_the_first_already_spent() {
     let database = require_live_database();
@@ -1187,6 +1218,7 @@ fn a_second_node_cannot_redeem_a_token_the_first_already_spent() {
 }
 
 /// CONCURRENT REDEMPTION IS THE ATTACK. Eight independent CONNECTIONS race on one token through a
+/// barrier — the arrangement a read-then-write implementation answers "first" to eight times.
 #[test]
 fn exactly_one_of_many_racing_nodes_wins_the_redemption() {
     let database = require_live_database();
@@ -1321,6 +1353,8 @@ fn the_ledger_refuses_values_it_cannot_store_faithfully() {
 }
 
 /// `plane_token_live` is MULTI-use and SPENDS NOTHING: a push-callback configuration is live across
+/// every callback of a running task, dies the moment the write that made its task terminal flips its
+/// disposition, and holds nothing once deleted.
 #[test]
 fn plane_token_live_carries_a_task_and_dies_with_it() {
     let database = require_live_database();
@@ -1376,6 +1410,7 @@ fn plane_token_live_carries_a_task_and_dies_with_it() {
 }
 
 /// The deadline is a real one (live AT `expires_at`, dead one second past it), and an unknown kind or
+/// token holds nothing live.
 #[test]
 fn plane_token_live_refuses_a_lapsed_token_and_an_unknown_one() {
     let database = require_live_database();
@@ -1415,6 +1450,7 @@ fn plane_token_live_refuses_a_lapsed_token_and_an_unknown_one() {
 }
 
 /// THE IDENTITY COLUMNS CARRY AN EXPLICIT COLLATION, asserted from the catalogue so the DDL cannot
+/// quietly lose it.
 #[test]
 fn the_plane_identity_columns_pin_a_byte_exact_collation() {
     let database = require_live_database();
@@ -1471,6 +1507,8 @@ fn wipe_kind(store: &TestStore, kind: &str) {
 }
 
 /// R14: an appended record honours its actual parent. A parentless append is stored by its own
+/// id, reads back through `get_plane_record`, and is NOT listed as a parent (nor as a child of
+/// itself); a record that names itself as its parent is listed as one.
 #[test]
 fn an_appended_record_honours_its_actual_parent() {
     let database = require_live_database();
@@ -1523,6 +1561,7 @@ fn an_appended_record_honours_its_actual_parent() {
 }
 
 /// R15: `list_plane_records` returns ONE order, (seq, identity) ascending, across the upserted and
+/// the appended rows together.
 #[test]
 fn list_plane_records_is_one_order_across_upserts_and_appends() {
     let database = require_live_database();
@@ -1552,6 +1591,8 @@ fn list_plane_records_is_one_order_across_upserts_and_appends() {
 }
 
 /// P19: a row re-written (upserted) between the purge's subquery and its delete is NOT deleted: the
+/// outer `DELETE` restates the retention predicate, so READ COMMITTED re-checks it on the new
+/// version of the row after the lock wait.
 #[test]
 fn a_purge_spares_a_row_rewritten_while_it_waited() {
     let database = require_live_database();

@@ -52,7 +52,7 @@ for the explicitly listed revoked-secret erasure:
   (`mcp_server`, `agent`, …). Pool grants stay in `allowed_pools` exactly as
   1.5.x wrote them.
 - `usage_metering` gains `priced_from_ms` (existing rows read `0`, the opening
-  rate card) and it joins the primary key, so a rate-card change mid-day opens
+  rate card) and participates in the row identity, so a rate-card change mid-day opens
   a second row for that day.
 - New tables: `usage_ledger_units` and `usage_metering_units` (unit classes
   other than the four reserved token classes), and `plane_records`,
@@ -110,17 +110,16 @@ for the explicitly listed revoked-secret erasure:
   Fresh unconditional writes to reserved usage adjustment buckets are refused;
   already-applied legacy receipts remain replayable.
 
-Drain and stop older store processes before the v19 upgrade, then reopen every
-node with this build. Builds with the newer-schema check, including v16, refuse
-a v19 database at open, but that check cannot fence an already-open process.
+Drain and stop older store processes before the v7 upgrade, then reopen every
+node with this build. A newer-schema check cannot fence an already-open process.
 The published v1.0.6 plugin used by busbar 1.5.5 has no newer-schema check.
 Do not reconnect older binaries to the upgraded database or run mixed-version
 store writers. Rollback requires a pre-upgrade backup and the corresponding
 older build, not reopening the upgraded database with an older binary.
 
-A database a pre-release dev build took to schema v7–v9 keeps its
-`mcp_calls`/`tasks`/`task_events`/`mcp_demotions`/`spent_ask_states` tables
-untouched; busbar 1.6.0 no longer reads them.
+Unreleased development databases are not supported upgrade sources. Markers
+above v7 are refused; a development database stamped v7 must already have the
+released v7 layout. Legacy application tables are left untouched.
 
 It is a `cdylib` that serves busbar's store v3 table (`StoreSlots`, via the plugin SDK in
 [`busbar-contract`](https://github.com/GetBusbar/busbar/tree/main/crates/busbar-contract))
@@ -161,7 +160,8 @@ that crate and exports its `door` through `export_door!`.
 - **Up to eight kept connections.** (1.5.x kept one.) The store connects and
   authenticates on demand and keeps up to eight idle connections; an
   operation that finds none free waits for one. A
-  connection that fails (or is left inside a transaction) is closed, and
+  dropped transaction is rolled back before reuse. A connection that fails or
+  cannot return to an idle session is closed, and
   the next operation connects afresh rather than needing a restart.
 - **TLS through busbar.** `sslmode=require`, `verify-ca` and
   `verify-full` secure the connection through busbar's connector and its
@@ -175,11 +175,9 @@ that crate and exports its `door` through `export_door!`.
   explicitly. A Unix-socket
   `host` is refused: the store reaches its server over TCP.
 
-See the doc comments at the top of
-[`store-postgres/src/lib.rs`](store-postgres/src/lib.rs)
-for the full design rationale — that is where the actual store logic
-lives (in this repo now, not busbar); `store-postgres-plugin/` is the
-thin `cdylib` adapter around it.
+The store and migration logic lives in
+[`store-postgres/src/lib.rs`](store-postgres/src/lib.rs);
+`store-postgres-plugin/` is the thin `cdylib` adapter around it.
 
 ## Config
 
@@ -189,8 +187,8 @@ thin `cdylib` adapter around it.
 
 The only setting is `url`; every refusal starts
 `invalid postgres plugin config: `. Any other top-level key is refused,
-a settings value that is not a JSON object is refused
-naming its type, a `url` that is not a string is refused naming the type it
+a non-null settings value that is not a JSON object is refused
+naming its type (null is treated as missing settings), a `url` that is not a string is refused naming the type it
 is, and a missing or `null` `url` is refused as required. A connection string
 the parser refuses is refused at `validate` as at `open`, as
 `invalid postgres plugin config: url: ...`; only the connect is left to `open`.
@@ -253,8 +251,10 @@ setting. So:
 - Any other valid value of those options (say `keepalives_idle=30`,
   `load_balance_hosts=random`, `sslnegotiation=direct`) cannot apply: it is
   accepted and logged once, at debug level, naming the option and why it has
-  no effect. Endpoints are always tried in the order given, and TLS is always
-  asked for with an `SSLRequest` (`sslmode` still decides whether it is used).
+  no effect. The initial connection tries endpoints in the order given; later operations
+  prefer the last successful endpoint so they can reuse its pooled sessions. If that
+  endpoint fails, the remaining endpoints are tried in configured order. TLS, when requested,
+  is negotiated with an `SSLRequest` (`sslmode` decides whether it is used).
 - A value 1.5.5's driver refused (not a number, an unknown keyword) is refused.
 
 **Refused, with an explanation (never silently ignored):** `channel_binding=require` (no SCRAM-PLUS), `sslrootcert`
@@ -404,3 +404,17 @@ expired or mismatched receipts return false. Other kinds keep their Active/calle
 Built-in `ticket` records store their absolute expiry in `ts`. Their retention cutoff is
 capped at the database clock, preserving still-live receipts even when a caller requests
 a future cutoff. Equal deadlines are retained; other record kinds keep their existing rules.
+
+## Differences from 1.5.5
+
+The released external Postgres plugin supported key, credential and usage storage.
+For those existing paths, server diagnostics now redact passwords throughout the
+connection and escape control characters. Diagnostics retain at most 4096 source
+characters before escaping, plus a truncation suffix when needed; escaping can
+expand the final rendered length. Pre-authentication
+and protocol-control messages are limited to 30,000 bytes; authenticated data rows
+retain the Postgres value ceiling. Corrupt stored labels and unknown credential
+secret forms are refused instead of being silently interpreted as empty values.
+
+The plane-record, replay-token, conditional-record and usage-correction behavior
+described above belongs to the new 1.6 interfaces, not a changed 1.5.5 contract.

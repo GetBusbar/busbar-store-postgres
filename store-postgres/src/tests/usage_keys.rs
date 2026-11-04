@@ -213,7 +213,7 @@ fn unsigned_usage_purge_preserves_zero_equal_cutoffs_and_metering() {
 }
 
 #[test]
-fn pre_v17_usage_keys_migrate_without_reinterpreting_existing_maximum_rows() {
+fn released_v6_usage_keys_migrate_without_reinterpreting_existing_maximum_rows() {
     let Some(url) = live_url() else { return };
     let db = TempDb::create(&url, "spg_usage_v16");
     let store = TestStore::open(&db.url()).unwrap();
@@ -223,7 +223,7 @@ fn pre_v17_usage_keys_migrate_without_reinterpreting_existing_maximum_rows() {
     }
     store
         .lock()
-        .batch_execute("DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (6)")
+        .batch_execute(&format!("DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES ({FIRST_RELEASED_SCHEMA})"))
         .unwrap();
     drop(store);
     let reopened = TestStore::open(&db.url()).unwrap();
@@ -254,7 +254,7 @@ fn pre_v17_usage_keys_migrate_without_reinterpreting_existing_maximum_rows() {
 }
 
 #[test]
-fn pre_v17_negative_usage_key_provenance_is_not_silently_reinterpreted() {
+fn released_v6_negative_usage_key_provenance_is_not_silently_reinterpreted() {
     let Some(url) = live_url() else { return };
     for (table, column) in [
         ("usage_windows", "window_start"),

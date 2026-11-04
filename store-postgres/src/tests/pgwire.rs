@@ -41,6 +41,7 @@ fn what_the_host_cannot_dial_is_refused() {
 }
 
 /// libpq's MULTI-HOST list (busbar oracle store.boot|postgres|multi-host): every endpoint, in
+/// order, each with its own port or the one shared; a connect the first refuses tries the next.
 #[test]
 fn a_multi_host_list_names_every_endpoint_in_order() {
     let c = Config::parse("postgres://u:p@127.0.0.1:1,db:5433,[::1]/d").unwrap();
@@ -54,6 +55,9 @@ fn a_multi_host_list_names_every_endpoint_in_order() {
 }
 
 /// D11 (RED before: `host` and `hostaddr` shared one slot, the last won): `hostaddr` is the
+/// address that is dialled and `host` the name the TLS check and the errors use (libpq, and the
+/// 1.5.5 driver), paired by position; a hostaddr that is no IP, or a list of another length, is
+/// refused.
 #[test]
 fn hostaddr_is_dialled_and_host_is_the_name() {
     let c = Config::parse("host=db.internal hostaddr=10.1.2.3 port=6000 user=u").unwrap();
@@ -77,6 +81,7 @@ fn hostaddr_is_dialled_and_host_is_the_name() {
 }
 
 /// D10 (RED before: any value was accepted and ignored): `target_session_attrs` is `any`,
+/// `read-write` or `read-only` (the 1.5.5 driver's set); anything else is refused naming them.
 #[test]
 fn target_session_attrs_takes_the_drivers_values_only() {
     for ok in ["any", "read-write", "read-only"] {
@@ -91,6 +96,8 @@ fn target_session_attrs_takes_the_drivers_values_only() {
 }
 
 /// D9 (RED before: both were accepted and silently ignored): this client has no SCRAM-PLUS, so
+/// `channel_binding=require` could not be honoured, and the connection is verified against
+/// busbar's trust anchors, so a per-store `sslrootcert` could not be.
 #[test]
 fn what_this_client_cannot_honour_is_refused_not_ignored() {
     let e = Config::parse("host=db user=u channel_binding=require").unwrap_err();
@@ -105,6 +112,7 @@ fn what_this_client_cannot_honour_is_refused_not_ignored() {
 }
 
 /// libpq's `prefer` and `allow` parse (1.5.5 accepted them); the password is never echoed by a
+/// later refusal.
 #[test]
 fn sslmode_prefer_and_allow_parse() {
     for mode in ["prefer", "allow"] {
@@ -118,6 +126,7 @@ fn sslmode_prefer_and_allow_parse() {
 }
 
 /// Each `sslmode` maps to its libpq behaviour: `disable` and `allow` are plaintext, `prefer` asks
+/// for TLS and takes plaintext on `N`, the `require` family insists.
 #[test]
 fn sslmode_values_map_to_their_modes() {
     for (mode, want) in [("allow", SslMode::Plain), ("prefer", SslMode::Prefer)] {
@@ -136,6 +145,8 @@ fn sslmode_values_map_to_their_modes() {
 }
 
 /// The libpq socket options a 1.5.5 DSN carried are ACCEPTED (1.5.5's driver accepted them; a 1.5.5
+/// config keeps booting): what the host's connector does anyway is accepted quietly, what it cannot
+/// apply is accepted and logged at debug, naming the option and why.
 #[test]
 fn socket_options_are_accepted_and_what_cannot_apply_is_logged() {
     let logged = |dsn: &str| -> (Result<(), String>, String) {
@@ -254,6 +265,7 @@ impl std::io::Write for Sink {
 }
 
 /// D37 (RED before: accepted and ignored): `connect_timeout` is whole seconds as the driver
+/// reads it, a number that is not one is refused.
 #[test]
 fn connect_timeout_is_whole_seconds() {
     for ok in ["5", "0", "-1"] {
@@ -261,7 +273,8 @@ fn connect_timeout_is_whole_seconds() {
     }
     let e = Config::parse("host=db user=u connect_timeout=soon").unwrap_err();
     assert!(e.to_string().contains("connect_timeout"), "{e}");
-    assert!(Config::parse("postgres://u@db/d?connect_timeout=2.5").is_err());
+    let fractional = Config::parse("postgres://u@db/d?connect_timeout=2.5").unwrap_err();
+    assert!(fractional.to_string().contains("whole number of seconds"));
 
     let ms = |v: &str| {
         Config::parse(&format!("host=db user=u connect_timeout={v}"))
@@ -269,11 +282,11 @@ fn connect_timeout_is_whole_seconds() {
             .connect_timeout_ms
     };
     assert_eq!((ms("5"), ms("0"), ms("-1")), (Some(5000), Some(0), Some(0)));
-    let e = Config::parse("host=db user=u connect_timeout=soon").unwrap_err();
     assert!(e.to_string().contains("whole number of seconds"), "{e}");
 }
 
 /// A DSN without `connect_timeout` still bounds the handshake (30 s); the DSN's value wins, and 0
+/// is the explicit "no bound".
 #[test]
 fn an_unset_connect_timeout_defaults_to_thirty_seconds() {
     let bound = |dsn: &str| Config::parse(dsn).unwrap().connect_bound_ms();
@@ -284,6 +297,9 @@ fn an_unset_connect_timeout_defaults_to_thirty_seconds() {
 }
 
 /// D26 (RED before: the unparsed fragment was echoed): a configuration error never repeats a
+/// token of the string that is not a well-formed `key=`, because a password with a space, a `?`
+/// or a missing `user:` prefix splits there and its tail would be echoed; an unknown option's
+/// key is named only when the string carries no password.
 #[test]
 fn a_config_error_never_echoes_a_password_tail() {
     for dsn in [
@@ -315,6 +331,7 @@ fn a_config_error_never_echoes_a_password_tail() {
 }
 
 /// B9: the store reaches its server over TCP, so a Unix-socket host is refused in the URL
+/// forms too (RED by mutation: drop the `starts_with('/')` refusal).
 #[test]
 fn a_unix_socket_host_is_refused_in_every_url_form() {
     let e = Config::parse("postgres://u@%2Fvar%2Frun%2Fpostgresql/d").unwrap_err();
@@ -326,6 +343,7 @@ fn a_unix_socket_host_is_refused_in_every_url_form() {
 }
 
 /// 1.5.5 dialled `hostaddr` and used `host` only as a name, so a socket-path host beside a
+/// hostaddr worked; the Unix-socket refusal is of what is DIALLED (RED before: refused).
 #[test]
 fn a_socket_path_host_beside_a_hostaddr_is_dialled_by_address() {
     let c = Config::parse("host=/tmp hostaddr=127.0.0.1 user=u").unwrap();
@@ -336,6 +354,7 @@ fn a_socket_path_host_beside_a_hostaddr_is_dialled_by_address() {
 }
 
 /// D28 (RED before: `ranges[i]` indexed out of bounds, a panic): a DataRow with fewer fields
+/// than the RowDescription named columns is an error on the missing column, not a panic.
 #[test]
 fn a_data_row_short_of_its_columns_is_an_error_not_a_panic() {
     use bytes::BytesMut;
@@ -384,6 +403,8 @@ fn a_snapshot_transaction_begins_repeatable_read() {
 }
 
 /// The connection's prepared statements stay bounded: past `STATEMENTS_KEPT` the least recently
+/// run is dropped and its Close queued for the next Parse; a stale statement is dropped the same
+/// way, and `26000` (the session's statements deallocated) drops them all.
 #[test]
 fn prepared_statements_drop_the_least_recently_run_past_the_bound() {
     use std::sync::Arc;
@@ -488,7 +509,9 @@ fn captured_passwords_preserve_last_wins_and_decode_semantics() {
             },
             "the effective password stays sealed and still redacts peer echoes"
         );
-        assert!(!format!("{config:?}").contains("password"));
+        if !decoded.is_empty() {
+            assert!(!format!("{config:?}").contains(decoded));
+        }
     }
 }
 
@@ -609,4 +632,70 @@ fn the_sdk_verifier_link_accepts_the_known_native_scram_exchange() {
         )
         .unwrap();
     assert!(link.verify("v=U+ppxD5XUKtradnv8e2MkeupiA8FU87Sg8CXzXHDAzw="));
+}
+
+impl Config {
+    /// Every endpoint, in the order a connect tries them: `(name, dial host:port)`.
+    #[must_use]
+    pub fn targets(&self) -> Vec<(&str, String)> {
+        self.endpoints
+            .iter()
+            .map(|e| (e.name.as_str(), target(&e.dial, e.port)))
+            .collect()
+    }
+}
+impl Error {
+    /// A server failure with SQLSTATE `code` and `message`, as an `ErrorResponse` decodes.
+    #[must_use]
+    pub fn server(code: &str, message: &str) -> Self {
+        Self::new(Kind_::Db(DbError {
+            severity: "ERROR".to_string(),
+            code: SqlState(code.to_string()),
+            message: message.to_string(),
+            constraint: None,
+        }))
+    }
+}
+
+#[test]
+fn authentication_and_control_message_limits_preserve_data_rows() {
+    assert_eq!(message_limit(b'R', false), 30_000);
+    assert_eq!(message_limit(b'D', false), 30_000);
+    assert_eq!(message_limit(b'R', true), 30_000);
+    assert_eq!(message_limit(b'D', true), (1 << 30) + 4);
+}
+
+#[test]
+fn malformed_server_error_is_a_protocol_error() {
+    for body in [
+        b"Munterminated".as_slice(),
+        b"Mmessage\0\0".as_slice(),
+        b"SERROR\0C23514\0\0".as_slice(),
+    ] {
+        let mut frame = BytesMut::new();
+        frame.extend_from_slice(b"E");
+        frame.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+        frame.extend_from_slice(body);
+        let Message::ErrorResponse(body) = Message::parse(&mut frame).unwrap().unwrap() else {
+            panic!("error response");
+        };
+        let error = Error::response(&body);
+        assert!(error.code().is_none());
+        assert!(error.to_string().contains("error parsing response"));
+    }
+}
+
+#[test]
+fn an_empty_server_message_preserves_its_sqlstate() {
+    let body = b"SERROR\0C23514\0M\0\0";
+    let mut frame = BytesMut::new();
+    frame.extend_from_slice(b"E");
+    frame.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+    frame.extend_from_slice(body);
+    let Message::ErrorResponse(body) = Message::parse(&mut frame).unwrap().unwrap() else {
+        panic!("error response");
+    };
+    let error = Error::response(&body);
+    assert_eq!(error.code().map(SqlState::code), Some("23514"));
+    assert_eq!(error.as_db_error().unwrap().message(), "");
 }

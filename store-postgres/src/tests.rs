@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! Unit tests for the Postgres store (schema v5, generic credentials): DSN-password scrubbing plus
+//! Unit tests for the Postgres store (schema v7, generic credentials): DSN-password scrubbing plus
+//! (gated on `BUSBAR_TEST_POSTGRES_URL`) real round-trip and invariant coverage against a live
+//! `postgres:16`.
 
 use super::*;
 use busbar_contract::records::{
@@ -35,6 +37,7 @@ mod migration_parent_presence;
 pub(crate) use harness::TestStore;
 
 /// The verify path's read, which is no longer a store op: a credential's secret by `(kind,
+/// public_id)`, read back through the revision delta (which carries every row, revoked or not).
 trait Lookup {
     fn lookup_credential_secret(
         &self,
@@ -57,6 +60,7 @@ impl Lookup for TestStore {
 }
 
 /// One model's ledger row from the four RESERVED token classes (zero classes left out, the way the
+/// store reads them back).
 fn mt(
     model: impl Into<String>,
     input: u64,
@@ -107,6 +111,8 @@ fn mtd(
 }
 
 /// Drift guard, no live DB needed: `CRED_SECRET_COLUMN_INDEX` must stay in sync with
+/// `CRED_META_COLUMNS`' own column count, since `str::split` isn't const-evaluable and the constant
+/// is hand-maintained.
 #[test]
 fn cred_secret_column_index_matches_cred_meta_columns_count() {
     assert_eq!(
@@ -185,6 +191,9 @@ fn live_url() -> Option<String> {
 }
 
 /// Open a raw `postgres::Client` with bounded retry-with-backoff. Used only where a test genuinely
+/// needs a SECOND connection independent of the store's (e.g. holding a REPEATABLE READ snapshot
+/// open on one connection while the store writes on its own) -- there the connection cannot be
+/// reused away.
 fn connect_client_with_retry(url: &str) -> postgres::Client {
     let mut last_err = None;
     for attempt in 0..10u32 {
@@ -200,6 +209,8 @@ fn connect_client_with_retry(url: &str) -> postgres::Client {
 }
 
 /// The store under test, opened with bounded retry-with-backoff: through the REAL loader on a
+/// dispatcher, its connections over the host's connection path (the loader's test `TcpConns`), so
+/// every op goes through the door exactly as busbar runs it.
 fn connect_store_with_retry(url: &str) -> Result<TestStore, String> {
     let mut last_err = None;
     for attempt in 0..10u32 {
@@ -215,6 +226,10 @@ fn connect_store_with_retry(url: &str) -> Result<TestStore, String> {
 }
 
 /// TRUE reset for test isolation -- unlike `delete_key` (a deliberate tombstone that can never fully
+/// reset a row by design), this raw-SQL wipe gives each test a genuinely clean slate for its id, so
+/// re-running the suite (or running it twice in a row) never sees stale state
+/// from a prior run leaking into the CHECK constraints (e.g. re-minting into a row still marked
+/// `deleted_at` from a previous run's tombstone would violate `keys_tombstone_disabled`).
 fn hard_reset(store: &TestStore, id: &str) {
     let mut client = store.lock();
     for sql in [
@@ -270,6 +285,7 @@ fn sample_cred(key_id: &str, slot: u8, public_id: &str) -> CredentialSecret {
 }
 
 /// Basic key round-trip, including the new fields (generation_hash, expires_at, deleted_at,
+/// revision) and the allowed_pools NULL-vs-'[]' distinction.
 #[test]
 fn key_roundtrip_new_fields() {
     let Some(url) = live_url() else { return };
@@ -307,6 +323,8 @@ fn key_roundtrip_new_fields() {
 }
 
 /// THE core invariant: delete_key is a TOMBSTONE. The row survives (deleted_at set, enabled=false),
+/// every credential is destroyed, and usage_metering (which FKs nothing here but conceptually
+/// depends on key_id resolving) still finds the key by id afterward.
 #[test]
 fn delete_key_is_a_tombstone_not_a_hard_delete() {
     let Some(url) = live_url() else { return };
@@ -348,6 +366,7 @@ fn delete_key_is_a_tombstone_not_a_hard_delete() {
 }
 
 /// `delete_key` must stamp `deleted_at` with a WALL-CLOCK time, not with the store-global revision
+/// counter.
 #[test]
 fn delete_key_stamps_deleted_at_with_a_wall_clock_time_not_the_revision() {
     let Some(url) = live_url() else { return };
@@ -432,6 +451,7 @@ fn put_key_with_credential_refuses_to_remint_over_a_tombstone() {
 }
 
 /// Credential minting is slot-safe: minting into a slot holding a LIVE credential must fail, not
+/// silently clobber it.
 #[test]
 fn credential_slot_guard_rejects_clobbering_a_live_credential() {
     let Some(url) = live_url() else { return };
@@ -472,6 +492,7 @@ fn credential_slot_guard_rejects_clobbering_a_live_credential() {
 }
 
 /// put_credential_tx must bind CredentialMeta::updated_at to its own column, not silently reuse
+/// created_at's parameter for both.
 #[test]
 fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
     let Some(url) = live_url() else { return };
@@ -501,6 +522,7 @@ fn put_credential_binds_updated_at_to_its_own_column_not_created_at() {
 }
 
 /// revoke_credential kills ONE credential independent of the key: the key stays enabled, the OTHER
+/// slot's credential stays live, only the targeted one is revoked.
 #[test]
 fn revoke_credential_is_independent_of_the_key_and_other_slots() {
     let Some(url) = live_url() else { return };
@@ -564,6 +586,7 @@ fn revoke_credential_is_independent_of_the_key_and_other_slots() {
 }
 
 /// `revoke_credential` must FAIL LOUD on a credential id that does not exist, rather than reporting
+/// a successful revocation of nothing.
 #[test]
 fn revoke_credential_errors_on_an_unknown_id_but_stays_idempotent_on_a_revoked_one() {
     let Some(url) = live_url() else { return };
@@ -628,6 +651,9 @@ fn revoke_credential_errors_on_an_unknown_id_but_stays_idempotent_on_a_revoked_o
 }
 
 /// HYDRATION-DELTA SOUNDNESS, the same invariant the SQLite and MySQL schemas have to hold. A
+/// revision-based delta consumer polling list_keys_since/list_credentials_since must be able to
+/// observe a delete_key tombstone AND infer the credential deletion from it, because the
+/// credential rows are hard-deleted and produce no delta of their own.
 #[test]
 fn hydration_delta_makes_credential_deletion_observable_via_the_key_tombstone() {
     let Some(url) = live_url() else { return };
@@ -669,6 +695,8 @@ fn hydration_delta_makes_credential_deletion_observable_via_the_key_tombstone() 
 }
 
 /// A concurrent-instance race: two independent connections both try to delete the same key. Exactly
+/// one does the real work; both must return Ok (idempotent), and the final state must be a single,
+/// consistent tombstone -- not a partial/interleaved one.
 #[test]
 fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
     let Some(url) = live_url() else { return };
@@ -706,6 +734,8 @@ fn concurrent_delete_of_the_same_key_is_safe_and_idempotent() {
 }
 
 /// A concurrent `add_usage` landing between `get_usage`'s reads must not be half-visible. A writer
+/// adds one request and one NEW model per call, so any consistent snapshot has exactly as many model
+/// rows as requests; `get_usage` itself is read in a loop against it.
 #[test]
 fn get_usage_never_returns_a_torn_snapshot_under_a_concurrent_writer() {
     let Some(url) = live_url() else { return };
@@ -761,6 +791,7 @@ fn get_usage_never_returns_a_torn_snapshot_under_a_concurrent_writer() {
 }
 
 /// usage_metering round-trip including the new fields (billable_requests, key_group_at_use,
+/// pricing_version) and the renamed tokens_cache_write (was tokens_cache_creation).
 #[test]
 fn metering_roundtrip_new_fields() {
     let Some(url) = live_url() else { return };
@@ -808,6 +839,8 @@ fn password_capture_percent_decoding_edge_cases() {
 }
 
 /// `is_undefined_table` must discriminate the ONE SQLSTATE (`42P01`/undefined_table) it exists to
+/// recognize from every other error class, so neither an inverted comparison nor an unconditional
+/// true/false passes.
 #[test]
 fn is_undefined_table_matches_only_the_real_sqlstate() {
     let missing = crate::pgwire::Error::server("42P01", "relation \"x\" does not exist");
@@ -826,6 +859,7 @@ fn is_undefined_table_matches_only_the_real_sqlstate() {
 }
 
 /// `labels_to_storage`'s serialization -- not just the empty-map default -- must round-trip a
+/// non-empty label set.
 #[test]
 fn labels_round_trip_non_empty_map() {
     let Some(url) = live_url() else { return };
@@ -846,6 +880,9 @@ fn labels_round_trip_non_empty_map() {
 }
 
 /// `secret_form_to_storage`/`secret_form_from_storage` for all three `SecretForm` variants, pure
+/// (no DB needed) and independent of which credential fixtures happen to default to `Recoverable`
+/// elsewhere -- catches a deleted `"recoverable"` or `"digest"` match arm silently falling through
+/// to an unrelated secret form.
 #[test]
 fn secret_form_storage_round_trip_all_variants() {
     assert_eq!(secret_form_to_storage(SecretForm::None), "none");
@@ -855,20 +892,23 @@ fn secret_form_storage_round_trip_all_variants() {
     );
     assert_eq!(secret_form_to_storage(SecretForm::Digest), "digest");
 
-    assert_eq!(secret_form_from_storage("none"), SecretForm::None);
+    assert_eq!(secret_form_from_storage("none").unwrap(), SecretForm::None);
     assert_eq!(
-        secret_form_from_storage("recoverable"),
+        secret_form_from_storage("recoverable").unwrap(),
         SecretForm::Recoverable
     );
-    assert_eq!(secret_form_from_storage("digest"), SecretForm::Digest);
     assert_eq!(
-        secret_form_from_storage("garbage"),
-        SecretForm::None,
-        "an unrecognized stored value must fail safe to None, not panic"
+        secret_form_from_storage("digest").unwrap(),
+        SecretForm::Digest
     );
+    assert!(secret_form_from_storage("garbage").is_err());
 }
 
 /// `put_usage`/`add_usage`'s multi-row `VALUES (...)` batching (comma insertion gated on `i > 0`,
+/// and each row's placeholder `base = 3 + i * 5`) is only exercised by a call with 2+ models -- every
+/// existing test used exactly one model, so `i > 0` vs `i < 0`, and `+`/`*` in the offset arithmetic,
+/// were never distinguished (with one model, `i` is always 0, and both branches degenerate to the
+/// same single-row SQL).
 #[test]
 fn put_usage_and_add_usage_batch_multiple_models_correctly() {
     let Some(url) = live_url() else { return };
@@ -1088,6 +1128,7 @@ fn denylist_add_is_listed_and_a_repeat_add_is_a_no_op() {
 }
 
 /// `list_audit_tail` must return the tail OLDEST FIRST, and `list_audit` must return the whole log
+/// in the same direction.
 #[test]
 fn list_audit_tail_returns_the_newest_entries_oldest_first() {
     let Some(url) = live_url() else { return };
@@ -1143,6 +1184,7 @@ fn list_audit_tail_returns_the_newest_entries_oldest_first() {
 }
 
 /// `list_keys` is deliberately UNFILTERED: it must include tombstoned rows, because
+/// `list_keys_since`'s fallback consumers need the tombstone visible to drive credential eviction.
 #[test]
 fn list_keys_includes_tombstoned_rows() {
     let Some(url) = live_url() else { return };
@@ -1166,6 +1208,10 @@ fn list_keys_includes_tombstoned_rows() {
 }
 
 /// `list_credentials_since` must actually return credentials. Its only previous appearance in this
+/// file was a NEGATIVE assertion (`all(|c| c.key_id != id)`), which `all()` satisfies vacuously on
+/// an empty vec, so deleting the whole method from the impl left the trait's `Ok(Vec::new())`
+/// default in place, kept the crate compiling, kept the suite green, and silently stopped every
+/// credential from ever reaching a hydrating node.
 #[test]
 fn list_credentials_since_returns_new_credentials_with_their_secret() {
     let Some(url) = live_url() else { return };
@@ -1205,6 +1251,8 @@ fn list_credentials_since_returns_new_credentials_with_their_secret() {
 }
 
 /// `put_credential_tx`'s SECOND failure branch: the slot is free, so the guarded upsert is not what
+/// blocked the write, and the insert was rejected by the cross-key `UNIQUE (kind, public_id)`
+/// constraint instead.
 #[test]
 fn put_credential_rejects_a_public_id_already_used_by_another_key() {
     let Some(url) = live_url() else { return };
@@ -1247,6 +1295,8 @@ fn put_credential_rejects_a_public_id_already_used_by_another_key() {
 }
 
 /// A unique-enough suffix (pid + nanos) for names that must not collide across concurrently
+/// running test binaries against the SAME shared Postgres instance (this repo's own `e2e.rs` uses
+/// the identical pattern for its temp work directory).
 fn unique_suffix() -> String {
     format!(
         "{}_{}",
@@ -1296,10 +1346,12 @@ fn drop_database(url: &str, db_name: &str) {
 }
 
 /// A disposable database that removes itself on drop, INCLUDING when a panic unwinds partway
+/// through the test.
 struct TempDb {
     admin_url: String,
     name: String,
     /// Cluster-scoped roles outlive the database they were used in, so they need dropping too, and
+    /// `DROP OWNED BY` must run while the database still exists.
     role: Option<String>,
 }
 
@@ -1341,6 +1393,8 @@ impl Drop for TempDb {
 }
 
 /// Every store transaction opens with `SET LOCAL lock_timeout` and
+/// `idle_in_transaction_session_timeout` (no startup `options`, which poolers refuse): a trigger
+/// on `keys` reports what the transaction sees.
 #[test]
 fn a_store_transaction_runs_with_the_lock_and_idle_timeouts() {
     let Some(url) = live_url() else { return };
@@ -1364,6 +1418,9 @@ fn a_store_transaction_runs_with_the_lock_and_idle_timeouts() {
 }
 
 /// `migrate_locked`'s undefined-table bootstrap path on a genuinely fresh (separate, disposable)
+/// database rather than the shared test database -- which, once any test has run against it, never
+/// again presents an undefined `busbar_schema` or a version < `SCHEMA_VERSION`, so this code was
+/// structurally unreachable from every other test in this file.
 #[test]
 fn migrate_bootstraps_fresh_database() {
     let Some(url) = live_url() else { return };
@@ -1502,6 +1559,7 @@ fn an_unreleased_schema_is_refused_without_dropping_tables_or_operation_rows() {
 }
 
 /// A malformed unsigned usage counter, or a NULL where the store reads a value, answers an
+/// error (never the stored value), not a panic.
 #[test]
 fn a_row_that_does_not_decode_is_an_error_not_a_panic() {
     let Some(url) = live_url() else { return };
@@ -1527,6 +1585,7 @@ fn a_row_that_does_not_decode_is_an_error_not_a_panic() {
 }
 
 /// An op held on the server (here waiting on the `store_revision` row lock) does not hold up a
+/// second op: the instance keeps more than one connection.
 #[test]
 fn a_held_op_does_not_block_a_second_op() {
     let Some(url) = live_url() else { return };
@@ -1557,6 +1616,7 @@ fn a_held_op_does_not_block_a_second_op() {
 }
 
 /// `since = 0` returns every row, and a row at revision 0 (a 1.5.x row the revision bump never
+/// touched) always reads as changed.
 #[test]
 fn revision_zero_rows_are_in_every_delta() {
     let Some(url) = live_url() else { return };
@@ -1637,6 +1697,7 @@ fn plane_tokens_has_its_sweep_index() {
 }
 
 /// A credential deleted (a `delete_key` cascade) between the revoke's existence check and its
+/// write names no row any more: the unknown-id error, not a story about a concurrent mint.
 #[test]
 fn revoking_a_credential_deleted_underneath_says_unknown_id() {
     let Some(url) = live_url() else { return };
@@ -1655,7 +1716,20 @@ fn revoking_a_credential_deleted_underneath_says_unknown_id() {
         .unwrap();
     let err = std::thread::scope(|s| {
         let revoke = s.spawn(|| store.revoke_credential(&cred.meta.id, "r"));
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let blocked: bool = holder.query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pg_backend_pid() = ANY(pg_blocking_pids(pid)))", &[]
+            ).unwrap().get(0);
+            if blocked {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "revoke must reach the held row lock"
+            );
+            std::thread::yield_now();
+        }
         holder
             .batch_execute(&format!(
                 "DELETE FROM credentials WHERE id = '{}'; COMMIT",
@@ -1674,6 +1748,7 @@ fn revoking_a_credential_deleted_underneath_says_unknown_id() {
 }
 
 /// A rolling-upgrade migration chosen as a deadlock victim (40P01) against a node holding locks
+/// in the other order is retried, not failed.
 #[test]
 fn a_migration_deadlock_victim_is_retried() {
     let Some(url) = live_url() else { return };
@@ -1681,30 +1756,32 @@ fn a_migration_deadlock_victim_is_retried() {
     let iso_url = tmp.url();
     drop(connect_store_with_retry(&iso_url).expect("fresh open"));
     let mut node = postgres::Client::connect(&iso_url, postgres::NoTls).unwrap();
-    node.batch_execute(
-        "DELETE FROM busbar_schema; INSERT INTO busbar_schema (version) VALUES (6);",
-    )
-    .unwrap();
-
-    node.batch_execute(
-        "BEGIN; INSERT INTO store_ops (op_id, body, answer, recorded_at)
-         VALUES ('\\xdead', 'x', '', 1)",
-    )
-    .unwrap();
-    let opening = {
-        let iso_url = iso_url.clone();
-        std::thread::spawn(move || TestStore::open(&iso_url).map(drop))
-    };
-
-    std::thread::sleep(std::time::Duration::from_millis(800));
-    let wanted = node.batch_execute("LOCK TABLE credentials IN ROW EXCLUSIVE MODE");
-    node.batch_execute("COMMIT").ok();
-    let _ = wanted;
-    let opened = opening.join().unwrap();
-    assert!(opened.is_ok(), "the migration was retried: {opened:?}");
+    node.batch_execute(&format!(
+        "DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES ({FIRST_RELEASED_SCHEMA});
+         CREATE SEQUENCE migration_attempt;
+         CREATE FUNCTION fail_first_migration() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF nextval('migration_attempt') = 1 THEN
+             RAISE EXCEPTION 'injected migration deadlock' USING ERRCODE = '40P01';
+           END IF;
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER migration_deadlock BEFORE INSERT ON busbar_schema
+         FOR EACH ROW EXECUTE FUNCTION fail_first_migration();"
+    )).unwrap();
+    TestStore::open(&iso_url).expect("a server-decided deadlock is retried");
+    let attempts: i64 = node
+        .query_one("SELECT last_value FROM migration_attempt", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        attempts, 2,
+        "the first migration failed and exactly one retry succeeded"
+    );
 }
 
 /// A database stamped ABOVE this build is refused at open, with the reason: an older binary would
+/// ignore newer rules (the epoch fence among them).
 #[test]
 fn migrate_refuses_a_database_stamped_newer_than_this_build() {
     let Some(url) = live_url() else { return };
@@ -1734,6 +1811,12 @@ fn migrate_refuses_a_database_stamped_newer_than_this_build() {
 }
 
 /// `migrate`/`migrate_locked` must never silently succeed against a role that lacks real read
+/// access to its own bookkeeping table -- built with a role granted CREATE/INSERT but deliberately
+/// NEVER SELECT on `busbar_schema`, so a genuine SQLSTATE 42501 (insufficient_privilege) surfaces
+/// somewhere in `migrate_locked`'s statement sequence (Postgres requires SELECT on the target table
+/// for `INSERT ... ON CONFLICT`, even `DO NOTHING`, confirmed empirically against this exact
+/// fixture -- not just for the version-probe `SELECT` itself), and `connect()` must propagate that
+/// as an `Err`, never proceed as if the database were merely fresh.
 #[test]
 fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() {
     let Some(url) = live_url() else { return };
@@ -1787,6 +1870,7 @@ fn migrate_propagates_a_non_undefined_table_error_and_never_silently_succeeds() 
 }
 
 /// TWO NODES BOOTING AGAINST ONE FRESH DATABASE. Every node runs `migrate()` on connect, and a fleet
+/// restarted together does it at the same instant; `pg_advisory_lock` is what serialises them.
 #[test]
 fn two_nodes_opening_a_fresh_database_together_both_migrate_cleanly() {
     let Some(url) = live_url() else { return };
@@ -1855,6 +1939,8 @@ fn two_nodes_opening_a_fresh_database_together_both_migrate_cleanly() {
 mod store_conformance;
 
 /// The cross-backend `Store` conformance checks, answered by this backend — EVERY check the suite
+/// offers: the key/credential/audit rulings the fleet used to settle differently per backend, and
+/// the 1.6.0 plane-record battery.
 mod conformance {
     use super::plane_records::lock_plane_purge;
     use super::store_conformance as conf;
@@ -1866,6 +1952,7 @@ mod conformance {
     }
 
     /// Delete every row this suite is about to write, so a rerun (or a crashed prior run that left
+    /// rows behind) starts from the same state as a first run.
     fn reset(store: &TestStore, ns: &str, seq: u64) {
         let mut client = store.lock();
         for id in conf::key_ids(ns) {
@@ -2318,3 +2405,21 @@ mod postgres_clock;
 
 #[path = "tests/kept_product.rs"]
 mod kept_product;
+
+#[test]
+fn corrupt_key_labels_are_refused() {
+    for invalid in ["{", "[]", "null", "{\"key\":1}"] {
+        assert!(labels_from_storage(invalid).is_err());
+    }
+    assert!(labels_from_storage("{}").unwrap().is_empty());
+}
+
+#[test]
+fn server_diagnostics_escape_controls_and_bound_output() {
+    let error = pgwire::Error::server("22000", &format!("bad\n\u{1b}{}", "x".repeat(5000)));
+    let rendered = render_pg_error(&error);
+    assert!(rendered.starts_with("22000:"));
+    assert!(!rendered.chars().any(char::is_control));
+    assert!(rendered.ends_with("[truncated]"));
+    assert!(rendered.len() < 4200);
+}

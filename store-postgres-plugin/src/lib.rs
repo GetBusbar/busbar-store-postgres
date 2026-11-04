@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The **Postgres store as a droppable busbar plugin** — the `cdylib` a signed tarball of the store
+//! carries (`kind: store`, alias `postgres`).
 
 #![deny(unsafe_code)]
 

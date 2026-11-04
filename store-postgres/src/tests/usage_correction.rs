@@ -698,3 +698,28 @@ fn malformed_rows_are_rejected_before_any_replacement_or_receipt() {
         assert_eq!(revision(&store), before);
     }
 }
+
+#[test]
+fn correction_does_not_decode_another_keys_metering() {
+    let Some(url) = live_url() else { return };
+    let db = TempDb::create(&url, "spg_correction_scope");
+    let store = seed(&db);
+    let mut unrelated = meter();
+    unrelated.key_id = "unrelated-key".into();
+    store.add_metering(&unrelated).unwrap();
+    store
+        .lock()
+        .batch_execute(
+            "ALTER TABLE usage_metering ALTER COLUMN requests DROP NOT NULL;
+         UPDATE usage_metering SET requests=NULL WHERE key_id='unrelated-key'",
+        )
+        .unwrap();
+    assert_eq!(
+        apply(&store, &request(UsageLedger::default(), ledger(1))).unwrap(),
+        Decision::Applied
+    );
+    assert!(
+        store.list_metering(DAY).is_err(),
+        "the unrelated row really cannot decode"
+    );
+}

@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store's two doors, as this repo's tests open them: COMPILED IN (the logic crate's `door`,
+//! through the loader's `load_linked`) and DROPPED IN (this crate's built cdylib, `dlopen`ed by the
+//! loader's `load_dropped`, which resolves `busbar_plugin_door` and admits it against the Statement
+//! the signed manifest would carry).
 
 #![allow(dead_code)]
 
@@ -19,16 +22,19 @@ use busbar_plugin_loader::store_v3::LoadedStore;
 pub mod postgres_io;
 
 /// The actual freshly built own-library artifact selected by [`plugin_path`]. Missing is a
+/// test failure, never a skip.
 pub fn cdylib() -> PathBuf {
     plugin_path()
 }
 
 /// The Statement rendering the signed manifest states: the linked door's own (the cdylib is the
+/// same crate).
 pub fn stated() -> Vec<u8> {
     rendering_of(busbar_store_postgres::door).expect("the store renders its Statement")
 }
 
 /// A fresh `op_id` for every bridge write: a node half no other open (in this run or an earlier
+/// one) used.
 pub fn mint() -> busbar_contract::abi::store::OpId {
     static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -46,6 +52,7 @@ pub fn mint() -> busbar_contract::abi::store::OpId {
 }
 
 /// The instance's binding: its connections over the loader's test connection table (plain TCP),
+/// woken through the dispatcher, as busbar's one connector serves a store's `tcp` need.
 pub fn bind(d: &Dispatcher) -> Bind {
     Bind {
         instance: Arc::from("store-postgres-test"),
@@ -65,6 +72,7 @@ pub fn linked(settings: &str) -> Result<LoadedStore, String> {
 }
 
 /// The library at `path` through the DROPPED-IN door, admitted against [`stated`] and opened on
+/// `settings`.
 pub fn dropped_at(path: &Path, settings: &str) -> Result<LoadedStore, String> {
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let p = load_dropped::<Store>(path, &stated(), bind(&d)).map_err(|e| e.to_string())?;
@@ -117,6 +125,7 @@ pub fn plugin_path() -> PathBuf {
 }
 
 /// The busbar checkout the real binaries are built from: `BUSBAR_CHECKOUT` when set, else a sibling
+/// `busbar/` beside this repo.
 pub fn busbar_root() -> PathBuf {
     let root = std::env::var_os("BUSBAR_CHECKOUT")
         .map(PathBuf::from)
@@ -131,6 +140,8 @@ pub fn busbar_root() -> PathBuf {
 }
 
 /// Build (once, cached by cargo) and return the path to the real `busbar` binary and the real
+/// `busbar-plugin-pack` binary, both from the sibling busbar checkout — never a fixture, never a
+/// stub, the exact binaries a real release ships.
 pub fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
 
@@ -183,3 +194,6 @@ pub const E2E_RELEASE_PUBKEY: &str =
     "9209607c315f66473c8cca8bf9a7b8031115d01bb47341613cebf57f0e4f271c";
 pub const E2E_RELEASE_PRIVKEY: &str =
     "290f2453f236650ab21b85a95d49b9dab088518e829e4d524b01e441636ab327";
+
+#[allow(dead_code)]
+pub(crate) mod temp_db;

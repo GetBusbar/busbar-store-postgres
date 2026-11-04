@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The Postgres frontend protocol over the host's connector: a small async client whose every byte
+//! goes through the op's one connection ([`Wire`], the store SDK's `wire`), so this store opens no
+//! socket of its own.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -92,6 +94,7 @@ fn config_err(what: impl Into<String>) -> Error {
 }
 
 /// How long the host's connector lets a dialled socket sit idle before the OS probes it
+/// (`busbar-core-connector`'s `KEEPALIVE_IDLE`, 1.5.5's `tcp_keepalive(60s)`), in seconds.
 const KEEPALIVE_IDLE_SECS: i64 = 60;
 
 /// Why a socket-tuning option has no effect.
@@ -100,12 +103,23 @@ const INERT_SOCKET: &str = "the host's connector dials every connection with TCP
                             per-store setting for it";
 
 /// Log, at debug (below the default level), that the accepted option `key=value` has no effect,
+/// and why.
 fn inert(key: &str, value: &str, why: &str) {
     tracing::debug!("postgres connection option {key}={value} has no effect: {why}");
 }
 
 /// The most a message may declare: Postgres' own ceiling on a value (1 GiB) plus the four bytes
+/// of the length word, which the declared length counts.
 const MAX_MESSAGE_LEN: u32 = (1 << 30) + 4;
+const MAX_CONTROL_MESSAGE_LEN: u32 = 30_000;
+
+fn message_limit(tag: u8, authenticated: bool) -> u32 {
+    if authenticated && matches!(tag, b'D' | b'E' | b'N' | b'A' | b'd') {
+        MAX_MESSAGE_LEN
+    } else {
+        MAX_CONTROL_MESSAGE_LEN
+    }
+}
 
 /// The handshake bound when the DSN has no `connect_timeout`.
 const DEFAULT_CONNECT_TIMEOUT_MS: u32 = 30_000;
@@ -118,6 +132,7 @@ impl Config {
     }
 
     /// Parse a libpq connection string: `postgres[ql]://user:pass@host:port/db?key=value&...` or
+    /// `host=... port=... user=... password=... dbname=... sslmode=...`.
     pub fn parse(s: &str) -> Result<Self, Error> {
         Self::captured(CredUrl::parse_postgres(s).map_err(config_err)?)
     }
@@ -364,16 +379,6 @@ impl Config {
         let text = zeroize::Zeroizing::new(text);
         self.credentials.redact_echo(&text)
     }
-
-    /// Every endpoint, in the order a connect tries them: `(name, dial host:port)`.
-    #[cfg(test)]
-    #[must_use]
-    pub fn targets(&self) -> Vec<(&str, String)> {
-        self.endpoints
-            .iter()
-            .map(|e| (e.name.as_str(), target(&e.dial, e.port)))
-            .collect()
-    }
 }
 
 fn target(host: &str, port: u16) -> String {
@@ -385,6 +390,7 @@ fn target(host: &str, port: u16) -> String {
 }
 
 /// libpq's host, hostaddr and port lists, paired by position: one port for every endpoint, or one
+/// per endpoint; a hostaddr is the address to dial (an IP) and its host the name.
 fn endpoints(
     hosts: Option<&str>,
     hostaddrs: Option<&str>,
@@ -465,6 +471,7 @@ fn decode(s: &str) -> Result<String, Error> {
 }
 
 /// The libpq keyword form: `key=value` pairs, whitespace around `=` allowed, single-quoted values
+/// with `\'` and `\\` escapes.
 pub(super) fn keywords(s: &str) -> Result<Vec<(String, String)>, Error> {
     let mut out = Vec::new();
     let mut it = s.chars().peekable();
@@ -559,25 +566,42 @@ pub struct DbError {
 }
 
 impl DbError {
-    fn parse(body: &ErrorResponseBody) -> Self {
+    fn parse(body: &ErrorResponseBody) -> Result<Self, Error> {
         let mut e = DbError {
             severity: String::new(),
             code: SqlState(String::new()),
             message: String::new(),
             constraint: None,
         };
+        let mut has_message = false;
         let mut fields = body.fields();
-        while let Ok(Some(f)) = fields.next() {
+        while let Some(f) = fields.next().map_err(parse_err)? {
             let v = String::from_utf8_lossy(f.value_bytes()).into_owned();
             match f.type_() {
                 b'S' => e.severity = v,
                 b'C' => e.code = SqlState(v),
-                b'M' => e.message = v,
+                b'M' => {
+                    has_message = true;
+                    e.message = v;
+                }
                 b'n' => e.constraint = Some(v),
                 _ => {}
             }
         }
-        e
+        if e.code.0.len() != 5
+            || !e
+                .code
+                .0
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+            || e.severity.is_empty()
+            || !has_message
+        {
+            return Err(parse_err(
+                "malformed ErrorResponse: missing or invalid required fields",
+            ));
+        }
+        Ok(e)
     }
 
     /// The SQLSTATE.
@@ -625,6 +649,13 @@ impl Error {
         Self(Box::new(k))
     }
 
+    fn response(body: &ErrorResponseBody) -> Self {
+        match DbError::parse(body) {
+            Ok(error) => Self::new(Kind_::Db(error)),
+            Err(error) => error,
+        }
+    }
+
     /// The server's failure, when it is one.
     #[must_use]
     pub fn as_db_error(&self) -> Option<&DbError> {
@@ -638,18 +669,6 @@ impl Error {
     #[must_use]
     pub fn code(&self) -> Option<&SqlState> {
         self.as_db_error().map(DbError::code)
-    }
-
-    /// A server failure with SQLSTATE `code` and `message`, as an `ErrorResponse` decodes.
-    #[cfg(test)]
-    #[must_use]
-    pub fn server(code: &str, message: &str) -> Self {
-        Self::new(Kind_::Db(DbError {
-            severity: "ERROR".to_string(),
-            code: SqlState(code.to_string()),
-            message: message.to_string(),
-            constraint: None,
-        }))
     }
 
     /// A connect failure (the host's connector could not reach the server).
@@ -671,7 +690,7 @@ impl fmt::Display for Error {
             Kind_::Authentication(c) => write!(f, "authentication error: {c}"),
             Kind_::Config(c) => write!(f, "invalid configuration: {c}"),
             Kind_::ToSql(i, c) => write!(f, "error serializing parameter {i}: {c}"),
-            Kind_::FromSql(i, c) => write!(f, "error deserializing column `{i}`: {c}"),
+            Kind_::FromSql(name, c) => write!(f, "error deserializing column `{name}`: {c}"),
             Kind_::Column(c) => write!(f, "invalid column `{c}`"),
             Kind_::RowCount => f.write_str("query returned an unexpected number of rows"),
             Kind_::Parameters(want, got) => {
@@ -763,6 +782,7 @@ struct Statement {
 }
 
 /// How many statements a connection keeps prepared: past it, the least recently run is closed
+/// (the store's variable-arity batches would otherwise prepare one per batch size, without end).
 const STATEMENTS_KEPT: usize = 256;
 
 /// The connection's prepared statements, by SQL text. Kept WITH the connection (the wire's session:
@@ -820,17 +840,25 @@ impl Cache {
 }
 
 /// A cached statement's run failed because the server no longer has it as prepared: `26000`
+/// (`invalid_sql_statement_name`, the session's statements were deallocated) or `0A000` (a schema
+/// change altered its result type, "cached plan must not change result type").
 fn is_stale_statement(e: &Error) -> bool {
     matches!(e.code().map(SqlState::code), Some("26000" | "0A000"))
 }
 
 /// One connection to the server, over the op's wire. The connection is KEPT for the instance's
+/// next op (the store SDK's kept set) only when [`Client::release`] finds the session idle: the
+/// last message read was `ReadyForQuery` with status `I` (no transaction open or failed), nothing
+/// is left unread and no transaction awaits its rollback.
 pub struct Client {
     wire: Wire,
+    authenticated: bool,
+    credentials: CredUrl,
     buf: BytesMut,
     /// A `Transaction` was dropped uncommitted: roll it back before the next statement.
     rollback_pending: bool,
     /// The transaction status of the last `ReadyForQuery` (`I` idle, `T` in a transaction, `E` in
+    /// a failed one).
     status: u8,
     /// The last message read was `ReadyForQuery` and nothing was sent after it.
     at_ready: bool,
@@ -859,6 +887,7 @@ fn auth_err(why: impl fmt::Display) -> Error {
 }
 
 /// Keep postgres-protocol's ordered, extension-free server-first grammar and its 100,000
+/// iteration ceiling.
 fn scram_server_first(bytes: &[u8]) -> Result<&str, Error> {
     let bad = || auth_err("malformed SCRAM server-first message");
     let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
@@ -902,6 +931,7 @@ fn scram_base64(b: u8) -> bool {
 }
 
 /// No ambiguous attributes: the server-final is one verifier or one refusal. Peer-provided
+/// refusal text is withheld because it may echo credential material.
 fn scram_server_final(bytes: &[u8]) -> Result<&str, Error> {
     let text =
         std::str::from_utf8(bytes).map_err(|_| auth_err("malformed SCRAM server-final message"))?;
@@ -922,7 +952,23 @@ fn scram_server_final(bytes: &[u8]) -> Result<&str, Error> {
 pub type Param<'a> = &'a (dyn ToSql + Sync);
 
 impl Client {
+    fn response(&self, body: &ErrorResponseBody) -> Error {
+        let mut error = Error::response(body);
+        if let Kind_::Db(db) = &mut *error.0 {
+            let message = zeroize::Zeroizing::new(std::mem::take(&mut db.message));
+            db.message = self.credentials.redact_echo(&message);
+            if let Some(constraint) = db.constraint.take() {
+                let constraint = zeroize::Zeroizing::new(constraint);
+                db.constraint = Some(self.credentials.redact_echo(&constraint));
+            }
+            let severity = zeroize::Zeroizing::new(std::mem::take(&mut db.severity));
+            db.severity = self.credentials.redact_echo(&severity);
+        }
+        error
+    }
+
     /// Connect over `wire` (its need 0) to the server `cfg` names, secure the connection when
+    /// `cfg` asks, and authenticate.
     pub async fn connect(
         wire: Wire,
         cfg: &Config,
@@ -979,6 +1025,8 @@ impl Client {
         };
         let mut c = Client {
             wire: wire.clone(),
+            authenticated: reused,
+            credentials: cfg.credentials.clone(),
             buf: BytesMut::new(),
             rollback_pending: false,
             status: b'I',
@@ -993,6 +1041,7 @@ impl Client {
             wire.bound(ms);
         }
         c.handshake(cfg, endpoint).await?;
+        c.authenticated = true;
         wire.unbound();
         Ok(c)
     }
@@ -1021,6 +1070,7 @@ impl Client {
     }
 
     /// Secure the stream after the server's `S`: verified against the host's trust anchors for
+    /// `require` and up, unverified for `prefer` (libpq).
     async fn upgrade(&mut self, cfg: &Config, endpoint: &Endpoint) -> Result<(), Error> {
         if !self.buf.is_empty() {
             return Err(Error::new(Kind_::Tls(
@@ -1142,7 +1192,7 @@ impl Client {
                     }
                     authenticated = true;
                 }
-                Message::ErrorResponse(e) => return Err(Error::new(Kind_::Db(DbError::parse(&e)))),
+                Message::ErrorResponse(e) => return Err(self.response(&e)),
                 Message::NoticeResponse(_) => {}
                 _ => {
                     return Err(Error::new(Kind_::Authentication(
@@ -1154,7 +1204,7 @@ impl Client {
         loop {
             match self.read().await? {
                 Message::ReadyForQuery(_) => return Ok(()),
-                Message::ErrorResponse(e) => return Err(Error::new(Kind_::Db(DbError::parse(&e)))),
+                Message::ErrorResponse(e) => return Err(self.response(&e)),
                 _ => {}
             }
         }
@@ -1163,7 +1213,7 @@ impl Client {
     /// An authentication message, a server failure answered as one.
     async fn read_auth(&mut self) -> Result<Message, Error> {
         match self.read().await? {
-            Message::ErrorResponse(e) => Err(Error::new(Kind_::Db(DbError::parse(&e)))),
+            Message::ErrorResponse(e) => Err(self.response(&e)),
             m => Ok(m),
         }
     }
@@ -1175,6 +1225,7 @@ impl Client {
     }
 
     /// The op is done with the connection: keep it if the session is idle, else it is discarded
+    /// when the client drops.
     pub async fn release(&mut self) {
         if self.rollback_pending
             && self.at_ready
@@ -1234,9 +1285,9 @@ impl Client {
         loop {
             if let Some(h) = self.buf.get(1..5) {
                 let len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
-                if len > MAX_MESSAGE_LEN {
+                if len > message_limit(self.buf[0], self.authenticated) {
                     return Err(Error::new(Kind_::Parse(format!(
-                        "protocol error: the server declared a message of {len} bytes (over 1 GiB)"
+                        "protocol error: the server declared a message of {len} bytes (over the protocol message limit)"
                     ))));
                 }
             }
@@ -1284,7 +1335,7 @@ impl Client {
             match self.read().await {
                 Ok(Message::ReadyForQuery(_)) => break,
                 Ok(Message::ErrorResponse(e)) if failed.is_none() => {
-                    failed = Some(Error::new(Kind_::Db(DbError::parse(&e))));
+                    failed = Some(self.response(&e));
                 }
                 Ok(_) => {}
 
@@ -1307,6 +1358,7 @@ impl Client {
     }
 
     /// Run one statement with `params`: its rows and the rows it affected. A statement the
+    /// connection has prepared runs in one round trip; one it has not is prepared first.
     async fn run(&mut self, sql: &str, params: &[Param<'_>]) -> Result<(Vec<Row>, u64), Error> {
         self.settle().await?;
         let cached = self.cache().get(sql);
@@ -1332,6 +1384,7 @@ impl Client {
     }
 
     /// Prepare `sql` under a new name (the parameter and column types: one round trip, which also
+    /// closes the statements the cache dropped) and cache it.
     async fn prepare(&mut self, sql: &str) -> Result<Arc<Statement>, Error> {
         let name = {
             let mut c = self.cache();
@@ -1369,7 +1422,7 @@ impl Client {
                     }
                 }
                 Message::ErrorResponse(e) => {
-                    let err = Error::new(Kind_::Db(DbError::parse(&e)));
+                    let err = self.response(&e);
 
                     let _ = self.drain().await;
                     return Err(err);
@@ -1468,7 +1521,7 @@ impl Client {
                         .unwrap_or(0);
                 }
                 Message::ErrorResponse(e) if failed.is_none() => {
-                    failed = Some(Error::new(Kind_::Db(DbError::parse(&e))));
+                    failed = Some(self.response(&e));
                 }
                 Message::ReadyForQuery(_) => break,
                 _ => {}
@@ -1543,6 +1596,8 @@ pub enum IsolationLevel {
 }
 
 /// The one simple-query batch that begins a transaction at `isolation` (`None` = READ COMMITTED,
+/// stated, so a DSN's `default_transaction_isolation` cannot change what the store's statements
+/// assume).
 #[must_use]
 pub fn begin_sql(isolation: Option<IsolationLevel>) -> &'static str {
     match isolation {

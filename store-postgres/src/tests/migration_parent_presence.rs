@@ -41,7 +41,7 @@ fn schemas(raw: &mut postgres::Client) -> Vec<i64> {
         .collect()
 }
 
-fn legacy_v13(raw: &mut postgres::Client) {
+fn legacy_v6(raw: &mut postgres::Client) {
     raw.batch_execute(
         "ALTER TABLE plane_chain DROP COLUMN has_parent;
          DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES (6)",
@@ -68,7 +68,7 @@ fn append_v13(raw: &mut postgres::Client, record: &PlaneRecord) {
 }
 
 #[test]
-fn pre14_ambiguous_parent_presence_refuses_without_rewriting_and_retries_identically() {
+fn released_v6_ambiguous_parent_presence_refuses_without_rewriting_and_retries_identically() {
     let Some(url) = live_url() else { return };
 
     for (kind, parented) in [("task_event", true), ("call", true), ("opaque", false)] {
@@ -81,7 +81,7 @@ fn pre14_ambiguous_parent_presence_refuses_without_rewriting_and_retries_identic
         );
         drop(store);
         let mut raw = connect_client_with_retry(&db.url());
-        legacy_v13(&mut raw);
+        legacy_v6(&mut raw);
         append_v13(&mut raw, &record);
         let safe = envelope("safe", "child", Some("different-parent"));
         append_v13(&mut raw, &safe);
@@ -93,7 +93,7 @@ fn pre14_ambiguous_parent_presence_refuses_without_rewriting_and_retries_identic
                 .err()
                 .expect("lost legacy parent presence requires provenance, not a guessed migration");
             assert!(
-                error.contains("pre-v14 plane_chain parent presence is ambiguous"),
+                error.contains("released-v6 plane_chain parent presence is ambiguous"),
                 "{error}"
             );
             assert!(
@@ -122,14 +122,14 @@ fn pre14_ambiguous_parent_presence_refuses_without_rewriting_and_retries_identic
 }
 
 #[test]
-fn pre14_unambiguous_parent_migrates_reopens_and_accepts_identical_replay() {
+fn released_v6_unambiguous_parent_migrates_reopens_and_accepts_identical_replay() {
     let Some(url) = live_url() else { return };
     let db = TempDb::create(&url, "spg_parent_safe");
     let store = TestStore::open(&db.url()).unwrap();
     let record = envelope("task_event", "child", Some("parent"));
     drop(store);
     let mut raw = connect_client_with_retry(&db.url());
-    legacy_v13(&mut raw);
+    legacy_v6(&mut raw);
     append_v13(&mut raw, &record);
     let before = chain_rows(&mut raw);
     let revision = global_revision(&mut raw);

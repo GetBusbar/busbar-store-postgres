@@ -155,7 +155,7 @@ fn v15_negative_timestamp_provenance_is_refused_without_partial_migration() {
         drop(store);
         let error = TestStore::open(&db.url())
             .err()
-            .expect("pre-v16 negative timestamp provenance is unknown");
+            .expect("released-v6 negative timestamp provenance is unknown");
         assert!(error.contains("negative credential timestamp"), "{error}");
         let mut raw = connect_client_with_retry(&db.url());
         let unchanged = raw.query_one(&format!(

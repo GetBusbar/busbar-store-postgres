@@ -962,7 +962,10 @@ fn postgres_refuses_a_schema_newer_than_its_build_through_both_doors() {
             Err(error) => error,
             Ok(_) => panic!("newer schema refused"),
         };
-        assert!(!e.is_empty(), "schema refusal states why");
+        assert!(
+            e.contains("is newer than this build"),
+            "schema refusal states why: {e}"
+        );
         drop_fold_schema(&name, &settings);
     }
 }

@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! **ONE POSTGRES STORE, BOTH DOORS, ONE TABLE** — the store's linked + dropped-in conformance on
+//! the store kind's door (THE DESIGN §11), run against the busbar rev this repo pins
+//! (`.busbar-ref`).
 
 mod common;
 
@@ -13,6 +15,7 @@ mod host_boundaries;
 mod store_contract;
 
 /// The live Postgres's address (`BUSBAR_TEST_POSTGRES_URL`'s authority; the service container's
+/// default when unset).
 fn upstream() -> &'static str {
     static AT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     AT.get_or_init(|| {
@@ -59,6 +62,7 @@ fn create_fold_schema(namespace: &str, settings: &[u8]) {
 }
 
 /// The suite's namespace hook: the fold's schema and everything the store made in it, dropped after
+/// the fold.
 fn drop_fold_schema(namespace: &str, settings: &[u8]) {
     fold_client(settings)
         .batch_execute(&format!("DROP SCHEMA IF EXISTS \"{namespace}\" CASCADE"))
@@ -75,6 +79,8 @@ use busbar_plugin_loader::store_v3::LoadedStore;
 use std::sync::Arc;
 
 /// The live Postgres, by this repo's one gate: set → `Some`; unset under CI → a FAILURE (the
+/// service container must provision it); unset locally → `None` (the durable scenario is skipped,
+/// everything else still runs).
 fn live_url() -> Option<String> {
     match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
         Ok(url) => Some(url),
@@ -90,6 +96,7 @@ fn live_url() -> Option<String> {
 }
 
 /// One durable scenario through `store`, every id namespaced by `ns` so the two doors (and
+/// concurrent runs) never read each other's rows; the transcript names ids WITHOUT the namespace.
 fn scenario(store: &dyn RecordStore, ns: &str) -> serde_json::Value {
     let kind = "conformance_task";
     let child = "conformance_event";
@@ -184,6 +191,7 @@ fn transcript(
 }
 
 /// The Postgres store behaves as ONE store through either door; the RED arms below show the
+/// comparison is not vacuous.
 #[test]
 fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
     let live = live_url();
@@ -235,6 +243,8 @@ fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
 }
 
 /// RED: DIFFERENT bytes (the object's magic broken) are not the store. The foreign image is
+/// written under its own directory, so the loader `dlopen`s a path no good image was ever loaded
+/// from, whatever order the tests in this target run in.
 #[test]
 fn foreign_bytes_dropped_in_are_not_the_postgres_store() {
     let lib = common::plugin_path();

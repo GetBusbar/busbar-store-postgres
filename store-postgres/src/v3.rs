@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The store v3 slots this backend answers beyond the base op set ([`StoreSlots`]): the
+//! `op_id`-carrying writes (the usage and metering batches and the plane-record append), the
+//! kernel-held records, and the door (`store_door!`) over all of it.
 
 use std::sync::atomic::Ordering;
 
@@ -33,6 +35,7 @@ const NO_TEXT: AbiStr = AbiStr {
 };
 
 /// The store's one need: the server, dialled over `tcp` at the DSN's `host:port`, in the
+/// `operator-infrastructure` egress class.
 pub const NEEDS: &[Need] = &[Need {
     direction: DIRECTION_OUTBOUND,
     egress_class: EGRESS_OPERATOR_INFRASTRUCTURE,
@@ -126,6 +129,8 @@ fn refused(e: RecordStoreError) -> OpRefused {
 }
 
 /// An apply error the server decided from the values (SQLSTATE class 22 data exception, 23
+/// integrity constraint; the text leads with its code, `render_pg_error`) is a refusal: the
+/// transaction rolled back and a retry of the same values fails the same way.
 fn decided(r: OpRefused) -> OpRefused {
     match r {
         OpRefused::Failed(t) if decided_text(&t) => OpRefused::Refused(t),
@@ -143,6 +148,7 @@ fn decided_text(t: &str) -> bool {
 }
 
 /// Claim `op` for `body` (its [`Dedupe::body_hex`]) inside `tx`: insert its row (`None`), or read
+/// the body a committed call recorded.
 async fn claim(tx: &mut Transaction<'_>, op: OpId, body: &str) -> Result<Option<String>, String> {
     let id: &[u8] = &op.0;
     let inserted = tx
@@ -173,9 +179,6 @@ impl Session {
         &mut self,
         request: &correction::Request,
     ) -> OpResult<correction::Decision> {
-        request
-            .validate()
-            .map_err(|e| OpRefused::Refused(e.into()))?;
         let dedupe = Dedupe::usage_correction(request);
         let mut tx = self
             .client()
@@ -200,10 +203,10 @@ impl Session {
             .map_err(|e| OpRefused::Failed(pg(e)))?
             .try_get(0)
             .map_err(|e| OpRefused::Failed(pg(e)))?;
-        let mut metering = Self::list_metering_in(&mut tx, request.day_start)
-            .await
-            .map_err(failed)?;
-        metering.retain(|row| row.key_id == request.key_id);
+        let mut metering =
+            Self::list_metering_for_key_in(&mut tx, request.day_start, Some(&request.key_id))
+                .await
+                .map_err(failed)?;
         correction::canonical_metering(&mut metering);
         let mut matches = live && metering == request.metering;
         for change in &request.usage {
@@ -310,13 +313,20 @@ impl Session {
                     &[&before, &SWEEP_BATCH],
                 )
                 .await;
-            if !matches!(removed, Ok(n) if n == SWEEP_BATCH as u64) {
-                break;
+            match removed {
+                Ok(n) if n == SWEEP_BATCH as u64 => {}
+                Ok(_) => break,
+                Err(error) => {
+                    tracing::warn!("postgres operation receipt sweep failed: {}", pg(error));
+                    break;
+                }
             }
         }
     }
 
     /// One `op_id`-carrying write in ONE transaction with its dedupe row: a new op runs `apply` and
+    /// commits (`None`); an op already recorded applies nothing and answers the body found, for
+    /// [`Dedupe::answer`].
     async fn deduped(
         &mut self,
         op: OpId,
@@ -376,7 +386,7 @@ impl Session {
             .client()
             .transaction()
             .await
-            .map_err(|e| OpRefused::Failed(pg(e)))?;
+            .map_err(|e| decided(OpRefused::Failed(pg(e))))?;
 
         Session::lock_revision(&mut tx).await.map_err(failed)?;
         if let Some(recorded) = claim(&mut tx, request.op_id, &dedupe.body_hex())
@@ -384,7 +394,9 @@ impl Session {
             .map_err(OpRefused::Failed)?
         {
             dedupe.answer(Ok(Some(recorded)))?;
-            tx.rollback().await.map_err(|e| OpRefused::Failed(pg(e)))?;
+            tx.rollback()
+                .await
+                .map_err(|e| decided(OpRefused::Failed(pg(e))))?;
             return Ok(Decision::Applied);
         }
         for predicate in &request.predicates {
@@ -394,17 +406,19 @@ impl Session {
                     &[&predicate.schema, &predicate.key],
                 )
                 .await
-                .map_err(|e| OpRefused::Failed(pg(e)))?;
+                .map_err(|e| decided(OpRefused::Failed(pg(e))))?;
             let value = row
                 .map(|row| row.try_get::<_, Vec<u8>>(0))
                 .transpose()
-                .map_err(|e| OpRefused::Failed(pg(e)))?;
+                .map_err(|e| decided(OpRefused::Failed(pg(e))))?;
             let matches = match &predicate.expected {
                 Expected::Absent => value.is_none(),
                 Expected::Bytes(expected) => value.as_ref() == Some(expected),
             };
             if !matches {
-                tx.rollback().await.map_err(|e| OpRefused::Failed(pg(e)))?;
+                tx.rollback()
+                    .await
+                    .map_err(|e| decided(OpRefused::Failed(pg(e))))?;
                 return Ok(Decision::ConditionConflict);
             }
         }
@@ -422,7 +436,7 @@ impl Session {
                     exact_key_length,
                 } => Self::record_delete_range_in(&mut tx, schema, prefix, *exact_key_length).await,
             }
-            .map_err(OpRefused::Failed)?;
+            .map_err(|e| decided(OpRefused::Failed(e)))?;
         }
         tx.commit().await.map_err(|e| OpRefused::Failed(pg(e)))?;
 
@@ -619,6 +633,7 @@ fn record(bytes: Vec<u8>) -> Result<RecordBytes, String> {
 }
 
 /// Parse with the SDK's wiping settings reader: a host secret marker is restored from its
+/// lent slot, and every DSN is captured before any public connection option is parsed.
 fn parse_settings(settings: &[u8], secrets: &[&[u8]]) -> Result<PostgresStore, String> {
     use busbar_contract::abi::sdk::cred::{settings_lent, PostgresUrl, SettingsError};
 
@@ -708,6 +723,7 @@ impl StoreSlots for PostgresStore {
     }
 
     /// Reach the server and ensure the schema (connect + migrate, at the same moment: the load),
+    /// in the driver's words when it cannot.
     fn connect(&self, cx: &mut Op<'_>) -> Step<Result<(), String>> {
         on_conn!(self, cx, |e| e, |s| s.migrate().await.map_err(|e| e.0))
     }

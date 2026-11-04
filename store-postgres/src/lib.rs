@@ -5,6 +5,12 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(not(test))]
+#[path = "database_clock.rs"]
+mod database_clock;
+#[cfg(test)]
+#[path = "tests/database_clock.rs"]
+mod database_clock;
 mod pgwire;
 
 use busbar_contract::abi::sdk::store::column::{
@@ -33,7 +39,7 @@ impl<T> IntoStoreResult<T> for Result<T, pgwire::Error> {
 
 /// Render a driver error with its CAUSE: `Display` for a server-side failure is just "db error".
 fn render_pg_error(e: &pgwire::Error) -> String {
-    match e.as_db_error() {
+    let rendered = match e.as_db_error() {
         Some(db) => {
             let mut out = format!("{}: {}", db.code().code(), db.message());
             if let Some(constraint) = db.constraint() {
@@ -42,15 +48,28 @@ fn render_pg_error(e: &pgwire::Error) -> String {
             out
         }
         None => e.to_string(),
+    };
+    let mut safe = String::new();
+    for ch in rendered.chars().take(4096) {
+        if ch.is_control() {
+            safe.extend(ch.escape_default());
+        } else {
+            safe.push(ch);
+        }
     }
+    if rendered.chars().count() > 4096 {
+        safe.push_str(" [truncated]");
+    }
+    safe
 }
 
 /// True when a postgres error is SQLSTATE 42P01 (`undefined_table`), the ONE case `migrate()` reads
+/// as an unversioned database; any other class must never be read as "fresh" and drop a populated one.
 fn is_undefined_table(e: &pgwire::Error) -> bool {
     e.code().map(pgwire::SqlState::code) == Some(pgwire::SqlState::UNDEFINED_TABLE)
 }
 
-/// Store schema version. A database older than v6 is refused: no release ever wrote one. v6 -> v19
+/// Store schema version. A database older than v6 is refused: no release ever wrote one. v6 -> v7.
 pub const SCHEMA_VERSION: i64 = 7;
 
 const TICKET_RECORD_KIND: &str = "ticket";
@@ -62,12 +81,15 @@ const MIGRATE_ATTEMPTS: u32 = 3;
 const FIRST_RELEASED_SCHEMA: i64 = 6;
 
 /// The plane-record kinds whose retention is TERMINAL-ONLY: `purge_plane_records_before` drops a
+/// row of one only once its `disposition` is `Terminal` (an interrupted task waiting on a human sits
+/// still longest).
 const TERMINAL_ONLY_RETENTION_KINDS: [&str; 1] = ["task"];
 
 /// Rows one purge statement removes (and the ids it holds).
 const PURGE_BATCH: i64 = 1000;
 
 /// `(parent kind, child kind)`: purging a parent takes the child CHAIN hanging off it in the same
+/// transaction (a task's event chain has no retention path of its own).
 const PLANE_CHILD_KINDS: [(&str, &str); 1] = [("task", "task_event")];
 
 const SCHEMA: &str = "
@@ -260,8 +282,8 @@ CREATE TABLE IF NOT EXISTS store_records (
 );
 ";
 
-/// The v10 column additions on tables an older database already has (idempotent).
-const MIGRATE_V10_COLUMNS: &str = "
+/// The v7 column additions on tables an older database already has (idempotent).
+const MIGRATE_V7_COLUMNS: &str = "
 ALTER TABLE keys ADD COLUMN IF NOT EXISTS idp_subject TEXT;
 ALTER TABLE keys ADD COLUMN IF NOT EXISTS binding_mode TEXT;
 ALTER TABLE keys ADD COLUMN IF NOT EXISTS minted_by TEXT;
@@ -275,7 +297,7 @@ pub struct PostgresStore {
     shared: std::sync::Arc<Shared>,
 }
 
-/// How many connections an instance keeps: at most eight (1.5.5's pool bound).
+/// How many connections an instance keeps: at most eight (1.5.5 kept one).
 pub const KEPT_CONNECTIONS: usize = 8;
 
 /// What every op of one instance shares.
@@ -304,6 +326,7 @@ impl std::ops::Deref for Session {
 }
 
 /// The four RESERVED unit classes, in the order of the `usage_ledger` token columns
+/// (`tokens_input`, `tokens_output`, `tokens_cache_read`, `tokens_cache_write`).
 const RESERVED_COLUMNS: [&str; 4] = [UNIT_INPUT, UNIT_OUTPUT, UNIT_CACHE_READ, UNIT_CACHE_WRITE];
 
 fn is_reserved_unit(unit: &str) -> bool {
@@ -311,6 +334,7 @@ fn is_reserved_unit(unit: &str) -> bool {
 }
 
 /// Current Unix time in seconds (0 before the epoch): the one source of wall-clock stamps, so no
+/// write path binds a nearby BIGINT such as `revision` to a timestamp column.
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -320,6 +344,7 @@ fn now_secs() -> u64 {
 
 impl PostgresStore {
     /// Capture a borrowed DSN's password before parsing public connection options. Authentication
+    /// and peer-error redaction use the sealed SDK credential; the store keeps no plaintext copy.
     pub fn new(conn_str: &str) -> RecordStoreResult<Self> {
         let config =
             pgwire::Config::parse(conn_str).map_err(|e| RecordStoreError(e.to_string()))?;
@@ -350,6 +375,7 @@ impl PostgresStore {
 
 impl Session {
     /// Open one op's connection over `wire`: connect through the host's connector, secure it when
+    /// the settings ask, authenticate.
     pub(crate) async fn open(
         wire: busbar_contract::abi::sdk::store::wire::Wire,
         shared: std::sync::Arc<Shared>,
@@ -364,6 +390,7 @@ impl Session {
     }
 
     /// The op is done: its connection is kept for the next op if the session is idle, else
+    /// discarded ([`Client::release`]).
     pub(crate) async fn close(mut self) {
         self.client.release().await;
     }
@@ -373,6 +400,7 @@ impl Session {
     }
 
     /// Open a transaction with ONE consistent snapshot (REPEATABLE READ, not READ COMMITTED's
+    /// per-statement snapshot, which tears multi-statement reads like `get_usage`).
     pub(crate) async fn snapshot_consistent_tx<'a>(
         client: &'a mut Client,
     ) -> RecordStoreResult<Transaction<'a>> {
@@ -390,7 +418,7 @@ impl Session {
         let client = self.client();
         client
             .batch_execute(&format!(
-                "SELECT pg_advisory_lock({})",
+                "SET lock_timeout = '30s'; SELECT pg_advisory_lock({}); RESET lock_timeout",
                 Self::MIGRATE_LOCK_KEY
             ))
             .await
@@ -471,7 +499,7 @@ impl Session {
                 .store()?;
             if incompatible {
                 return Err(RecordStoreError(
-                    "postgres store: negative usage key in a pre-v17 database; \
+                    "postgres store: negative usage key in a released-v6 database; \
                      refusing to infer its encoding"
                         .into(),
                 ));
@@ -490,7 +518,7 @@ impl Session {
                 .store()?;
             if incompatible {
                 return Err(RecordStoreError(
-                    "postgres store: negative credential timestamp in a pre-v16 database; \
+                    "postgres store: negative credential timestamp in a released-v6 database; \
                      refusing to infer its encoding"
                         .into(),
                 ));
@@ -498,27 +526,12 @@ impl Session {
         }
 
         if version < SCHEMA_VERSION {
-            tx.batch_execute(MIGRATE_V10_COLUMNS).await.store()?;
+            tx.batch_execute(MIGRATE_V7_COLUMNS).await.store()?;
 
             tx.batch_execute(
                 "ALTER TABLE usage_metering DROP CONSTRAINT IF EXISTS usage_metering_pkey;
                  ALTER TABLE usage_metering ADD CONSTRAINT usage_metering_pkey
                      PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms);",
-            )
-            .await
-            .store()?;
-        }
-
-        if (11..13).contains(&version) {
-            tx.batch_execute(
-                "DROP TABLE IF EXISTS money_slices;
-                 DROP TABLE IF EXISTS money_slots;
-                 DROP TABLE IF EXISTS money_epoch;
-                 DROP TABLE IF EXISTS store_journal;
-                 DROP TABLE IF EXISTS store_sessions;
-                 DELETE FROM store_ops WHERE position(':' IN body) > 0
-                     AND split_part(body, ':', 1) NOT IN
-                     ('append_plane_record', 'add_usage_batch', 'add_metering_batch');",
             )
             .await
             .store()?;
@@ -536,7 +549,7 @@ impl Session {
                 .store()?;
             if ambiguous {
                 return Err(RecordStoreError(
-                    "postgres store: pre-v14 plane_chain parent presence is ambiguous; \
+                    "postgres store: released-v6 plane_chain parent presence is ambiguous; \
                      refusing to infer it; repair requires authoritative envelope provenance \
                      or a verified backup"
                         .into(),
@@ -633,7 +646,7 @@ impl Session {
         Ok(())
     }
 
-    /// Bump and return the store-global revision inside the caller's open transaction. Acquire this
+    /// Lock the store-global revision inside the caller's open transaction. Acquire this
     async fn lock_revision(tx: &mut Transaction<'_>) -> RecordStoreResult<()> {
         tx.query_one(
             "SELECT revision FROM store_revision WHERE only_row FOR UPDATE",
@@ -644,6 +657,7 @@ impl Session {
         Ok(())
     }
 
+    /// Bump and return the store-global revision inside the caller's transaction.
     async fn next_revision(tx: &mut Transaction<'_>) -> RecordStoreResult<i64> {
         tx.query_one(
             "UPDATE store_revision SET revision = revision + 1 WHERE only_row RETURNING revision",
@@ -659,8 +673,8 @@ impl Session {
 fn labels_to_storage(labels: &std::collections::BTreeMap<String, String>) -> String {
     serde_json::to_string(labels).unwrap_or_else(|_| "{}".to_string())
 }
-fn labels_from_storage(stored: &str) -> std::collections::BTreeMap<String, String> {
-    serde_json::from_str(stored).unwrap_or_default()
+fn labels_from_storage(stored: &str) -> RecordStoreResult<BTreeMap<String, String>> {
+    serde_json::from_str(stored).map_err(|_| RecordStoreError("invalid stored key labels".into()))
 }
 
 fn row_to_key(r: &Row) -> RecordStoreResult<VirtualKey> {
@@ -675,7 +689,7 @@ fn row_to_key(r: &Row) -> RecordStoreResult<VirtualKey> {
         enabled: r.try_get(4).store()?,
         created_at: read_u64(r.try_get::<_, i64>(5).store()?),
         group: r.try_get(6).store()?,
-        labels: labels_from_storage(&r.try_get::<_, String>(7).store()?),
+        labels: labels_from_storage(&r.try_get::<_, String>(7).store()?)?,
         expires_at: r.try_get::<_, Option<i64>>(8).store()?.map(read_u64),
         deleted_at: r.try_get::<_, Option<i64>>(9).store()?.map(read_u64),
         revision: read_u64(r.try_get::<_, i64>(10).store()?),
@@ -727,16 +741,20 @@ fn secret_form_to_storage(f: SecretForm) -> &'static str {
         SecretForm::Digest => "digest",
     }
 }
-fn secret_form_from_storage(s: &str) -> SecretForm {
+fn secret_form_from_storage(s: &str) -> RecordStoreResult<SecretForm> {
     match s {
-        "recoverable" => SecretForm::Recoverable,
-        "digest" => SecretForm::Digest,
-        _ => SecretForm::None,
+        "none" => Ok(SecretForm::None),
+        "recoverable" => Ok(SecretForm::Recoverable),
+        "digest" => Ok(SecretForm::Digest),
+        _ => Err(RecordStoreError(
+            "invalid stored credential secret form".into(),
+        )),
     }
 }
 
 const CRED_META_COLUMNS: &str = "id,key_id,kind,slot,public_id,secret_form,created_at,updated_at,expires_at,revoked_at,revoke_reason,revision";
 /// The row index of `secret` in `SELECT {CRED_META_COLUMNS},secret ...`: the column count of
+/// CRED_META_COLUMNS.
 const CRED_SECRET_COLUMN_INDEX: usize = 12;
 
 fn credential_timestamp(value: u64) -> i64 {
@@ -754,7 +772,7 @@ fn row_to_cred_meta(r: &Row) -> RecordStoreResult<CredentialMeta> {
         kind: r.try_get(2).store()?,
         slot: r.try_get::<_, i16>(3).store()? as u8,
         public_id: r.try_get(4).store()?,
-        secret_form: secret_form_from_storage(r.try_get::<_, &str>(5).store()?),
+        secret_form: secret_form_from_storage(r.try_get::<_, &str>(5).store()?)?,
         created_at: read_credential_timestamp(r.try_get::<_, i64>(6).store()?),
         updated_at: read_credential_timestamp(r.try_get::<_, i64>(7).store()?),
         expires_at: r
@@ -771,6 +789,7 @@ fn row_to_cred_meta(r: &Row) -> RecordStoreResult<CredentialMeta> {
 }
 
 /// The `keys` upsert both key writes run; the conflict branch's `WHERE` is the tombstone
+/// precondition (a write not carrying a tombstone never overwrites one).
 const KEY_UPSERT: &str = "INSERT INTO keys
         (id,generation_hash,name,allowed_pools,enabled,created_at,key_group,labels,expires_at,deleted_at,revision,
          idp_subject,binding_mode,minted_by,allowed_scopes_by_kind,idp_provider)
@@ -1181,23 +1200,31 @@ impl Session {
         tx: &mut Transaction<'_>,
         bucket: u64,
     ) -> RecordStoreResult<Vec<MeteringRow>> {
+        Self::list_metering_for_key_in(tx, bucket, None).await
+    }
+
+    async fn list_metering_for_key_in(
+        tx: &mut Transaction<'_>,
+        bucket: u64,
+        key: Option<&str>,
+    ) -> RecordStoreResult<Vec<MeteringRow>> {
         let b = usage_key(bucket);
         let rows = tx
             .query(
                 "SELECT key_id, model, provider,
                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
                     requests, billable_requests, key_group_at_use, pricing_version, priced_from_ms
-                 FROM usage_metering WHERE bucket=$1
+                 FROM usage_metering WHERE bucket=$1 AND ($2::text IS NULL OR key_id=$2)
                  ORDER BY key_id, model, provider, priced_from_ms, key_group_at_use, pricing_version",
-                &[&b],
+                &[&b, &key],
             )
             .await
             .store()?;
         let unit_rows = tx
             .query(
                 "SELECT key_id, model, provider, priced_from_ms, unit, count, key_group_at_use, pricing_version
-                 FROM usage_metering_units WHERE bucket=$1",
-                &[&b],
+                 FROM usage_metering_units WHERE bucket=$1 AND ($2::text IS NULL OR key_id=$2)",
+                &[&b, &key],
             )
             .await
             .store()?;
@@ -1755,34 +1782,7 @@ impl Session {
     }
 
     async fn database_now(tx: &mut Transaction<'_>) -> RecordStoreResult<u64> {
-        #[cfg(test)]
-        {
-            const TEST_CLOCK_SETTING: &str = "busbar.test_database_clock";
-            let fixture: Option<String> = tx
-                .query_one("SELECT current_setting($1,true)", &[&TEST_CLOCK_SETTING])
-                .await
-                .store()?
-                .try_get(0)
-                .store()?;
-            if let Some(fixture) = fixture {
-                let now = fixture
-                    .parse::<i64>()
-                    .map_err(|_| RecordStoreError("invalid database clock fixture".into()))?;
-                return u64::try_from(now)
-                    .map_err(|_| RecordStoreError("database clock precedes Unix epoch".into()));
-            }
-        }
-        let now: i64 = tx
-            .query_one(
-                "SELECT floor(extract(epoch FROM pg_catalog.clock_timestamp()))::bigint",
-                &[],
-            )
-            .await
-            .store()?
-            .try_get(0)
-            .store()?;
-        u64::try_from(now)
-            .map_err(|_| RecordStoreError("database clock precedes Unix epoch".into()))
+        database_clock::now(tx).await
     }
 
     pub(crate) async fn redeem_plane_token(
@@ -1899,6 +1899,7 @@ fn row_to_audit(r: &Row) -> RecordStoreResult<AuditRecord> {
 
 impl Session {
     /// Shared body of `put_credential`/`put_key_with_credential` (`op` names the caller in every
+    /// refusal): upsert on `(key_id, kind, slot)`.
     async fn put_credential_tx(
         tx: &mut Transaction<'_>,
         op: &str,
@@ -1965,7 +1966,7 @@ impl Session {
                     m.id
                 )));
             }
-            let stored: (String, String, i16, String, Option<String>, String) = (
+            let stored: (&str, &str, i16, &str, Option<&str>, &str) = (
                 r.try_get(0).store()?,
                 r.try_get(1).store()?,
                 r.try_get(2).store()?,
@@ -1975,12 +1976,12 @@ impl Session {
             );
             let same = stored
                 == (
-                    m.key_id.clone(),
-                    m.kind.clone(),
+                    m.key_id.as_str(),
+                    m.kind.as_str(),
                     slot,
-                    m.public_id.clone(),
-                    secret_val.map(str::to_owned),
-                    form.to_owned(),
+                    m.public_id.as_str(),
+                    secret_val,
+                    form,
                 )
                 && r.try_get::<_, i64>(6).store()? == created
                 && r.try_get::<_, i64>(7).store()? == updated
@@ -1988,7 +1989,7 @@ impl Session {
             if same {
                 return Ok(false);
             }
-            return Err(live_refused(&stored.0, &stored.1, stored.2));
+            return Err(live_refused(stored.0, stored.1, stored.2));
         }
 
         let occupant: Option<bool> = tx
@@ -2055,6 +2056,7 @@ impl Session {
 /// The writes the store v3 `op_id` slots run inside their dedupe transaction ([`v3`]).
 impl Session {
     /// `add_usage` inside the caller's transaction (the store v3 `op_id` writes and batches run
+    /// it with their dedupe record, in one transaction).
     pub(crate) async fn add_usage_in(
         tx: &mut Transaction<'_>,
         bucket_id: &str,
@@ -2312,6 +2314,8 @@ impl Session {
     }
 
     /// `append_plane_record` inside the caller's transaction: `Ok(true)` once the record is stored
+    /// (or an identical one already was), `Ok(false)` when the conflicting row vanished before the
+    /// share lock held it (retry in a fresh transaction), `Err` on a fork.
     pub(crate) async fn append_plane_record_in(
         tx: &mut Transaction<'_>,
         record: &PlaneRecord,
@@ -2377,4 +2381,5 @@ pub use v3::door;
 pub const NAME: &str = "busbar-store-postgres";
 
 #[cfg(test)]
+#[path = "tests.rs"]
 mod tests;

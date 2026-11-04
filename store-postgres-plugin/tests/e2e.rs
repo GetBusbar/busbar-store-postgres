@@ -41,7 +41,11 @@
 //! install work," and converting them to a full process-boot-and-capture-stderr harness for each
 //! error shape is a much larger, lower-value lift than the persistence test's conversion.
 
+//! These development fixtures permit unsigned plugins; they verify manifest and archive
+//! integrity and loading, not production release-signature trust policy.
+
 mod common;
+use common::temp_db::TempDb;
 
 use common::{build_real_binaries, plugin_path, postgres_url, E2E_RELEASE_PRIVKEY};
 
@@ -50,6 +54,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// RAII guard for a spawned child process: kills and reaps it on drop, including when a panic
+/// unwinds partway through the test (unlike a manual `child.kill()` call placed after the code that
+/// might panic, which never runs if an earlier assertion fails first).
 struct ChildGuard(Child, PathBuf);
 
 impl ChildGuard {
@@ -62,60 +68,6 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
-    }
-}
-
-/// A disposable database that drops itself on drop, panic path included. Written as a trailing
-struct TempDb {
-    admin_url: String,
-    name: String,
-}
-
-impl TempDb {
-    fn create(admin_url: &str, prefix: &str) -> Self {
-        let name = format!(
-            "{prefix}_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let mut maint = postgres::Client::connect(admin_url, postgres::NoTls)
-            .expect("connect to create the disposable database");
-        let _ = maint.execute(&format!("DROP DATABASE IF EXISTS {name}"), &[]);
-        maint
-            .execute(&format!("CREATE DATABASE {name}"), &[])
-            .expect("the boot proof needs its own empty database");
-        Self {
-            admin_url: admin_url.to_string(),
-            name,
-        }
-    }
-
-    /// Rewrite the admin DSN to name this database, keeping the credentials. The shape is the one
-    fn url(&self) -> String {
-        let rest = self
-            .admin_url
-            .split("://")
-            .nth(1)
-            .expect("url must have a scheme");
-        let (userinfo, host_and_db) = rest.rsplit_once('@').expect("url must have userinfo");
-        let (host_port, _) = host_and_db
-            .split_once('/')
-            .expect("url must have a db path");
-        format!("postgres://{userinfo}@{host_port}/{}", self.name)
-    }
-}
-
-impl Drop for TempDb {
-    fn drop(&mut self) {
-        if let Ok(mut maint) = postgres::Client::connect(&self.admin_url, postgres::NoTls) {
-            let _ = maint.execute(
-                &format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.name),
-                &[],
-            );
-        }
     }
 }
 
@@ -141,6 +93,7 @@ fn referenced_env_vars(text: &str) -> Vec<String> {
 }
 
 /// Set a harmless placeholder for every `{ env: NAME }` `config_text` references, so `--validate`
+/// (which now resolves built-in secrets, see `referenced_env_vars`) has something to resolve.
 fn set_referenced_secret_envs(cmd: &mut Command, config_text: &str) {
     for name in referenced_env_vars(config_text) {
         cmd.env(
@@ -151,6 +104,9 @@ fn set_referenced_secret_envs(cmd: &mut Command, config_text: &str) {
 }
 
 /// THE REAL END-TO-END INSTALL PROOF: pack the plugin, drop it in a real `plugins.dir`, run the real
+/// `busbar --validate` against a config naming `store: { module: postgres }` (trust/manifest gate
+/// proof), then boot a REAL `busbar` process (no `--validate`) and poll for real Postgres to
+/// actually be touched — via the documented file-drop mechanism, never a direct `load_store()` call.
 #[test]
 fn load_and_exercise_postgres_plugin_via_file_drop() {
     let Some(admin_url) = postgres_url() else {
@@ -320,6 +276,8 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
 }
 
 /// END-TO-END FAILURE (ABI-contract unit test, see module doc for why this stays a direct
+/// dropped-in load): an `open()` config that cannot produce a usable store surfaces back across
+/// the door as a clean `Err`, never a panic or a silently-succeeded load.
 #[test]
 fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
     let path = plugin_path();
@@ -350,6 +308,7 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
 }
 
 /// A non-plugin library (or a missing file) is refused with a clear error, never a crash. Same
+/// ABI-contract-unit-test rationale as above.
 #[test]
 fn refuses_non_plugin() {
     let err = match common::dropped_at(std::path::Path::new("/definitely/not/a/plugin.so"), "{}") {
@@ -360,6 +319,7 @@ fn refuses_non_plugin() {
 }
 
 /// Serialize a stand-in plane-record body. The store never decodes a body, so the shape only has to
+/// be something THIS test can decode again on the way back.
 fn plane_body(v: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&v).expect("serialize a stand-in body")
 }
@@ -524,6 +484,7 @@ fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 }
 
 /// THE DURABILITY PROOF FOR THE `task` / `task_event` PLANE KINDS (the A2A task store), OVER THE REAL
+/// PLUGIN PATH.
 #[test]
 fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
@@ -760,6 +721,7 @@ fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
 }
 
 /// THE DURABILITY PROOF FOR THE TRUST STATE — the `demotion` kind and the single-use `ask` token
+/// ledger — OVER THE REAL PLUGIN PATH.
 #[test]
 fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
     use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};

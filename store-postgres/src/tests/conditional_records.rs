@@ -372,14 +372,16 @@ fn a_statement_error_rolls_back_all_mutations_and_the_receipt_before_exact_retry
     let rev = revision(&store);
     store.lock().batch_execute(
         "CREATE FUNCTION reject_conditional_z() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
-         IF NEW.key=decode('7a','hex') THEN RAISE EXCEPTION 'conditional rollback probe'; END IF; RETURN NEW; END $$;
+         IF NEW.key=decode('7a','hex') THEN RAISE EXCEPTION 'conditional rollback probe' USING ERRCODE = '23514'; END IF; RETURN NEW; END $$;
          CREATE TRIGGER reject_conditional_z BEFORE INSERT OR UPDATE ON store_records FOR EACH ROW EXECUTE FUNCTION reject_conditional_z()",
     ).unwrap();
     let r = request(
         vec![predicate(b"a", Expected::Bytes(b"old".to_vec()))],
         vec![put(b"a", b"new"), put(b"z", b"new")],
     );
-    assert!(apply(&store, &r).is_err());
+    assert!(
+        matches!(apply(&store, &r), Err(StoreFailure::Refused(text)) if text.starts_with("23514:"))
+    );
     assert_eq!(rows(&store), before);
     assert_eq!(revision(&store), rev);
     assert_eq!(receipts(&store), 0);

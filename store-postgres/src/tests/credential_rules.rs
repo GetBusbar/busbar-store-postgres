@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Busbar Inc and contributors
 
 //! The family's credential rules (R3, R4, R5, R7) and the one-text-per-condition refusals (W2),
+//! against a live Postgres.
 
 use super::*;
 
@@ -50,6 +51,7 @@ fn isolated(tag: &str) -> (TestStore, String, IsolatedSchema) {
 }
 
 /// R3: a revoked credential id is never minted again; a NEW id into the revoked occupant's slot
+/// reclaims the slot, its `created_at` the new credential's.
 #[test]
 fn a_revoked_credential_id_is_never_reminted_but_its_slot_is_reclaimed() {
     if live_url().is_none() {
@@ -82,6 +84,7 @@ fn a_revoked_credential_id_is_never_reminted_but_its_slot_is_reclaimed() {
 }
 
 /// R4: re-putting a live credential with identical content is Ok and writes nothing; different
+/// content is refused.
 #[test]
 fn reputting_a_live_credential_is_ok_when_identical_and_refused_when_different() {
     if live_url().is_none() {
@@ -272,7 +275,9 @@ fn lists_come_back_in_a_deterministic_order() {
         .collect();
     for k in &ids {
         hard_reset(&store, k);
-        store.put_key(&sample_key(k)).unwrap();
+        let mut key = sample_key(k);
+        key.created_at = if k == &ids[0] { 100 } else { 200 };
+        store.put_key(&key).unwrap();
     }
     let listed: Vec<String> = store
         .list_keys()
@@ -281,9 +286,10 @@ fn lists_come_back_in_a_deterministic_order() {
         .map(|k| k.id)
         .filter(|k| k.starts_with(&id))
         .collect();
-    let mut want = listed.clone();
-    want.sort();
-    assert_eq!(listed, want, "list_keys breaks created_at ties by id");
+    assert_eq!(
+        listed, ids,
+        "list_keys orders by created_at, then breaks ties by id"
+    );
 
     let owner = &ids[0];
     store
@@ -292,13 +298,20 @@ fn lists_come_back_in_a_deterministic_order() {
     store
         .put_credential(&sample_cred(owner, 0, &format!("AKIA_W5_0_{id}")))
         .unwrap();
-    let slots: Vec<u8> = store
+    let mut other = sample_cred(owner, 2, &format!("AKIA_W5_OTHER_{id}"));
+    other.meta.kind = "aaa".into();
+    store.put_credential(&other).unwrap();
+    let slots: Vec<(String, u8)> = store
         .list_credentials(owner)
         .unwrap()
         .iter()
-        .map(|c| c.slot)
+        .map(|c| (c.kind.clone(), c.slot))
         .collect();
-    assert_eq!(slots, [0, 1], "list_credentials is (kind, slot) ascending");
+    assert_eq!(
+        slots,
+        [("aaa".into(), 2), ("sigv4".into(), 0), ("sigv4".into(), 1)],
+        "list_credentials is (kind, slot) ascending"
+    );
     for k in &ids {
         hard_reset(&store, k);
     }
