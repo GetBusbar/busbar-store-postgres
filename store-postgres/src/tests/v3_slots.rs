@@ -566,7 +566,7 @@ fn an_op_recorded_by_an_older_build_replays() {
     const BUCKET: u64 = 4_000_000_000_000_003;
     let key_id = format!("{ns}-k");
     let m = MeteringDelta {
-        scale: 6,
+        scale: 0,
         key_id: key_id.clone(),
         bucket: BUCKET,
         model: "m".into(),
@@ -585,11 +585,14 @@ fn an_op_recorded_by_an_older_build_replays() {
     let id = op();
     old_row(
         id,
-        format!("add_metering_batch:{:?}", std::slice::from_ref(&m)),
+        format!(
+            r#"add_metering_batch:[MeteringDelta {{ key_id: {:?}, bucket: {BUCKET}, model: "m", provider: "p", tokens_input: 10, tokens_output: 0, tokens_cache_read: 0, tokens_cache_write: 0, requests: 1, billable_requests: 1, key_group_at_use: "", pricing_version: "v", priced_from_ms: 0, usage_units: {{}} }}]"#,
+            m.key_id,
+        ),
     );
     s.add_metering_op(id, &m).expect("an older body replays");
     let other = MeteringDelta {
-        scale: 6,
+        scale: 0,
         tokens_input: 11,
         ..m.clone()
     };

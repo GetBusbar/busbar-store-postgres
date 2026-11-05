@@ -257,14 +257,19 @@ fn a_released_v6_database_upgrades_in_place_without_losing_a_row() {
         vec![ModelTokens {
             scale: 6,
             model: "model-a".into(),
-            usage_units: units(&[(UNIT_INPUT, 100), (UNIT_OUTPUT, 200), (UNIT_CACHE_WRITE, 7)]),
+            usage_units: units(&[
+                (UNIT_INPUT, 100_000_000),
+                (UNIT_OUTPUT, 200_000_000),
+                (UNIT_CACHE_WRITE, 7_000_000)
+            ]),
         }]
     );
 
     let rows = store.list_metering(86_400).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].priced_from_ms, 0);
-    assert_eq!(rows[0].tokens_input, 100);
+    assert_eq!(rows[0].scale, 6);
+    assert_eq!(rows[0].tokens_input, 100_000_000);
     assert_eq!(rows[0].requests, 12);
     assert_eq!(rows[0].key_group_at_use, "growth");
     assert_eq!(rows[0].pricing_version, "v1");
@@ -292,7 +297,11 @@ fn a_released_v6_database_upgrades_in_place_without_losing_a_row() {
     let mut rows = store.list_metering(86_400).unwrap();
     rows.sort_by_key(|r| r.priced_from_ms);
     assert_eq!(rows.len(), 2);
-    assert_eq!((rows[0].tokens_input, rows[1].tokens_input), (100, 1));
+    assert!(rows.iter().all(|row| row.scale == 6));
+    assert_eq!(
+        (rows[0].tokens_input, rows[1].tokens_input),
+        (100_000_000, 1)
+    );
 
     let mut k = store.get_key("vk_all").unwrap().unwrap();
     k.minted_by = Some("vk_admin".into());
@@ -790,7 +799,7 @@ fn reserved_units(row: &serde_json::Value) -> BTreeMap<String, u64> {
         (UNIT_CACHE_READ, "tokens_cache_read"),
         (UNIT_CACHE_WRITE, "tokens_cache_write"),
     ] {
-        let v = fx_u64(row, col);
+        let v = fx_u64(row, col) * 1_000_000;
         if v != 0 {
             m.insert(unit.to_string(), v);
         }
@@ -812,6 +821,7 @@ fn assert_recorded_1_5_5_admin_counts(store: &TestStore) {
             .iter()
             .filter(|row| row.key_id == expected["id"].as_str().unwrap())
             .collect();
+        assert!(rows.iter().all(|row| row.scale == 6));
         let actual = [
             rows.iter().map(|row| row.requests).sum::<u64>(),
             rows.iter().map(|row| row.tokens_input).sum(),
@@ -826,7 +836,9 @@ fn assert_recorded_1_5_5_admin_counts(store: &TestStore) {
             "tokens_cache_read",
             "tokens_cache_creation",
         ]
-        .map(|field| expected[field].as_u64().unwrap());
+        .map(|field| {
+            expected[field].as_u64().unwrap() * if field == "requests" { 1 } else { 1_000_000 }
+        });
         assert_eq!(
             actual, expected,
             "migrated metering preserves the recorded fleet usage counts"
@@ -846,6 +858,7 @@ fn assert_recorded_1_5_5_admin_counts(store: &TestStore) {
             expected["requests"].as_u64().unwrap(),
             "preserve the independently recorded key-window count, including historical differences from metering"
         );
+        assert!(got.models.iter().all(|model| model.scale == 6));
         let tokens: u64 = got
             .models
             .iter()
@@ -856,7 +869,7 @@ fn assert_recorded_1_5_5_admin_counts(store: &TestStore) {
                     .sum::<u64>()
             })
             .sum();
-        assert_eq!(tokens, expected["tokens"].as_u64().unwrap());
+        assert_eq!(tokens, expected["tokens"].as_u64().unwrap() * 1_000_000);
     }
 }
 
@@ -905,16 +918,29 @@ fn assert_1_5_5_rows_read_back(store: &TestStore) {
                         && g.provider == fx_str(w, "provider")
                 })
                 .unwrap_or_else(|| panic!("metering row missing after migrate: {w}"));
+            assert_eq!(row.scale, 6, "{w}");
             assert_eq!(row.requests, fx_u64(w, "requests"), "{w}");
             assert_eq!(row.billable_requests, fx_u64(w, "billable_requests"), "{w}");
             assert_eq!(row.key_group_at_use, fx_str(w, "key_group_at_use"), "{w}");
             assert_eq!(row.pricing_version, fx_str(w, "pricing_version"), "{w}");
-            assert_eq!(row.tokens_input, fx_u64(w, "tokens_input"), "{w}");
-            assert_eq!(row.tokens_output, fx_u64(w, "tokens_output"), "{w}");
-            assert_eq!(row.tokens_cache_read, fx_u64(w, "tokens_cache_read"), "{w}");
+            assert_eq!(
+                row.tokens_input,
+                fx_u64(w, "tokens_input") * 1_000_000,
+                "{w}"
+            );
+            assert_eq!(
+                row.tokens_output,
+                fx_u64(w, "tokens_output") * 1_000_000,
+                "{w}"
+            );
+            assert_eq!(
+                row.tokens_cache_read,
+                fx_u64(w, "tokens_cache_read") * 1_000_000,
+                "{w}"
+            );
             assert_eq!(
                 row.tokens_cache_write,
-                fx_u64(w, "tokens_cache_write"),
+                fx_u64(w, "tokens_cache_write") * 1_000_000,
                 "{w}"
             );
             assert_eq!(row.priced_from_ms, 0, "a 1.5.5 row is undated: {w}");

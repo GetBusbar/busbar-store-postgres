@@ -97,6 +97,65 @@ fn historical_attribution_survives_batch_replay_and_reopen() {
 }
 
 fn legacy_metering(raw: &mut postgres::Client) {
+    // A released-v6 database held nonnegative signed keys and whole-unit quantities.
+    // Reconstruct those physical values after using the current store to seed the rows.
+    let negative_key: bool = raw
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM usage_metering WHERE bucket < 0)",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        !negative_key,
+        "a historical fixture must use a released-v6 key encoding"
+    );
+    for (table, columns) in [
+        (
+            "usage_ledger",
+            &[
+                "tokens_input",
+                "tokens_output",
+                "tokens_cache_read",
+                "tokens_cache_write",
+            ][..],
+        ),
+        ("usage_ledger_units", &["count"][..]),
+        (
+            "usage_metering",
+            &[
+                "tokens_input",
+                "tokens_output",
+                "tokens_cache_read",
+                "tokens_cache_write",
+            ][..],
+        ),
+        ("usage_metering_units", &["count"][..]),
+    ] {
+        let inexact = columns
+            .iter()
+            .map(|column| format!("{column} % 1000000 <> 0"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let found: bool = raw
+            .query_one(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {inexact})"),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert!(
+            !found,
+            "historical seed {table} must contain exact whole units"
+        );
+        let assignments = columns
+            .iter()
+            .map(|column| format!("{column} = {column} / 1000000"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        raw.batch_execute(&format!("UPDATE {table} SET {assignments}"))
+            .unwrap();
+    }
     raw.batch_execute(
         "CREATE TABLE legacy_metering_units AS SELECT key_id,bucket,model,provider,priced_from_ms,unit,count FROM usage_metering_units;
          DROP TABLE usage_metering_units;
@@ -114,7 +173,8 @@ fn migration_preserves_legacy_attribution_units_and_replay() {
     for (group, version) in [("", ""), ("historical", "old-version ")] {
         let db = TempDb::create(&url, "spg_meter_history");
         let store = TestStore::open(&db.url()).unwrap();
-        let old = attributed_meter(u64::MAX, group, version, 7);
+        let mut old = attributed_meter(i64::MAX as u64, group, version, 7);
+        old.scale = 0;
         let op = OpId::from_parts(601, 5);
         store
             .add_metering_batch_op(op, std::slice::from_ref(&old))
@@ -129,18 +189,19 @@ fn migration_preserves_legacy_attribution_units_and_replay() {
             .add_metering_batch_op(op, std::slice::from_ref(&old))
             .unwrap();
         assert_eq!(migrated.list_metering(old.bucket).unwrap(), expected);
-        let new = MeteringDelta {
-            scale: 6,
+        let mut new = MeteringDelta {
             key_group_at_use: "new-group".into(),
             pricing_version: "new-version".into(),
             ..old.clone()
         };
+        new.normalize_scale6().unwrap();
         migrated.add_metering(&new).unwrap();
         let rows = migrated.list_metering(old.bucket).unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.contains(&expected[0]));
         for row in rows {
-            assert_eq!(row.usage_units, old.usage_units);
+            assert_eq!(row.scale, 6);
+            assert_eq!(row.usage_units, new.usage_units);
         }
     }
 }
@@ -150,9 +211,9 @@ fn migration_refuses_orphan_metering_units_without_inventing_attribution() {
     let Some(url) = live_url() else { return };
     let db = TempDb::create(&url, "spg_meter_orphan");
     let store = TestStore::open(&db.url()).unwrap();
-    store
-        .add_metering(&attributed_meter(17, "group", "version", 7))
-        .unwrap();
+    let mut historical = attributed_meter(17, "group", "version", 7);
+    historical.scale = 0;
+    store.add_metering(&historical).unwrap();
     drop(store);
     let mut raw = connect_client_with_retry(&db.url());
     legacy_metering(&mut raw);
@@ -187,7 +248,8 @@ fn long_historical_attribution_migrates_and_accumulates_without_an_index_limit()
         })
         .collect();
     let version: String = group.chars().rev().collect();
-    let old = attributed_meter(u64::MAX, &group, &version, 7);
+    let mut old = attributed_meter(i64::MAX as u64, &group, &version, 7);
+    old.scale = 0;
     store.add_metering(&old).unwrap();
     let expected = store.list_metering(old.bucket).unwrap();
     drop(store);
@@ -197,11 +259,11 @@ fn long_historical_attribution_migrates_and_accumulates_without_an_index_limit()
     let migrated = TestStore::open(&db.url()).unwrap();
     assert_eq!(migrated.list_metering(old.bucket).unwrap(), expected);
     migrated.add_metering(&old).unwrap();
-    let new = MeteringDelta {
-        scale: 6,
+    let mut new = MeteringDelta {
         pricing_version: format!("{version}changed"),
         ..old.clone()
     };
+    new.normalize_scale6().unwrap();
     migrated.add_metering(&new).unwrap();
     let rows = migrated.list_metering(old.bucket).unwrap();
     assert_eq!(rows.len(), 2);
@@ -214,10 +276,11 @@ fn long_historical_attribution_migrates_and_accumulates_without_an_index_limit()
             7
         };
         assert_eq!(row.requests, n);
-        assert_eq!(row.tokens_input, n);
+        assert_eq!(row.scale, 6);
+        assert_eq!(row.tokens_input, n * 1_000_000);
         assert_eq!(
             row.usage_units,
-            BTreeMap::from([("audio_seconds".into(), n)])
+            BTreeMap::from([("audio_seconds".into(), n * 1_000_000)])
         );
     }
 }

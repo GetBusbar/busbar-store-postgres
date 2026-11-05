@@ -42,10 +42,11 @@ explicitly in production; do not assume they move together.
 ### Upgrading an existing database
 
 The first connect of this build upgrades an existing database **in place**
-(schema v6 → v7, inside one transaction, under the same advisory lock every
+(schema v6/v7 → v8, inside one transaction, under the same advisory lock every
 node's migration takes). The compatibility refusals below leave the migration
-transaction unchanged; accepted upgrades preserve existing row meanings except
-for the explicitly listed revoked-secret erasure:
+transaction unchanged; accepted upgrades preserve existing row meanings while
+converting quantity representations and applying the revoked-secret erasure
+described below. The v7 changes remain part of an upgrade from v6:
 
 - `keys` gains `idp_subject`, `binding_mode`, `minted_by`, `idp_provider` (NULL for existing
   keys) and `allowed_scopes_by_kind`, which holds non-pool scope grants
@@ -62,7 +63,7 @@ for the explicitly listed revoked-secret erasure:
   the kernel's records). The store keeps ledger counts, not money: busbar
   derives money from the counts and its rate card.
 - The released v6 upgrade preserves tables owned by other applications. Unreleased development
-  schema markers above v7 are refused without deleting tables or operation records.
+  schema markers above v8 are refused without deleting tables or operation records.
 - The v7 upgrade adds `plane_chain.has_parent`: new parentless appends are stored
   under their own ID and are not listed as parents. Earlier schemas stored
   both `parent=None` and `parent=Some(id)` as `parent=id`, losing the presence
@@ -98,11 +99,18 @@ for the explicitly listed revoked-secret erasure:
   size range. The migration copies the attribution recorded on
   each legacy parent, preserving empty unknown values. Orphan units refuse migration;
   already-collapsed historical attribution cannot be reconstructed from these rows.
-- The v7 upgrade stores raw usage request and unit counters as `NUMERIC(20,0)` and
-  reads and writes their complete `u64` domain. Signed accruals and refunds saturate
-  at the `u64` bounds, matching `UsageLedger::apply_delta`; previously saturated
-  counts retain their existing values. Metering counters retain their existing
-  rules. Atomic usage corrections compare the live key, the full key/day metering
+- The historical v7 upgrade changed raw usage request and unit columns to
+  `NUMERIC(20,0)`. In v8, quantity aggregates use exact decimal counts at scale 6:
+  each stored integer represents one millionth of a unit, with a maximum mantissa
+  of `i64::MAX` (9,223,372,036,854,775,807). Usage and metering token quantities and
+  open-unit quantities from v6/v7 are multiplied by 1,000,000 exactly once.
+  Migration locks all four quantity tables before preflight and refuses negative
+  legacy quantities or values above 9,223,372,036,854 whole units. Conversion and
+  the schema-v8 stamp commit together; refusal leaves rows and the schema unchanged.
+  Existing request and billable-request counters are not rescaled and retain
+  their separate counter rules. Quantity accruals and refunds refuse overflow,
+  underflow or values that cannot be represented exactly at scale 6; they do not
+  silently saturate or round. Atomic usage corrections compare the live key, the full key/day metering
   selection and every affected canonical usage row under the same first revision
   lock as ordinary usage, metering, purge and key writers. All replacements and
   the operation receipt commit together. A condition conflict writes nothing;
@@ -110,7 +118,7 @@ for the explicitly listed revoked-secret erasure:
   Fresh unconditional writes to reserved usage adjustment buckets are refused;
   already-applied legacy receipts remain replayable.
 
-Drain and stop older store processes before the v7 upgrade, then reopen every
+Drain and stop older store processes before the v8 upgrade, then reopen every
 node with this build. A newer-schema check cannot fence an already-open process.
 The published v1.0.6 plugin used by busbar 1.5.5 has no newer-schema check.
 Do not reconnect older binaries to the upgraded database or run mixed-version
@@ -118,8 +126,8 @@ store writers. Rollback requires a pre-upgrade backup and the corresponding
 older build, not reopening the upgraded database with an older binary.
 
 Unreleased development databases are not supported upgrade sources. Markers
-above v7 are refused; a development database stamped v7 must already have the
-released v7 layout. Legacy application tables are left untouched.
+above v8 are refused; a database stamped v7 or v8 must already have the corresponding
+layout. Legacy application tables are left untouched.
 
 It is a `cdylib` that serves busbar's store v3 table (`StoreSlots`, via the plugin SDK in
 [`busbar-contract`](https://github.com/GetBusbar/busbar/tree/main/crates/busbar-contract))
