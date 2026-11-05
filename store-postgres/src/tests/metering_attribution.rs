@@ -277,10 +277,10 @@ fn long_historical_attribution_migrates_and_accumulates_without_an_index_limit()
         };
         assert_eq!(row.requests, n);
         assert_eq!(row.scale, 6);
-        assert_eq!(row.tokens_input, n * 1_000_000);
+        assert_eq!(row.tokens_input, i128::from(n) * 1_000_000);
         assert_eq!(
             row.usage_units,
-            BTreeMap::from([("audio_seconds".into(), n * 1_000_000)])
+            BTreeMap::from([("audio_seconds".into(), i128::from(n) * 1_000_000)])
         );
     }
 }
