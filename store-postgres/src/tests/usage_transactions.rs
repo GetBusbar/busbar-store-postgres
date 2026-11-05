@@ -15,6 +15,7 @@ fn an_absolute_usage_write_waits_on_the_window_before_touching_its_ledger() {
         requests: 7,
         billable_requests: 7,
         models: vec![ModelTokens {
+            scale: 6,
             model: "model".into(),
             usage_units: [(UNIT_INPUT.into(), 1)].into_iter().collect(),
         }],
@@ -71,6 +72,7 @@ fn usage_model_lists_cross_the_existing_bind_frame_width_without_a_new_admission
         billable_requests: 7,
         models: (0..count)
             .map(|i| ModelTokens {
+                scale: 6,
                 model: format!("m{i}"),
                 usage_units: [(UNIT_INPUT.into(), 1)].into_iter().collect(),
             })
@@ -121,6 +123,7 @@ fn open_usage_and_metering_unit_lists_cross_the_bind_frame_width_atomically() {
         requests: 1,
         billable_requests: 1,
         models: vec![ModelTokens {
+            scale: 6,
             model: "model".into(),
             usage_units: units.clone(),
         }],
@@ -130,6 +133,7 @@ fn open_usage_and_metering_unit_lists_cross_the_bind_frame_width_atomically() {
         requests: 1,
         billable_requests: 1,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: "model".into(),
             usage_units: units.iter().map(|(k, v)| (k.clone(), *v as i64)).collect(),
         }],
@@ -139,6 +143,7 @@ fn open_usage_and_metering_unit_lists_cross_the_bind_frame_width_atomically() {
     assert_eq!(got.models[0].usage_units.len(), count);
     assert!(got.models[0].usage_units.values().all(|value| *value == 2));
     let metering = MeteringDelta {
+        scale: 6,
         key_id: "key".into(),
         bucket: 60,
         model: "model".into(),

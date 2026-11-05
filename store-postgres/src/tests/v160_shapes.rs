@@ -255,6 +255,7 @@ fn a_released_v6_database_upgrades_in_place_without_losing_a_row() {
     assert_eq!(
         ledger.models,
         vec![ModelTokens {
+            scale: 6,
             model: "model-a".into(),
             usage_units: units(&[(UNIT_INPUT, 100), (UNIT_OUTPUT, 200), (UNIT_CACHE_WRITE, 7)]),
         }]
@@ -271,6 +272,7 @@ fn a_released_v6_database_upgrades_in_place_without_losing_a_row() {
 
     store
         .add_metering(&MeteringDelta {
+            scale: 6,
             key_id: "vk_pools".into(),
             bucket: 86_400,
             model: "model-a".into(),
@@ -451,10 +453,12 @@ fn the_usage_ledger_carries_open_units_and_applies_refunds() {
         billable_requests: 3,
         models: vec![
             ModelTokens {
+                scale: 6,
                 model: "model-a".into(),
                 usage_units: units(&[(UNIT_INPUT, 10), (UNIT_OUTPUT, 20), ("search_units", 3)]),
             },
             ModelTokens {
+                scale: 6,
                 model: "model-b".into(),
                 usage_units: units(&[("tool_calls", 5)]),
             },
@@ -467,6 +471,7 @@ fn the_usage_ledger_carries_open_units_and_applies_refunds() {
         requests: 1,
         billable_requests: 1,
         models: vec![ModelTokens {
+            scale: 6,
             model: "model-a".into(),
             usage_units: units(&[(UNIT_INPUT, 1)]),
         }],
@@ -483,10 +488,12 @@ fn the_usage_ledger_carries_open_units_and_applies_refunds() {
                 billable_requests: 1,
                 models: vec![
                     ModelTokensDelta {
+                        scale: 6,
                         model: "model-a".into(),
                         usage_units: signed(&[(UNIT_INPUT, 4), ("search_units", 7)]),
                     },
                     ModelTokensDelta {
+                        scale: 6,
                         model: "model-c".into(),
                         usage_units: signed(&[(UNIT_OUTPUT, 9)]),
                     },
@@ -503,11 +510,13 @@ fn the_usage_ledger_carries_open_units_and_applies_refunds() {
                 billable_requests: -1,
                 models: vec![
                     ModelTokensDelta {
+                        scale: 6,
                         model: "model-a".into(),
                         usage_units: signed(&[(UNIT_INPUT, -2), ("search_units", -100)]),
                     },
                     // A refund against a model the window never saw floors to 0.
                     ModelTokensDelta {
+                        scale: 6,
                         model: "model-d".into(),
                         usage_units: signed(&[(UNIT_OUTPUT, -5)]),
                     },
@@ -523,10 +532,12 @@ fn the_usage_ledger_carries_open_units_and_applies_refunds() {
         billable_requests: 1,
         models: vec![
             ModelTokensDelta {
+                scale: 6,
                 model: "model-a".into(),
                 usage_units: signed(&[(UNIT_INPUT, 4), ("search_units", 7)]),
             },
             ModelTokensDelta {
+                scale: 6,
                 model: "model-c".into(),
                 usage_units: signed(&[(UNIT_OUTPUT, 9)]),
             },
@@ -537,10 +548,12 @@ fn the_usage_ledger_carries_open_units_and_applies_refunds() {
         billable_requests: -1,
         models: vec![
             ModelTokensDelta {
+                scale: 6,
                 model: "model-a".into(),
                 usage_units: signed(&[(UNIT_INPUT, -2), ("search_units", -100)]),
             },
             ModelTokensDelta {
+                scale: 6,
                 model: "model-d".into(),
                 usage_units: signed(&[(UNIT_OUTPUT, -5)]),
             },
@@ -576,6 +589,7 @@ fn metering_splits_on_priced_from_ms_and_carries_open_classes() {
     let key_id = format!("vk_meter_units_{}", unique_suffix());
     let bucket = 20_270_611u64;
     let delta = |priced_from_ms: u64, input: u64, classes: &[(&str, u64)]| MeteringDelta {
+        scale: 6,
         key_id: key_id.clone(),
         bucket,
         model: "m".into(),
@@ -827,7 +841,11 @@ fn assert_recorded_1_5_5_admin_counts(store: &TestStore) {
         let got = store
             .get_usage(id, expected["window_start"].as_u64().unwrap())
             .unwrap();
-        assert_eq!(got.requests, expected["requests"].as_u64().unwrap(), "preserve the independently recorded key-window count, including historical differences from metering");
+        assert_eq!(
+            got.requests,
+            expected["requests"].as_u64().unwrap(),
+            "preserve the independently recorded key-window count, including historical differences from metering"
+        );
         let tokens: u64 = got
             .models
             .iter()
@@ -919,6 +937,7 @@ fn assert_1_5_5_rows_read_back(store: &TestStore) {
             .iter()
             .filter(|l| fx_str(l, "bucket_id") == bucket && fx_u64(l, "window_start") == start)
             .map(|l| ModelTokens {
+                scale: 6,
                 model: fx_str(l, "model").to_string(),
                 usage_units: reserved_units(l),
             })
@@ -1056,6 +1075,7 @@ fn add_usage_folds_a_model_named_twice_sequentially() {
     let store = connect_store_with_retry(&url).expect("connect");
     let ws = 20_270_601u64;
     let entry = |m: &str, u: &[(&str, i64)]| ModelTokensDelta {
+        scale: 6,
         model: m.into(),
         usage_units: signed(u),
     };
@@ -1086,6 +1106,7 @@ fn add_usage_folds_a_model_named_twice_sequentially() {
         requests: 0,
         billable_requests: 0,
         models: vec![ModelTokens {
+            scale: 6,
             model: "m".into(),
             usage_units: units(&[(UNIT_INPUT, 20)]),
         }],

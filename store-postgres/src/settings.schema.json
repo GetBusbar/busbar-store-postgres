@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "url"
+  ],
+  "properties": {
+    "url": {
+      "type": "string",
+      "minLength": 1,
+      "writeOnly": true,
+      "description": "A non-blank libpq connection string: postgres:// or postgresql:// URI, or keyword/value form. Requires an explicit non-empty user; connections use TCP rather than Unix sockets. The lifecycle parser validates connection syntax, supported options and SSL mode, and captures the password.",
+      "pattern": "\\S",
+      "x-busbar-secret": true
+    }
+  }
+}

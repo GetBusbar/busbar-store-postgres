@@ -21,6 +21,7 @@ fn ledger(n: u64) -> UsageLedger {
         requests: n,
         billable_requests: n,
         models: vec![ModelTokens {
+            scale: 6,
             model: "model".into(),
             usage_units: BTreeMap::from([(UNIT_INPUT.into(), n), ("audio_seconds".into(), n)]),
         }],
@@ -29,6 +30,7 @@ fn ledger(n: u64) -> UsageLedger {
 
 fn meter(bucket: u64, n: u64) -> MeteringDelta {
     MeteringDelta {
+        scale: 6,
         key_id: "key".into(),
         bucket,
         model: "model".into(),
@@ -66,6 +68,7 @@ fn usage_keys_remain_distinct_across_put_batch_replay_and_reopen() {
         requests: 2,
         billable_requests: 2,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: "model".into(),
             usage_units: BTreeMap::from([(UNIT_INPUT.into(), 2), ("audio_seconds".into(), 2)]),
         }],

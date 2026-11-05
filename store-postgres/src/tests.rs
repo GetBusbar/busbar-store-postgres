@@ -81,6 +81,7 @@ fn mt(
         }
     }
     ModelTokens {
+        scale: 6,
         model: model.into(),
         usage_units,
     }
@@ -106,6 +107,7 @@ fn mtd(
         }
     }
     ModelTokensDelta {
+        scale: 6,
         model: model.into(),
         usage_units,
     }
@@ -802,6 +804,7 @@ fn metering_roundtrip_new_fields() {
     hard_reset(&store, &meter_key);
     store
         .add_metering(&busbar_contract::records::MeteringDelta {
+            scale: 6,
             key_id: meter_key.clone(),
             bucket,
             model: "m".into(),
@@ -988,9 +991,9 @@ fn put_usage_and_add_usage_batch_multiple_models_correctly() {
     assert_eq!(models2[1].tier(UNIT_OUTPUT), 11);
 }
 
-/// Raw usage pins at u64::MAX without narrowing corrected counters back through BIGINT.
+/// Quantity overflow refuses atomically; request-only accrual retains the u64 domain.
 #[test]
-fn usage_accruals_pin_at_the_column_maximum() {
+fn usage_accruals_refuse_quantity_overflow_and_keep_request_width() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
     let max = i64::MAX;
@@ -998,20 +1001,24 @@ fn usage_accruals_pin_at_the_column_maximum() {
     let ws = 20_270_501u64;
     let mut open_units = mtd("m", max, max, max, max);
     open_units.usage_units.insert("audio_s".into(), max);
-    let delta = UsageDelta {
+    let mut delta = UsageDelta {
         requests: max,
         billable_requests: max,
         models: vec![open_units],
     };
     store.add_usage(&bucket, ws, &delta).unwrap();
+    let before = store.get_usage(&bucket, ws).unwrap();
+    assert!(store.add_usage(&bucket, ws, &delta).is_err());
+    assert_eq!(store.get_usage(&bucket, ws).unwrap(), before);
+    delta.models.clear();
     store.add_usage(&bucket, ws, &delta).unwrap();
     store.add_usage(&bucket, ws, &delta).unwrap();
     let got = store.get_usage(&bucket, ws).unwrap();
     assert_eq!(got.requests, u64::MAX);
     assert_eq!(got.billable_requests, u64::MAX);
-    assert_eq!(got.models[0].tier(UNIT_INPUT), u64::MAX);
-    assert_eq!(got.models[0].tier(UNIT_CACHE_WRITE), u64::MAX);
-    assert_eq!(got.models[0].tier("audio_s"), u64::MAX);
+    assert_eq!(got.models[0].tier(UNIT_INPUT), i64::MAX as u64);
+    assert_eq!(got.models[0].tier(UNIT_CACHE_WRITE), i64::MAX as u64);
+    assert_eq!(got.models[0].tier("audio_s"), i64::MAX as u64);
 
     let mut refund = mtd("m", -1, 0, 0, 0);
     refund.usage_units.insert("audio_s".into(), -1);
@@ -1028,28 +1035,29 @@ fn usage_accruals_pin_at_the_column_maximum() {
         .unwrap();
     let got = store.get_usage(&bucket, ws).unwrap();
     assert_eq!(got.requests, u64::MAX - 1);
-    assert_eq!(got.models[0].tier(UNIT_INPUT), u64::MAX - 1);
-    assert_eq!(got.models[0].tier("audio_s"), u64::MAX - 1);
+    assert_eq!(got.models[0].tier(UNIT_INPUT), i64::MAX as u64 - 1);
+    assert_eq!(got.models[0].tier("audio_s"), i64::MAX as u64 - 1);
 }
 
-/// The metering twin of the usage pin above.
+/// Metering quantities refuse overflow without changing request or quantity columns.
 #[test]
-fn metering_accruals_pin_at_the_column_maximum() {
+fn metering_accruals_refuse_quantity_overflow() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
     let max = i64::MAX;
     let key = format!("vk_sat_m_{}", unique_suffix());
     let mut units = BTreeMap::new();
-    units.insert("audio_s".to_string(), u64::MAX);
+    units.insert("audio_s".to_string(), max as u64);
     let meter = busbar_contract::records::MeteringDelta {
+        scale: 6,
         key_id: key.clone(),
         bucket: 20_270_502,
         model: "m".into(),
         provider: "p".into(),
-        tokens_input: u64::MAX,
-        tokens_output: u64::MAX,
-        tokens_cache_read: u64::MAX,
-        tokens_cache_write: u64::MAX,
+        tokens_input: max as u64,
+        tokens_output: max as u64,
+        tokens_cache_read: max as u64,
+        tokens_cache_write: max as u64,
         requests: u64::MAX,
         billable_requests: u64::MAX,
         key_group_at_use: "g".into(),
@@ -1058,7 +1066,7 @@ fn metering_accruals_pin_at_the_column_maximum() {
         usage_units: units,
     };
     store.add_metering(&meter).unwrap();
-    store.add_metering(&meter).unwrap();
+    assert!(store.add_metering(&meter).is_err());
     let rows = store.list_metering(20_270_502).unwrap();
     let row = rows.iter().find(|r| r.key_id == key).unwrap();
     assert_eq!(row.tokens_input, max as u64);
@@ -2432,3 +2440,6 @@ fn server_diagnostics_escape_controls_and_bound_output() {
     assert!(rendered.ends_with("[truncated]"));
     assert!(rendered.len() < 4200);
 }
+
+#[path = "tests/exact_counts.rs"]
+mod exact_counts;

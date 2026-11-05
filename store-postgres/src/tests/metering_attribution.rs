@@ -7,6 +7,7 @@ use busbar_contract::records::{MeteringDelta, MeteringRow};
 use std::collections::BTreeMap;
 fn attributed_meter(bucket: u64, group: &str, version: &str, n: u64) -> MeteringDelta {
     MeteringDelta {
+        scale: 6,
         key_id: "attribution-key".into(),
         bucket,
         model: "model".into(),
@@ -129,6 +130,7 @@ fn migration_preserves_legacy_attribution_units_and_replay() {
             .unwrap();
         assert_eq!(migrated.list_metering(old.bucket).unwrap(), expected);
         let new = MeteringDelta {
+            scale: 6,
             key_group_at_use: "new-group".into(),
             pricing_version: "new-version".into(),
             ..old.clone()
@@ -196,6 +198,7 @@ fn long_historical_attribution_migrates_and_accumulates_without_an_index_limit()
     assert_eq!(migrated.list_metering(old.bucket).unwrap(), expected);
     migrated.add_metering(&old).unwrap();
     let new = MeteringDelta {
+        scale: 6,
         pricing_version: format!("{version}changed"),
         ..old.clone()
     };

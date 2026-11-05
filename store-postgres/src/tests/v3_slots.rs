@@ -61,7 +61,9 @@ fn open_refuses_settings_without_a_url() {
 
     assert_eq!(
         TestStore::open_slot(br#"{"url": 5}"#).err().as_deref(),
-        Some("invalid postgres plugin config: url: settings: invalid type: integer `***`, expected a string")
+        Some(
+            "invalid postgres plugin config: url: settings: invalid type: integer `***`, expected a string"
+        )
     );
 
     for (settings, ty) in [
@@ -312,6 +314,7 @@ fn a_write_refused_before_commit_answers_refused_and_records_nothing() {
         .unwrap();
 
     let mut meter = MeteringDelta {
+        scale: 6,
         key_id: format!("{ns}-k"),
         bucket: 1,
         model: "m".into(),
@@ -463,6 +466,7 @@ fn a_batch_applies_in_key_order() {
     );
 
     let m = |key: &str, model: &str| MeteringDelta {
+        scale: 6,
         key_id: key.into(),
         bucket: 7,
         model: model.into(),
@@ -562,6 +566,7 @@ fn an_op_recorded_by_an_older_build_replays() {
     const BUCKET: u64 = 4_000_000_000_000_003;
     let key_id = format!("{ns}-k");
     let m = MeteringDelta {
+        scale: 6,
         key_id: key_id.clone(),
         bucket: BUCKET,
         model: "m".into(),
@@ -584,6 +589,7 @@ fn an_op_recorded_by_an_older_build_replays() {
     );
     s.add_metering_op(id, &m).expect("an older body replays");
     let other = MeteringDelta {
+        scale: 6,
         tokens_input: 11,
         ..m.clone()
     };

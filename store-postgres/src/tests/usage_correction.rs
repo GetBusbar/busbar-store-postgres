@@ -25,12 +25,21 @@ const POLL: Duration = Duration::from_millis(5);
 const NODE: u64 = 0x5047_434f_5252;
 
 fn ledger(n: u64) -> UsageLedger {
+    ledger_parts(n, n)
+}
+
+/// Request width and quantity width are independent: these fixtures state both explicitly.
+fn ledger_parts(requests: u64, quantity: u64) -> UsageLedger {
     UsageLedger {
-        requests: n,
-        billable_requests: n,
+        requests,
+        billable_requests: requests,
         models: vec![ModelTokens {
+            scale: 6,
             model: MODEL.into(),
-            usage_units: BTreeMap::from([(UNIT_INPUT.into(), n), (OPEN_UNIT.into(), n)]),
+            usage_units: BTreeMap::from([
+                (UNIT_INPUT.into(), quantity),
+                (OPEN_UNIT.into(), quantity),
+            ]),
         }],
     }
 }
@@ -88,6 +97,7 @@ fn seed(db: &TempDb) -> TestStore {
 }
 fn meter() -> MeteringDelta {
     MeteringDelta {
+        scale: 6,
         key_id: KEY.into(),
         bucket: DAY,
         model: MODEL.into(),
@@ -112,16 +122,22 @@ fn exact_rows_receipts_conflicts_and_full_unsigned_values_survive_reopen() {
     let store = seed(&db);
     assert!(busbar_contract::store_calls::StoreCalls::supports_usage_correction(&*store));
     let before = revision(&store);
-    let r = request(UsageLedger::default(), ledger(u64::MAX));
+    let r = request(
+        UsageLedger::default(),
+        ledger_parts(u64::MAX, i64::MAX as u64),
+    );
     assert_eq!(apply(&store, &r).unwrap(), Decision::Applied);
-    assert_eq!(store.get_usage(BUCKET, DAY).unwrap(), ledger(u64::MAX));
+    assert_eq!(
+        store.get_usage(BUCKET, DAY).unwrap(),
+        ledger_parts(u64::MAX, i64::MAX as u64)
+    );
     assert_eq!(receipts(&store), 1);
     assert_eq!(revision(&store), before);
     drop(store);
     let reopened = TestStore::open(&db.url()).unwrap();
     assert_eq!(apply(&reopened, &r).unwrap(), Decision::Applied);
     let mut changed = r.clone();
-    changed.usage[0].replacement = ledger(u64::MAX - 1);
+    changed.usage[0].replacement = ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1);
     assert!(matches!(
         apply(&reopened, &changed),
         Err(StoreFailure::Conflict)
@@ -132,11 +148,16 @@ fn exact_rows_receipts_conflicts_and_full_unsigned_values_survive_reopen() {
         Decision::ConditionConflict
     );
     assert_eq!(receipts(&reopened), 1);
-    assert_eq!(store_value(&reopened), ledger(u64::MAX));
-    reopened.put_usage(BUCKET, DAY, &ledger(u64::MAX)).unwrap();
     assert_eq!(
         store_value(&reopened),
-        ledger(u64::MAX),
+        ledger_parts(u64::MAX, i64::MAX as u64)
+    );
+    reopened
+        .put_usage(BUCKET, DAY, &ledger_parts(u64::MAX, i64::MAX as u64))
+        .unwrap();
+    assert_eq!(
+        store_value(&reopened),
+        ledger_parts(u64::MAX, i64::MAX as u64),
         "ordinary absolute writes share the exact codec"
     );
 
@@ -148,20 +169,24 @@ fn exact_rows_receipts_conflicts_and_full_unsigned_values_survive_reopen() {
                 requests: -1,
                 billable_requests: -1,
                 models: vec![ModelTokensDelta {
+                    scale: 6,
                     model: MODEL.into(),
                     usage_units: BTreeMap::from([(UNIT_INPUT.into(), -1), (OPEN_UNIT.into(), -1)]),
                 }],
             },
         )
         .unwrap();
-    assert_eq!(store_value(&reopened), ledger(u64::MAX - 1));
+    assert_eq!(
+        store_value(&reopened),
+        ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
+    );
     reopened.delete_key(KEY).unwrap();
     assert_eq!(
         apply(&reopened, &r).unwrap(),
         Decision::Applied,
         "receipt precedes live-key predicate"
     );
-    let mut fresh = request(ledger(u64::MAX - 1), ledger(40));
+    let mut fresh = request(ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1), ledger(40));
     assert_eq!(
         apply(&reopened, &fresh).unwrap(),
         Decision::ConditionConflict
@@ -176,7 +201,10 @@ fn exact_rows_receipts_conflicts_and_full_unsigned_values_survive_reopen() {
         apply(&reopened, &fresh),
         Err(StoreFailure::Refused(_))
     ));
-    assert_eq!(store_value(&reopened), ledger(u64::MAX - 1));
+    assert_eq!(
+        store_value(&reopened),
+        ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
+    );
     assert_eq!(receipts(&reopened), 2);
 }
 fn store_value(store: &TestStore) -> UsageLedger {
@@ -481,7 +509,10 @@ fn a_lost_commit_reply_retains_exact_replay_custody_after_the_loaded_future_is_d
     let gate = gate.unwrap();
     gate.arm();
     let _release = Release(gate.clone());
-    let r = request(UsageLedger::default(), ledger(u64::MAX));
+    let r = request(
+        UsageLedger::default(),
+        ledger_parts(u64::MAX, i64::MAX as u64),
+    );
     let sent = r.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -519,7 +550,10 @@ fn a_lost_commit_reply_retains_exact_replay_custody_after_the_loaded_future_is_d
     drop(store);
     let reopened = TestStore::open(&db.url()).unwrap();
     assert_eq!(apply(&reopened, &r).unwrap(), Decision::Applied);
-    assert_eq!(store_value(&reopened), ledger(u64::MAX));
+    assert_eq!(
+        store_value(&reopened),
+        ledger_parts(u64::MAX, i64::MAX as u64)
+    );
     assert_eq!(receipts(&reopened), 1);
 }
 
@@ -566,7 +600,7 @@ fn v18_usage_counters_migrate_in_place_before_exact_corrections_are_accepted() {
     let Some(url) = live_url() else { return };
     let db = TempDb::create(&url, "spg_correction_v18");
     let store = seed(&db);
-    let old = ledger(i64::MAX as u64);
+    let old = ledger_parts(i64::MAX as u64, 2);
     store.put_usage(BUCKET, DAY, &old).unwrap();
     store
         .lock()
@@ -596,20 +630,38 @@ fn v18_usage_counters_migrate_in_place_before_exact_corrections_are_accepted() {
         )
         .unwrap();
     drop(store);
+    let old = ledger_parts(i64::MAX as u64, 2_000_000);
     let reopened = TestStore::open(&db.url()).unwrap();
     assert_eq!(store_value(&reopened), old);
     assert_eq!(
-        apply(&reopened, &request(old, ledger(u64::MAX))).unwrap(),
+        apply(
+            &reopened,
+            &request(old, ledger_parts(u64::MAX, i64::MAX as u64))
+        )
+        .unwrap(),
         Decision::Applied
     );
     drop(reopened);
     let reopened = TestStore::open(&db.url()).unwrap();
-    assert_eq!(store_value(&reopened), ledger(u64::MAX));
     assert_eq!(
-        apply(&reopened, &request(ledger(u64::MAX), ledger(u64::MAX - 1))).unwrap(),
+        store_value(&reopened),
+        ledger_parts(u64::MAX, i64::MAX as u64)
+    );
+    assert_eq!(
+        apply(
+            &reopened,
+            &request(
+                ledger_parts(u64::MAX, i64::MAX as u64),
+                ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
+            )
+        )
+        .unwrap(),
         Decision::Applied
     );
-    assert_eq!(store_value(&reopened), ledger(u64::MAX - 1));
+    assert_eq!(
+        store_value(&reopened),
+        ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
+    );
 }
 
 #[test]
@@ -623,6 +675,7 @@ fn sparse_empty_stored_models_compare_as_an_absent_ledger() {
             DAY,
             &UsageLedger {
                 models: vec![ModelTokens {
+                    scale: 6,
                     model: MODEL.into(),
                     usage_units: BTreeMap::new(),
                 }],
@@ -661,6 +714,7 @@ fn empty_model_identity_keeps_its_units_separate_from_request_totals() {
         requests: 17,
         billable_requests: 19,
         models: vec![ModelTokensDelta {
+            scale: 6,
             model: String::new(),
             usage_units: BTreeMap::from([(UNIT_INPUT.into(), 23)]),
         }],

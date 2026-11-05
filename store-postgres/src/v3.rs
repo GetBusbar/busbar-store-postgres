@@ -59,6 +59,7 @@ pub const NEEDS: &[Need] = &[Need {
 }];
 
 busbar_contract::statement_extensions!(EXTENSIONS: [
+    ("busbar.store.count-scale", b"6"),
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
     (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
     (busbar_contract::abi::sdk::store::conditional::CAPABILITY, b"1"),
@@ -68,13 +69,18 @@ busbar_contract::statement_extensions!(EXTENSIONS: [
 /// How many ops of this store the host may have in flight at once.
 const MAX_INFLIGHT: u32 = 64;
 
+/// The settings accepted by this plugin's lifecycle parser.
+const SETTINGS_SCHEMA: busbar_contract::abi::mechanism::call::Blob =
+    busbar_contract::abi::mechanism::call::Blob::json(include_bytes!("settings.schema.json"));
+
 busbar_contract::store_door!(
     PostgresStore,
     NAME,
     env!("CARGO_PKG_VERSION"),
     MAX_INFLIGHT,
     needs: NEEDS,
-    extensions: EXTENSIONS
+    extensions: EXTENSIONS,
+    settings_schema: SETTINGS_SCHEMA
 );
 
 /// Run one op on the instance's kept connection (a fresh one when none is kept): open the session
@@ -141,10 +147,11 @@ fn decided(r: OpRefused) -> OpRefused {
 /// `t` leads with a five-character SQLSTATE of class 22 or 23, then `: `.
 fn decided_text(t: &str) -> bool {
     let b = t.as_bytes();
-    b.len() > 6
-        && matches!(&b[..2], b"22" | b"23")
-        && b[2..5].iter().all(u8::is_ascii_alphanumeric)
-        && &b[5..7] == b": "
+    t.starts_with("exact count: ")
+        || b.len() > 6
+            && matches!(&b[..2], b"22" | b"23")
+            && b[2..5].iter().all(u8::is_ascii_alphanumeric)
+            && &b[5..7] == b": "
 }
 
 /// Claim `op` for `body` (its [`Dedupe::body_hex`]) inside `tx`: insert its row (`None`), or read
@@ -180,6 +187,22 @@ impl Session {
         request: &correction::Request,
     ) -> OpResult<correction::Decision> {
         let dedupe = Dedupe::usage_correction(request);
+        let mut normalized_request = request.clone();
+        for row in &mut normalized_request.metering {
+            row.normalize_scale6()
+                .map_err(|e| OpRefused::Refused(e.to_string()))?;
+        }
+        for change in &mut normalized_request.usage {
+            change
+                .expected
+                .normalize_scale6()
+                .map_err(|e| OpRefused::Refused(e.to_string()))?;
+            change
+                .replacement
+                .normalize_scale6()
+                .map_err(|e| OpRefused::Refused(e.to_string()))?;
+        }
+        let request = &normalized_request;
         let mut tx = self
             .client()
             .transaction()
@@ -896,3 +919,7 @@ impl StoreSlots for PostgresStore {
             .await)
     }
 }
+
+#[cfg(test)]
+#[path = "settings_schema_tests.rs"]
+mod settings_schema_tests;

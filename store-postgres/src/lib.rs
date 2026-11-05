@@ -69,8 +69,9 @@ fn is_undefined_table(e: &pgwire::Error) -> bool {
     e.code().map(pgwire::SqlState::code) == Some(pgwire::SqlState::UNDEFINED_TABLE)
 }
 
-/// Store schema version. A database older than v6 is refused: no release ever wrote one. v6 -> v7.
-pub const SCHEMA_VERSION: i64 = 7;
+/// Store schema version. v6 is the oldest released schema; v8 converts quantity aggregates
+/// to checked micro-units without changing request counters.
+pub const SCHEMA_VERSION: i64 = 8;
 
 const TICKET_RECORD_KIND: &str = "ticket";
 
@@ -483,7 +484,7 @@ impl Session {
     async fn migrate_tx(client: &mut Client, version: i64) -> RecordStoreResult<()> {
         let mut tx = client.transaction().await.store()?;
         tx.batch_execute(SCHEMA).await.store()?;
-        if version < SCHEMA_VERSION {
+        if version < 7 {
             let incompatible: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM usage_windows WHERE window_start < 0)
@@ -505,7 +506,7 @@ impl Session {
                 ));
             }
         }
-        if version < SCHEMA_VERSION {
+        if version < 7 {
             let incompatible: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM credentials WHERE created_at < 0 OR updated_at < 0
@@ -525,7 +526,7 @@ impl Session {
             }
         }
 
-        if version < SCHEMA_VERSION {
+        if version < 7 {
             tx.batch_execute(MIGRATE_V7_COLUMNS).await.store()?;
 
             tx.batch_execute(
@@ -537,7 +538,7 @@ impl Session {
             .store()?;
         }
 
-        if version < SCHEMA_VERSION {
+        if version < 7 {
             let ambiguous: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM plane_chain WHERE parent = id)",
@@ -561,7 +562,7 @@ impl Session {
             .await
             .store()?;
         }
-        if version < SCHEMA_VERSION {
+        if version < 7 {
             let dirty: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM credentials WHERE revoked_at IS NOT NULL
@@ -584,7 +585,7 @@ impl Session {
                 .store()?;
             }
         }
-        if version < SCHEMA_VERSION {
+        if version < 7 {
             let orphan: bool = tx
                 .query_one(
                     "SELECT EXISTS(SELECT 1 FROM usage_metering_units u
@@ -621,7 +622,7 @@ impl Session {
                     ON usage_metering (key_id,bucket,model,provider,priced_from_ms);"
             ).await.store()?;
         }
-        if version < SCHEMA_VERSION {
+        if version < 7 {
             tx.batch_execute(
                 "ALTER TABLE usage_windows
                     ALTER COLUMN requests TYPE NUMERIC(20,0),
@@ -635,6 +636,83 @@ impl Session {
             )
             .await
             .store()?;
+        }
+        // Quantity conversion and its version stamp share one transaction. Lock every
+        // quantity table before preflight so no counter can change between check and update.
+        tx.batch_execute("LOCK TABLE usage_ledger, usage_ledger_units, usage_metering, usage_metering_units IN ACCESS EXCLUSIVE MODE")
+            .await.store()?;
+        for (table, columns) in [
+            (
+                "usage_ledger",
+                &[
+                    "tokens_input",
+                    "tokens_output",
+                    "tokens_cache_read",
+                    "tokens_cache_write",
+                ][..],
+            ),
+            ("usage_ledger_units", &["count"][..]),
+            (
+                "usage_metering",
+                &[
+                    "tokens_input",
+                    "tokens_output",
+                    "tokens_cache_read",
+                    "tokens_cache_write",
+                ][..],
+            ),
+            ("usage_metering_units", &["count"][..]),
+        ] {
+            let invalid = columns
+                .iter()
+                .map(|column| format!("{column} < 0 OR {column} > 9223372036854"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let invalid: bool = tx
+                .query_one(
+                    &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {invalid})"),
+                    &[],
+                )
+                .await
+                .store()?
+                .try_get(0)
+                .store()?;
+            if invalid {
+                return Err(RecordStoreError(format!(
+                    "exact count migration: {table} contains a quantity outside the scale-6 range; nothing was converted"
+                )));
+            }
+        }
+        for (table, columns) in [
+            (
+                "usage_ledger",
+                &[
+                    "tokens_input",
+                    "tokens_output",
+                    "tokens_cache_read",
+                    "tokens_cache_write",
+                ][..],
+            ),
+            ("usage_ledger_units", &["count"][..]),
+            (
+                "usage_metering",
+                &[
+                    "tokens_input",
+                    "tokens_output",
+                    "tokens_cache_read",
+                    "tokens_cache_write",
+                ][..],
+            ),
+            ("usage_metering_units", &["count"][..]),
+        ] {
+            let assignments = columns
+                .iter()
+                .map(|column| format!("{column} = {column} * 1000000"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tx.batch_execute(&format!("UPDATE {table} SET {assignments}"))
+                .await
+                .store()?;
         }
         tx.execute(
             "INSERT INTO busbar_schema (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
@@ -1010,7 +1088,11 @@ impl Session {
             billable_requests,
             models: models
                 .into_iter()
-                .map(|(model, usage_units)| ModelTokens { model, usage_units })
+                .map(|(model, usage_units)| ModelTokens {
+                    scale: 6,
+                    model,
+                    usage_units,
+                })
                 .collect(),
         })
     }
@@ -1063,6 +1145,12 @@ impl Session {
         window_start: u64,
         ledger: &UsageLedger,
     ) -> RecordStoreResult<()> {
+        let mut ledger = ledger.clone();
+        ledger
+            .normalize_scale6()
+            .map_err(|e| RecordStoreError(format!("exact count: {e}")))?;
+        let ledger = &ledger;
+
         if busbar_contract::abi::sdk::store::correction::reserved_bucket(bucket_id) {
             return Err(RecordStoreError(
                 "reserved usage adjustment requires atomic correction".into(),
@@ -1109,10 +1197,10 @@ impl Session {
                 .zip(rows.chunks((pgwire::MAX_BIND_PARAMETERS - 2) / 5))
             {
                 let mut sql = String::from(
-                "INSERT INTO usage_ledger \
+                    "INSERT INTO usage_ledger \
                  (bucket_id, window_start, model, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write) \
                  VALUES ",
-            );
+                );
                 let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(2 + rows.len() * 5);
                 params.push(&bucket_id);
                 params.push(&ws);
@@ -1150,8 +1238,8 @@ impl Session {
             if !opens.is_empty() {
                 for opens in opens.chunks((pgwire::MAX_BIND_PARAMETERS - 2) / 3) {
                     let mut sql = String::from(
-                    "INSERT INTO usage_ledger_units (bucket_id, window_start, model, unit, count) VALUES ",
-                );
+                        "INSERT INTO usage_ledger_units (bucket_id, window_start, model, unit, count) VALUES ",
+                    );
                     let mut params: Vec<&(dyn ToSql + Sync)> =
                         Vec::with_capacity(2 + opens.len() * 3);
                     params.push(&bucket_id);
@@ -1259,6 +1347,7 @@ impl Session {
                     r.try_get(10).store()?,
                 );
                 Ok(MeteringRow {
+                    scale: 6,
                     usage_units: units.remove(&key).unwrap_or_default(),
                     key_id: key.0,
                     model: key.1,
@@ -1922,14 +2011,14 @@ impl Session {
                 return Err(RecordStoreError(format!(
                     "{op}: key '{}' does not exist; a credential must hang off a real key",
                     m.key_id
-                )))
+                )));
             }
             Some(false) => {
                 return Err(RecordStoreError(format!(
                     "{op}: key '{}' is tombstoned; its credentials were revoked with it and are \
                      never reissued",
                     m.key_id
-                )))
+                )));
             }
             Some(true) => {}
         }
@@ -2063,6 +2152,16 @@ impl Session {
         window_start: u64,
         delta: &UsageDelta,
     ) -> RecordStoreResult<()> {
+        let mut delta = delta.clone();
+        delta
+            .normalize_scale6()
+            .map_err(|e| RecordStoreError(format!("exact count: {e}")))?;
+        let delta = &delta;
+        let mut checked = Self::get_usage_in(tx, bucket_id, window_start).await?;
+        checked
+            .checked_apply_delta(delta)
+            .map_err(|e| RecordStoreError(format!("exact count: {e}")))?;
+
         let ws = usage_key(window_start);
         let window_sql = format!(
             "INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests)
@@ -2160,8 +2259,8 @@ impl Session {
             if !opens.is_empty() {
                 for opens in opens.chunks((pgwire::MAX_BIND_PARAMETERS - 2) / 3) {
                     let mut ensure = String::from(
-                    "INSERT INTO usage_ledger_units (bucket_id, window_start, model, unit) VALUES ",
-                );
+                        "INSERT INTO usage_ledger_units (bucket_id, window_start, model, unit) VALUES ",
+                    );
                     let mut update = format!(
                         "UPDATE usage_ledger_units u SET count = {} FROM (VALUES ",
                         usage_add("u.count", "v.d")
@@ -2214,6 +2313,26 @@ impl Session {
         tx: &mut Transaction<'_>,
         d: &MeteringDelta,
     ) -> RecordStoreResult<()> {
+        let mut d = d.clone();
+        d.normalize_scale6()
+            .map_err(|e| RecordStoreError(format!("exact count: {e}")))?;
+        let d = &d;
+        if let Some(mut checked) = Self::list_metering_for_key_in(tx, d.bucket, Some(&d.key_id))
+            .await?
+            .into_iter()
+            .find(|row| {
+                row.model == d.model
+                    && row.provider == d.provider
+                    && row.priced_from_ms == d.priced_from_ms
+                    && row.key_group_at_use == d.key_group_at_use
+                    && row.pricing_version == d.pricing_version
+            })
+        {
+            checked
+                .checked_add_delta(d)
+                .map_err(|e| RecordStoreError(format!("exact count: {e}")))?;
+        }
+
         let (bucket, ti, to, tcr, tcw) = (
             usage_key(d.bucket),
             clamp(d.tokens_input),

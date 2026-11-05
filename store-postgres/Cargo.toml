@@ -32,6 +32,7 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+jsonschema = { workspace = true }
 # The `Store` contract conformance suite used to arrive here as `busbar-plugin-testkit`; the owner
 # ruled that crate DELETED on 2026-09-22 and #2/#31 forbid a shared test util between plugins, so
 # this crate owns its copy at `src/tests/store_conformance.rs` (verbatim from busbar's in-tree copy).
