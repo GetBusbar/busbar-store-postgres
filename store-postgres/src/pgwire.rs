@@ -100,16 +100,11 @@ fn config_err(what: impl Into<String>) -> Error {
 /// (`busbar-core-connector`'s `KEEPALIVE_IDLE`, 1.5.5's `tcp_keepalive(60s)`), in seconds.
 const KEEPALIVE_IDLE_SECS: i64 = 60;
 
-/// Why a socket-tuning option has no effect.
-const INERT_SOCKET: &str = "the host's connector dials every connection with TCP keepalive on, \
+/// Why a nondefault socket-tuning request cannot be honoured.
+const FIXED_SOCKET_POLICY: &str =
+    "the host's connector dials every connection with TCP keepalive on, \
                             probing after 60 s idle at the OS's interval and count, and has no \
                             per-store setting for it";
-
-/// Log, at debug (below the default level), that the accepted option `key=value` has no effect,
-/// and why.
-fn inert(key: &str, value: &str, why: &str) {
-    tracing::debug!("postgres connection option {key}={value} has no effect: {why}");
-}
 
 /// The most a message may declare: Postgres' own ceiling on a value (1 GiB) plus the four bytes
 /// of the length word, which the declared length counts.
@@ -323,7 +318,9 @@ impl Config {
 
                     let applied = n <= 0 || (k == "keepalives_idle" && n == KEEPALIVE_IDLE_SECS);
                     if !applied {
-                        inert(&k, &v, INERT_SOCKET);
+                        return Err(config_err(format!(
+                            "nondefault `{k}` is not supported: {FIXED_SOCKET_POLICY}"
+                        )));
                     }
                 }
                 "keepalives_count" | "keepalives_retries" => {
@@ -331,29 +328,33 @@ impl Config {
                         .parse()
                         .map_err(|_| config_err(format!("invalid value for option `{k}`")))?;
                     if n != 0 {
-                        inert(&k, &v, INERT_SOCKET);
+                        return Err(config_err(format!(
+                            "nondefault `{k}` is not supported: {FIXED_SOCKET_POLICY}"
+                        )));
                     }
                 }
 
                 "load_balance_hosts" => match v.as_str() {
                     "disable" => {}
-                    "random" => inert(
-                        &k,
-                        &v,
-                        "the endpoints are tried in the order given, the one that last connected \
-                         first; this store does not shuffle them",
-                    ),
+                    "random" => {
+                        return Err(config_err(
+                            "load_balance_hosts=random is not supported: the endpoints are tried \
+                             in the order given, the one that last connected first; this store \
+                             does not shuffle them",
+                        ));
+                    }
                     _ => return Err(config_err("invalid value for option `load_balance_hosts`")),
                 },
 
                 "sslnegotiation" => match v.as_str() {
                     "postgres" => {}
-                    "direct" => inert(
-                        &k,
-                        &v,
-                        "this store asks for TLS with an SSLRequest (sslnegotiation=postgres); \
-                         sslmode still decides whether the connection is secured",
-                    ),
+                    "direct" => {
+                        return Err(config_err(
+                            "sslnegotiation=direct is not supported: this store asks for TLS with \
+                             an SSLRequest (sslnegotiation=postgres); sslmode still decides \
+                             whether the connection is secured",
+                        ));
+                    }
                     _ => return Err(config_err("invalid value for option `sslnegotiation`")),
                 },
                 _ if has_password => {

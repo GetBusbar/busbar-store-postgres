@@ -28,7 +28,7 @@ postgres-types = { workspace = true }
 bytes = { workspace = true }
 fallible-iterator = { workspace = true }
 serde_json = { workspace = true }
-# Logs, at debug, the connection options accepted but without effect (`pgwire::inert`).
+# Operation receipt maintenance diagnostics.
 tracing = { workspace = true }
 
 [dev-dependencies]

@@ -25,11 +25,11 @@ const POLL: Duration = Duration::from_millis(5);
 const NODE: u64 = 0x5047_434f_5252;
 
 fn ledger(n: u64) -> UsageLedger {
-    ledger_parts(n, n)
+    ledger_parts(n, i128::from(n))
 }
 
 /// Request width and quantity width are independent: these fixtures state both explicitly.
-fn ledger_parts(requests: u64, quantity: u64) -> UsageLedger {
+fn ledger_parts(requests: u64, quantity: i128) -> UsageLedger {
     UsageLedger {
         requests,
         billable_requests: requests,
@@ -122,14 +122,11 @@ fn exact_rows_receipts_conflicts_and_full_unsigned_values_survive_reopen() {
     let store = seed(&db);
     assert!(busbar_contract::store_calls::StoreCalls::supports_usage_correction(&*store));
     let before = revision(&store);
-    let r = request(
-        UsageLedger::default(),
-        ledger_parts(u64::MAX, i64::MAX as u64),
-    );
+    let r = request(UsageLedger::default(), ledger_parts(u64::MAX, i128::MAX));
     assert_eq!(apply(&store, &r).unwrap(), Decision::Applied);
     assert_eq!(
         store.get_usage(BUCKET, DAY).unwrap(),
-        ledger_parts(u64::MAX, i64::MAX as u64)
+        ledger_parts(u64::MAX, i128::MAX)
     );
     assert_eq!(receipts(&store), 1);
     assert_eq!(revision(&store), before);
@@ -137,7 +134,7 @@ fn exact_rows_receipts_conflicts_and_full_unsigned_values_survive_reopen() {
     let reopened = TestStore::open(&db.url()).unwrap();
     assert_eq!(apply(&reopened, &r).unwrap(), Decision::Applied);
     let mut changed = r.clone();
-    changed.usage[0].replacement = ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1);
+    changed.usage[0].replacement = ledger_parts(u64::MAX - 1, i128::MAX - 1);
     assert!(matches!(
         apply(&reopened, &changed),
         Err(StoreFailure::Conflict)
@@ -148,16 +145,13 @@ fn exact_rows_receipts_conflicts_and_full_unsigned_values_survive_reopen() {
         Decision::ConditionConflict
     );
     assert_eq!(receipts(&reopened), 1);
-    assert_eq!(
-        store_value(&reopened),
-        ledger_parts(u64::MAX, i64::MAX as u64)
-    );
+    assert_eq!(store_value(&reopened), ledger_parts(u64::MAX, i128::MAX));
     reopened
-        .put_usage(BUCKET, DAY, &ledger_parts(u64::MAX, i64::MAX as u64))
+        .put_usage(BUCKET, DAY, &ledger_parts(u64::MAX, i128::MAX))
         .unwrap();
     assert_eq!(
         store_value(&reopened),
-        ledger_parts(u64::MAX, i64::MAX as u64),
+        ledger_parts(u64::MAX, i128::MAX),
         "ordinary absolute writes share the exact codec"
     );
 
@@ -178,7 +172,7 @@ fn exact_rows_receipts_conflicts_and_full_unsigned_values_survive_reopen() {
         .unwrap();
     assert_eq!(
         store_value(&reopened),
-        ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
+        ledger_parts(u64::MAX - 1, i128::MAX - 1)
     );
     reopened.delete_key(KEY).unwrap();
     assert_eq!(
@@ -186,7 +180,7 @@ fn exact_rows_receipts_conflicts_and_full_unsigned_values_survive_reopen() {
         Decision::Applied,
         "receipt precedes live-key predicate"
     );
-    let mut fresh = request(ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1), ledger(40));
+    let mut fresh = request(ledger_parts(u64::MAX - 1, i128::MAX - 1), ledger(40));
     assert_eq!(
         apply(&reopened, &fresh).unwrap(),
         Decision::ConditionConflict
@@ -203,9 +197,24 @@ fn exact_rows_receipts_conflicts_and_full_unsigned_values_survive_reopen() {
     ));
     assert_eq!(
         store_value(&reopened),
-        ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
+        ledger_parts(u64::MAX - 1, i128::MAX - 1)
     );
     assert_eq!(receipts(&reopened), 2);
+}
+
+#[test]
+fn negative_exact_correction_refuses_before_any_replacement_or_receipt() {
+    let Some(url) = live_url() else { return };
+    let db = TempDb::create(&url, "spg_correction_negative");
+    let store = seed(&db);
+    let before = ledger_parts(u64::MAX, i128::MAX);
+    store.put_usage(BUCKET, DAY, &before).unwrap();
+    for quantity in [-1, i128::MIN] {
+        let candidate = request(before.clone(), ledger_parts(u64::MAX, quantity));
+        assert!(apply(&store, &candidate).is_err());
+        assert_eq!(store_value(&store), before);
+        assert_eq!(receipts(&store), 0);
+    }
 }
 fn store_value(store: &TestStore) -> UsageLedger {
     store.get_usage(BUCKET, DAY).unwrap()
@@ -509,10 +518,7 @@ fn a_lost_commit_reply_retains_exact_replay_custody_after_the_loaded_future_is_d
     let gate = gate.unwrap();
     gate.arm();
     let _release = Release(gate.clone());
-    let r = request(
-        UsageLedger::default(),
-        ledger_parts(u64::MAX, i64::MAX as u64),
-    );
+    let r = request(UsageLedger::default(), ledger_parts(u64::MAX, i128::MAX));
     let sent = r.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -550,10 +556,7 @@ fn a_lost_commit_reply_retains_exact_replay_custody_after_the_loaded_future_is_d
     drop(store);
     let reopened = TestStore::open(&db.url()).unwrap();
     assert_eq!(apply(&reopened, &r).unwrap(), Decision::Applied);
-    assert_eq!(
-        store_value(&reopened),
-        ledger_parts(u64::MAX, i64::MAX as u64)
-    );
+    assert_eq!(store_value(&reopened), ledger_parts(u64::MAX, i128::MAX));
     assert_eq!(receipts(&reopened), 1);
 }
 
@@ -634,25 +637,18 @@ fn v18_usage_counters_migrate_in_place_before_exact_corrections_are_accepted() {
     let reopened = TestStore::open(&db.url()).unwrap();
     assert_eq!(store_value(&reopened), old);
     assert_eq!(
-        apply(
-            &reopened,
-            &request(old, ledger_parts(u64::MAX, i64::MAX as u64))
-        )
-        .unwrap(),
+        apply(&reopened, &request(old, ledger_parts(u64::MAX, i128::MAX))).unwrap(),
         Decision::Applied
     );
     drop(reopened);
     let reopened = TestStore::open(&db.url()).unwrap();
-    assert_eq!(
-        store_value(&reopened),
-        ledger_parts(u64::MAX, i64::MAX as u64)
-    );
+    assert_eq!(store_value(&reopened), ledger_parts(u64::MAX, i128::MAX));
     assert_eq!(
         apply(
             &reopened,
             &request(
-                ledger_parts(u64::MAX, i64::MAX as u64),
-                ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
+                ledger_parts(u64::MAX, i128::MAX),
+                ledger_parts(u64::MAX - 1, i128::MAX - 1)
             )
         )
         .unwrap(),
@@ -660,7 +656,7 @@ fn v18_usage_counters_migrate_in_place_before_exact_corrections_are_accepted() {
     );
     assert_eq!(
         store_value(&reopened),
-        ledger_parts(u64::MAX - 1, i64::MAX as u64 - 1)
+        ledger_parts(u64::MAX - 1, i128::MAX - 1)
     );
 }
 
@@ -720,7 +716,7 @@ fn empty_model_identity_keeps_its_units_separate_from_request_totals() {
         }],
     };
     store.add_usage(BUCKET, DAY, &delta).unwrap();
-    new.apply_delta(&delta);
+    new.checked_apply_delta(&delta).unwrap();
     assert_eq!(store_value(&store), new);
 }
 

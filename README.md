@@ -41,8 +41,22 @@ explicitly in production; do not assume they move together.
 
 ### Upgrading an existing database
 
+**Connection settings also need review before upgrading.** Positive
+`keepalives_idle` (other than `60`), positive `keepalives_interval`,
+`keepalives_count`, `keepalives_retries` or `tcp_user_timeout`,
+`load_balance_hosts=random`, and `sslnegotiation=direct` now fail validation:
+the host connector does not implement those requested settings. Earlier 1.6
+development builds accepted them with a DEBUG-only notice and ignored them.
+Released 1.5.5's driver applied supported socket tuning and random host selection,
+so removing these options can change connection failure detection or distribution.
+There is no automatic equivalent conversion. Remove or replace them only after
+reviewing the fixed connector policy below; deployments requiring those behaviors
+must resolve that requirement before upgrading. This validation happens before
+connecting or changing the database. Supported TLS modes, explicit connection
+timeouts, and multi-host failover remain available.
+
 The first connect of this build upgrades an existing database **in place**
-(schema v6/v7 → v8, inside one transaction, under the same advisory lock every
+(schema v6/v7/v8 → v9, inside one transaction, under the same advisory lock every
 node's migration takes). The compatibility refusals below leave the migration
 transaction unchanged; accepted upgrades preserve existing row meanings while
 converting quantity representations and applying the revoked-secret erasure
@@ -63,7 +77,7 @@ described below. The v7 changes remain part of an upgrade from v6:
   the kernel's records). The store keeps ledger counts, not money: busbar
   derives money from the counts and its rate card.
 - The released v6 upgrade preserves tables owned by other applications. Unreleased development
-  schema markers above v8 are refused without deleting tables or operation records.
+  schema markers above v9 are refused without deleting tables or operation records.
 - The v7 upgrade adds `plane_chain.has_parent`: new parentless appends are stored
   under their own ID and are not listed as parents. Earlier schemas stored
   both `parent=None` and `parent=Some(id)` as `parent=id`, losing the presence
@@ -99,18 +113,25 @@ described below. The v7 changes remain part of an upgrade from v6:
   size range. The migration copies the attribution recorded on
   each legacy parent, preserving empty unknown values. Orphan units refuse migration;
   already-collapsed historical attribution cannot be reconstructed from these rows.
-- The historical v7 upgrade changed raw usage request and unit columns to
-  `NUMERIC(20,0)`. In v8, quantity aggregates use exact decimal counts at scale 6:
-  each stored integer represents one millionth of a unit, with a maximum mantissa
-  of `i64::MAX` (9,223,372,036,854,775,807). Usage and metering token quantities and
-  open-unit quantities from v6/v7 are multiplied by 1,000,000 exactly once.
-  Migration locks all four quantity tables before preflight and refuses negative
-  legacy quantities or values above 9,223,372,036,854 whole units. Conversion and
-  the schema-v8 stamp commit together; refusal leaves rows and the schema unchanged.
-  Existing request and billable-request counters are not rescaled and retain
-  their separate counter rules. Quantity accruals and refunds refuse overflow,
-  underflow or values that cannot be represented exactly at scale 6; they do not
-  silently saturate or round. Atomic usage corrections compare the live key, the full key/day metering
+- Schema v9 stores quantity mantissas as `NUMERIC(39,0)`, with the exact
+  nonnegative range `0..=i128::MAX` (170,141,183,460,469,231,731,687,303,715,884,105,727
+  micro-units). The ABI advertises `busbar.store.count-scale=6` and
+  `busbar.store.count-range=i128`. All new quantity writes use scale 6.
+  Usage and metering token quantities and open-unit quantities from v6/v7
+  are widened **before** multiplication by 1,000,000. Existing schema-v8
+  micro-units are widened without rescaling. Migration locks every quantity
+  table, rejects negative/out-of-range data, and commits the conversion and
+  schema-v9 stamp together; refusal leaves the prior schema and rows unchanged.
+- Request and billable-request counters are separate, unscaled `u64` values.
+  Both usage and metering counters use `NUMERIC(20,0)` and saturating `u64`
+  accrual. Earlier PostgreSQL metering writes saturated at `i64::MAX`; v9
+  preserves stored historical values and removes that narrower limit for
+  future accrual. Values already lost to historical saturation cannot be recovered.
+- Quantity accrual refuses positive overflow atomically. Ordinary signed usage
+  refunds floor at zero, including the full signed-i128 delta range; exact
+  correction replacements must remain nonnegative and within `i128::MAX`.
+  No quantity is rounded, narrowed through a 64-bit column, or silently
+  saturated at an upper bound. Atomic usage corrections compare the live key, the full key/day metering
   selection and every affected canonical usage row under the same first revision
   lock as ordinary usage, metering, purge and key writers. All replacements and
   the operation receipt commit together. A condition conflict writes nothing;
@@ -118,7 +139,7 @@ described below. The v7 changes remain part of an upgrade from v6:
   Fresh unconditional writes to reserved usage adjustment buckets are refused;
   already-applied legacy receipts remain replayable.
 
-Drain and stop older store processes before the v8 upgrade, then reopen every
+Drain and stop older store processes before the v9 upgrade, then reopen every
 node with this build. A newer-schema check cannot fence an already-open process.
 The published v1.0.6 plugin used by busbar 1.5.5 has no newer-schema check.
 Do not reconnect older binaries to the upgraded database or run mixed-version
@@ -126,7 +147,7 @@ store writers. Rollback requires a pre-upgrade backup and the corresponding
 older build, not reopening the upgraded database with an older binary.
 
 Unreleased development databases are not supported upgrade sources. Markers
-above v8 are refused; a database stamped v7 or v8 must already have the corresponding
+above v9 are refused; a database stamped v7, v8 or v9 must already have the corresponding
 layout. Legacy application tables are left untouched.
 
 It is a `cdylib` that serves busbar's store v3 table (`StoreSlots`, via the plugin SDK in
@@ -245,25 +266,25 @@ it server-side: `BEGIN ISOLATION LEVEL READ COMMITTED` (or `REPEATABLE READ`);
 `SET LOCAL lock_timeout = '30s'`; `SET LOCAL idle_in_transaction_session_timeout
 = '60s'`. A single statement run outside a transaction carries no such bound.
 
-**Socket options, accepted as 1.5.5's driver accepted them.** busbar's
+**Socket and connection options must match implemented behavior.** busbar's
 connector owns the sockets: it dials every connection with TCP keepalive on,
 probing after 60 s idle at the OS's interval and count, with no per-store
 setting. So:
 
 - `keepalives=1` (any non-zero) is what happens anyway; `keepalives=0` is
   **refused** (the connector cannot turn keepalive off).
-- `keepalives_idle` (`60`, or `0` or less), `keepalives_interval`,
+- `keepalives_idle` (`60`, or `0` or less), `keepalives_interval` (`0` or less),
   `tcp_user_timeout` (`0` or less), `keepalives_count`, `keepalives_retries`
   (`0`), `load_balance_hosts=disable` and `sslnegotiation=postgres` are
   what the store does: accepted.
 - Any other valid value of those options (say `keepalives_idle=30`,
-  `load_balance_hosts=random`, `sslnegotiation=direct`) cannot apply: it is
-  accepted and logged once, at debug level, naming the option and why it has
-  no effect. The initial connection tries endpoints in the order given; later operations
+  `load_balance_hosts=random`, `sslnegotiation=direct`) is **refused**, naming
+  the unsupported option and the behavior this implementation provides.
+  The initial connection tries endpoints in the order given; later operations
   prefer the last successful endpoint so they can reuse its pooled sessions. If that
   endpoint fails, the remaining endpoints are tried in configured order. TLS, when requested,
   is negotiated with an `SSLRequest` (`sslmode` decides whether it is used).
-- A value 1.5.5's driver refused (not a number, an unknown keyword) is refused.
+- Malformed values and unknown keywords are refused.
 
 **Refused, with an explanation (never silently ignored):** `channel_binding=require` (no SCRAM-PLUS), `sslrootcert`
 (trust is busbar's), a Unix-socket `host`, `keepalives=0`, and any unknown

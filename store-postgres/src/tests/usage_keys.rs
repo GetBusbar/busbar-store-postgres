@@ -23,7 +23,10 @@ fn ledger(n: u64) -> UsageLedger {
         models: vec![ModelTokens {
             scale: 6,
             model: "model".into(),
-            usage_units: BTreeMap::from([(UNIT_INPUT.into(), n), ("audio_seconds".into(), n)]),
+            usage_units: BTreeMap::from([
+                (UNIT_INPUT.into(), i128::from(n)),
+                ("audio_seconds".into(), i128::from(n)),
+            ]),
         }],
     }
 }
@@ -35,7 +38,7 @@ fn meter(bucket: u64, n: u64) -> MeteringDelta {
         bucket,
         model: "model".into(),
         provider: "provider".into(),
-        tokens_input: n,
+        tokens_input: i128::from(n),
         tokens_output: 0,
         tokens_cache_read: 0,
         tokens_cache_write: 0,
@@ -44,7 +47,7 @@ fn meter(bucket: u64, n: u64) -> MeteringDelta {
         key_group_at_use: "group".into(),
         pricing_version: "version".into(),
         priced_from_ms: 0,
-        usage_units: BTreeMap::from([("audio_seconds".into(), n)]),
+        usage_units: BTreeMap::from([("audio_seconds".into(), i128::from(n))]),
     }
 }
 
@@ -137,8 +140,11 @@ fn metering_buckets_remain_distinct_across_add_batch_replay_and_reopen() {
         let n = 2 * (index as u64 + 1);
         assert_eq!(rows[0].requests, n);
         assert_eq!(rows[0].billable_requests, n);
-        assert_eq!(rows[0].tokens_input, n);
-        assert_eq!(rows[0].usage_units.get("audio_seconds"), Some(&n));
+        assert_eq!(rows[0].tokens_input, i128::from(n));
+        assert_eq!(
+            rows[0].usage_units.get("audio_seconds"),
+            Some(&i128::from(n))
+        );
     }
 }
 

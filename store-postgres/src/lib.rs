@@ -69,9 +69,9 @@ fn is_undefined_table(e: &pgwire::Error) -> bool {
     e.code().map(pgwire::SqlState::code) == Some(pgwire::SqlState::UNDEFINED_TABLE)
 }
 
-/// Store schema version. v6 is the oldest released schema; v8 converts quantity aggregates
-/// to checked micro-units without changing request counters.
-pub const SCHEMA_VERSION: i64 = 8;
+/// Store schema version. v9 widens quantity mantissas to signed i128 without rescaling
+/// existing v8 micro-units. Request counters keep their independent whole-number domain.
+pub const SCHEMA_VERSION: i64 = 9;
 
 const TICKET_RECORD_KIND: &str = "ticket";
 
@@ -161,10 +161,10 @@ CREATE TABLE IF NOT EXISTS usage_ledger (
     bucket_id          TEXT NOT NULL,
     window_start       BIGINT NOT NULL,
     model              TEXT NOT NULL,
-    tokens_input       BIGINT NOT NULL DEFAULT 0,
-    tokens_output      BIGINT NOT NULL DEFAULT 0,
-    tokens_cache_read  BIGINT NOT NULL DEFAULT 0,
-    tokens_cache_write BIGINT NOT NULL DEFAULT 0,
+    tokens_input       NUMERIC(39,0) NOT NULL DEFAULT 0,
+    tokens_output      NUMERIC(39,0) NOT NULL DEFAULT 0,
+    tokens_cache_read  NUMERIC(39,0) NOT NULL DEFAULT 0,
+    tokens_cache_write NUMERIC(39,0) NOT NULL DEFAULT 0,
     PRIMARY KEY (bucket_id, window_start, model)
 );
 -- Open unit classes of a ledger row (the four reserved token classes keep their columns).
@@ -173,7 +173,7 @@ CREATE TABLE IF NOT EXISTS usage_ledger_units (
     window_start BIGINT NOT NULL,
     model        TEXT NOT NULL,
     unit         TEXT COLLATE \"C\" NOT NULL,
-    count        BIGINT NOT NULL DEFAULT 0,
+    count        NUMERIC(39,0) NOT NULL DEFAULT 0,
     PRIMARY KEY (bucket_id, window_start, model, unit)
 );
 CREATE TABLE IF NOT EXISTS usage_metering (
@@ -181,12 +181,12 @@ CREATE TABLE IF NOT EXISTS usage_metering (
     bucket             BIGINT NOT NULL,
     model              TEXT NOT NULL,
     provider           TEXT NOT NULL,
-    tokens_input       BIGINT NOT NULL DEFAULT 0,
-    tokens_output      BIGINT NOT NULL DEFAULT 0,
-    tokens_cache_read  BIGINT NOT NULL DEFAULT 0,
-    tokens_cache_write BIGINT NOT NULL DEFAULT 0,
-    requests           BIGINT NOT NULL DEFAULT 0,
-    billable_requests  BIGINT NOT NULL DEFAULT 0,
+    tokens_input       NUMERIC(39,0) NOT NULL DEFAULT 0,
+    tokens_output      NUMERIC(39,0) NOT NULL DEFAULT 0,
+    tokens_cache_read  NUMERIC(39,0) NOT NULL DEFAULT 0,
+    tokens_cache_write NUMERIC(39,0) NOT NULL DEFAULT 0,
+    requests           NUMERIC(20,0) NOT NULL DEFAULT 0,
+    billable_requests  NUMERIC(20,0) NOT NULL DEFAULT 0,
     key_group_at_use   TEXT NOT NULL DEFAULT '',
     pricing_version    TEXT NOT NULL DEFAULT '',
     -- Start of the rate-card entry this row accrued under; part of the key.
@@ -202,7 +202,7 @@ CREATE TABLE IF NOT EXISTS usage_metering_units (
     provider       TEXT NOT NULL,
     priced_from_ms BIGINT NOT NULL DEFAULT 0,
     unit           TEXT COLLATE \"C\" NOT NULL,
-    count          BIGINT NOT NULL DEFAULT 0,
+    count          NUMERIC(39,0) NOT NULL DEFAULT 0,
     PRIMARY KEY (key_id, bucket, model, provider, priced_from_ms, unit)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_metering_units_bucket ON usage_metering_units (bucket);
@@ -626,21 +626,27 @@ impl Session {
             tx.batch_execute(
                 "ALTER TABLE usage_windows
                     ALTER COLUMN requests TYPE NUMERIC(20,0),
-                    ALTER COLUMN billable_requests TYPE NUMERIC(20,0);
-                 ALTER TABLE usage_ledger
-                    ALTER COLUMN tokens_input TYPE NUMERIC(20,0),
-                    ALTER COLUMN tokens_output TYPE NUMERIC(20,0),
-                    ALTER COLUMN tokens_cache_read TYPE NUMERIC(20,0),
-                    ALTER COLUMN tokens_cache_write TYPE NUMERIC(20,0);
-                 ALTER TABLE usage_ledger_units ALTER COLUMN count TYPE NUMERIC(20,0);",
+                    ALTER COLUMN billable_requests TYPE NUMERIC(20,0);",
             )
             .await
             .store()?;
         }
-        // Quantity conversion and its version stamp share one transaction. Lock every
-        // quantity table before preflight so no counter can change between check and update.
+        // Widen before converting whole units. Every quantity table stays locked until the
+        // new schema stamp commits; a failed preflight rolls back both DDL and row changes.
         tx.batch_execute("LOCK TABLE usage_ledger, usage_ledger_units, usage_metering, usage_metering_units IN ACCESS EXCLUSIVE MODE")
             .await.store()?;
+        // Admission and billable-request counters are unscaled u64, independently of quantities.
+        tx.batch_execute(
+            "ALTER TABLE usage_metering ALTER COLUMN requests TYPE NUMERIC(20,0),
+             ALTER COLUMN billable_requests TYPE NUMERIC(20,0)",
+        )
+        .await
+        .store()?;
+        let quantity_limit = if version < 8 {
+            i128::MAX / 1_000_000
+        } else {
+            i128::MAX
+        };
         for (table, columns) in [
             (
                 "usage_ledger",
@@ -663,9 +669,17 @@ impl Session {
             ),
             ("usage_metering_units", &["count"][..]),
         ] {
+            let widening = columns
+                .iter()
+                .map(|column| format!("ALTER COLUMN {column} TYPE NUMERIC(39,0)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tx.batch_execute(&format!("ALTER TABLE {table} {widening}"))
+                .await
+                .store()?;
             let invalid = columns
                 .iter()
-                .map(|column| format!("{column} < 0 OR {column} > 9223372036854"))
+                .map(|column| format!("{column} < 0 OR {column} > {quantity_limit}"))
                 .collect::<Vec<_>>()
                 .join(" OR ");
             let invalid: bool = tx
@@ -682,37 +696,16 @@ impl Session {
                     "exact count migration: {table} contains a quantity outside the scale-6 range; nothing was converted"
                 )));
             }
-        }
-        for (table, columns) in [
-            (
-                "usage_ledger",
-                &[
-                    "tokens_input",
-                    "tokens_output",
-                    "tokens_cache_read",
-                    "tokens_cache_write",
-                ][..],
-            ),
-            ("usage_ledger_units", &["count"][..]),
-            (
-                "usage_metering",
-                &[
-                    "tokens_input",
-                    "tokens_output",
-                    "tokens_cache_read",
-                    "tokens_cache_write",
-                ][..],
-            ),
-            ("usage_metering_units", &["count"][..]),
-        ] {
-            let assignments = columns
-                .iter()
-                .map(|column| format!("{column} = {column} * 1000000"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            tx.batch_execute(&format!("UPDATE {table} SET {assignments}"))
-                .await
-                .store()?;
+            if version < 8 {
+                let assignments = columns
+                    .iter()
+                    .map(|column| format!("{column} = {column} * 1000000"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tx.batch_execute(&format!("UPDATE {table} SET {assignments}"))
+                    .await
+                    .store()?;
+            }
         }
         tx.execute(
             "INSERT INTO busbar_schema (version) VALUES ($1) ON CONFLICT (version) DO NOTHING",
@@ -778,22 +771,32 @@ fn row_to_key(r: &Row) -> RecordStoreResult<VirtualKey> {
     })
 }
 
-/// `a + b` in SQL, pinned at `i64::MAX` instead of failing 22003 (rule 8); `floor` also keeps it >= 0.
-fn sat_add(a: &str, b: &str, floor: bool) -> String {
-    let sum = format!("LEAST(9223372036854775807, ({a})::numeric + ({b})::numeric)");
-    if floor {
-        format!("GREATEST(0, {sum})::bigint")
-    } else {
-        format!("({sum})::bigint")
-    }
-}
-
-/// Raw usage has an exact unsigned domain; numeric arithmetic must never narrow through BIGINT.
+/// Request counters have an unscaled u64 domain; quantities use separate checked arithmetic.
 fn usage_add(a: &str, b: &str) -> String {
     format!(
         "GREATEST(0, LEAST({}, ({a})::numeric + ({b})::numeric))",
         u64::MAX
     )
+}
+
+/// Quantities have already passed checked i128 preflight under revision authority.
+/// Ordinary refunds floor at zero; exact corrections use replacement writes instead.
+fn quantity_add(a: &str, b: &str) -> String {
+    format!("GREATEST(0, ({a})::numeric + ({b})::numeric)")
+}
+
+/// Read an exact nonnegative signed-i128 mantissa through the text wire codec.
+fn quantity_count(row: &Row, column: usize) -> RecordStoreResult<i128> {
+    let text: String = row.try_get(column).store()?;
+    let value: i128 = text
+        .parse()
+        .map_err(|_| RecordStoreError("exact count: invalid stored quantity".into()))?;
+    if value < 0 {
+        return Err(RecordStoreError(
+            "exact count: negative stored quantity".into(),
+        ));
+    }
+    Ok(value)
 }
 
 fn usage_count(row: &Row, column: usize) -> RecordStoreResult<u64> {
@@ -1062,20 +1065,20 @@ impl Session {
             .await
             .store()?;
 
-        let mut models: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+        let mut models: BTreeMap<String, BTreeMap<String, i128>> = BTreeMap::new();
         for r in &rows {
             let units = models
                 .entry(r.try_get::<_, String>(0).store()?)
                 .or_default();
             for (i, unit) in RESERVED_COLUMNS.iter().enumerate() {
-                let v = usage_count(r, i + 1)?;
+                let v = quantity_count(r, i + 1)?;
                 if v != 0 {
                     units.insert(unit.to_string(), v);
                 }
             }
         }
         for r in &unit_rows {
-            let v = usage_count(r, 2)?;
+            let v = quantity_count(r, 2)?;
             let units = models
                 .entry(r.try_get::<_, String>(0).store()?)
                 .or_default();
@@ -1300,8 +1303,8 @@ impl Session {
         let rows = tx
             .query(
                 "SELECT key_id, model, provider,
-                    tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
-                    requests, billable_requests, key_group_at_use, pricing_version, priced_from_ms
+                    tokens_input::text, tokens_output::text, tokens_cache_read::text, tokens_cache_write::text,
+                    requests::text, billable_requests::text, key_group_at_use, pricing_version, priced_from_ms
                  FROM usage_metering WHERE bucket=$1 AND ($2::text IS NULL OR key_id=$2)
                  ORDER BY key_id, model, provider, priced_from_ms, key_group_at_use, pricing_version",
                 &[&b, &key],
@@ -1310,17 +1313,17 @@ impl Session {
             .store()?;
         let unit_rows = tx
             .query(
-                "SELECT key_id, model, provider, priced_from_ms, unit, count, key_group_at_use, pricing_version
+                "SELECT key_id, model, provider, priced_from_ms, unit, count::text, key_group_at_use, pricing_version
                  FROM usage_metering_units WHERE bucket=$1 AND ($2::text IS NULL OR key_id=$2)",
                 &[&b, &key],
             )
             .await
             .store()?;
         type RowKey = (String, String, String, i64, String, String);
-        let mut units: std::collections::HashMap<RowKey, BTreeMap<String, u64>> =
+        let mut units: std::collections::HashMap<RowKey, BTreeMap<String, i128>> =
             std::collections::HashMap::new();
         for r in &unit_rows {
-            let v = read_u64(r.try_get::<_, i64>(5).store()?);
+            let v = quantity_count(r, 5)?;
             if v == 0 {
                 continue;
             }
@@ -1352,12 +1355,12 @@ impl Session {
                     key_id: key.0,
                     model: key.1,
                     provider: key.2,
-                    tokens_input: read_u64(r.try_get::<_, i64>(3).store()?),
-                    tokens_output: read_u64(r.try_get::<_, i64>(4).store()?),
-                    tokens_cache_read: read_u64(r.try_get::<_, i64>(5).store()?),
-                    tokens_cache_write: read_u64(r.try_get::<_, i64>(6).store()?),
-                    requests: read_u64(r.try_get::<_, i64>(7).store()?),
-                    billable_requests: read_u64(r.try_get::<_, i64>(8).store()?),
+                    tokens_input: quantity_count(r, 3)?,
+                    tokens_output: quantity_count(r, 4)?,
+                    tokens_cache_read: quantity_count(r, 5)?,
+                    tokens_cache_write: quantity_count(r, 6)?,
+                    requests: usage_count(r, 7)?,
+                    billable_requests: usage_count(r, 8)?,
                     key_group_at_use: r.try_get(9).store()?,
                     pricing_version: r.try_get(10).store()?,
                     priced_from_ms: read_u64(key.3),
@@ -2193,9 +2196,11 @@ impl Session {
             .iter()
             .flat_map(|models| models.chunks((pgwire::MAX_BIND_PARAMETERS - 2) / 5))
         {
-            let deltas: Vec<[i64; 4]> = models
+            let deltas: Vec<[String; 4]> = models
                 .iter()
-                .map(|m| RESERVED_COLUMNS.map(|u| m.usage_units.get(u).copied().unwrap_or(0)))
+                .map(|m| {
+                    RESERVED_COLUMNS.map(|u| m.usage_units.get(u).copied().unwrap_or(0).to_string())
+                })
                 .collect();
             let mut ensure =
                 String::from("INSERT INTO usage_ledger (bucket_id, window_start, model) VALUES ");
@@ -2206,10 +2211,10 @@ impl Session {
                     tokens_cache_read  = {}, \
                     tokens_cache_write = {} \
                  FROM (VALUES ",
-                usage_add("u.tokens_input", "v.di"),
-                usage_add("u.tokens_output", "v.do_"),
-                usage_add("u.tokens_cache_read", "v.dcr"),
-                usage_add("u.tokens_cache_write", "v.dcw"),
+                quantity_add("u.tokens_input", "v.di"),
+                quantity_add("u.tokens_output", "v.do_"),
+                quantity_add("u.tokens_cache_read", "v.dcr"),
+                quantity_add("u.tokens_cache_write", "v.dcw"),
             );
             let mut ensure_params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(2 + models.len());
             let mut update_params: Vec<&(dyn ToSql + Sync)> =
@@ -2227,7 +2232,7 @@ impl Session {
                 ensure_params.push(&m.model);
                 let base = 3 + i * 5;
                 update.push_str(&format!(
-                    "(${}::text,${}::bigint,${}::bigint,${}::bigint,${}::bigint)",
+                    "(${}::text,${}::text::numeric,${}::text::numeric,${}::text::numeric,${}::text::numeric)",
                     base,
                     base + 1,
                     base + 2,
@@ -2247,13 +2252,13 @@ impl Session {
             tx.execute(&ensure, &ensure_params).await.store()?;
             tx.execute(&update, &update_params).await.store()?;
 
-            let opens: Vec<(&String, &String, i64)> = models
+            let opens: Vec<(&String, &String, String)> = models
                 .iter()
                 .flat_map(|m| {
                     m.usage_units
                         .iter()
                         .filter(|(u, _)| !is_reserved_unit(u))
-                        .map(move |(u, d)| (&m.model, u, *d))
+                        .map(move |(u, d)| (&m.model, u, d.to_string()))
                 })
                 .collect();
             if !opens.is_empty() {
@@ -2263,7 +2268,7 @@ impl Session {
                     );
                     let mut update = format!(
                         "UPDATE usage_ledger_units u SET count = {} FROM (VALUES ",
-                        usage_add("u.count", "v.d")
+                        quantity_add("u.count", "v.d")
                     );
                     let mut ensure_params: Vec<&(dyn ToSql + Sync)> =
                         Vec::with_capacity(2 + opens.len() * 2);
@@ -2284,7 +2289,7 @@ impl Session {
                         ensure_params.push(*unit);
                         let ub = 3 + i * 3;
                         update.push_str(&format!(
-                            "(${}::text,${}::text,${}::bigint)",
+                            "(${}::text,${}::text,${}::text::numeric)",
                             ub,
                             ub + 1,
                             ub + 2
@@ -2335,13 +2340,13 @@ impl Session {
 
         let (bucket, ti, to, tcr, tcw) = (
             usage_key(d.bucket),
-            clamp(d.tokens_input),
-            clamp(d.tokens_output),
-            clamp(d.tokens_cache_read),
-            clamp(d.tokens_cache_write),
+            d.tokens_input.to_string(),
+            d.tokens_output.to_string(),
+            d.tokens_cache_read.to_string(),
+            d.tokens_cache_write.to_string(),
         );
-        let requests = clamp(d.requests);
-        let brequests = clamp(d.billable_requests);
+        let requests = d.requests.to_string();
+        let brequests = d.billable_requests.to_string();
         let priced_from = clamp(d.priced_from_ms);
 
         tx.query_one(
@@ -2370,12 +2375,12 @@ impl Session {
                  tokens_cache_write={}, requests={}, billable_requests={}
                  WHERE key_id=$1 AND bucket=$2 AND model=$3 AND provider=$4
                  AND key_group_at_use=$11 AND pricing_version=$12 AND priced_from_ms=$13",
-                sat_add("tokens_input", "$5::bigint", false),
-                sat_add("tokens_output", "$6::bigint", false),
-                sat_add("tokens_cache_read", "$7::bigint", false),
-                sat_add("tokens_cache_write", "$8::bigint", false),
-                sat_add("requests", "$9::bigint", false),
-                sat_add("billable_requests", "$10::bigint", false),
+                quantity_add("tokens_input", "$5::text::numeric"),
+                quantity_add("tokens_output", "$6::text::numeric"),
+                quantity_add("tokens_cache_read", "$7::text::numeric"),
+                quantity_add("tokens_cache_write", "$8::text::numeric"),
+                usage_add("requests", "$9::text::numeric"),
+                usage_add("billable_requests", "$10::text::numeric"),
             ),
                 params,
             )
@@ -2385,15 +2390,15 @@ impl Session {
             tx.execute(
                 "INSERT INTO usage_metering (key_id,bucket,model,provider,tokens_input,tokens_output,
                  tokens_cache_read,tokens_cache_write,requests,billable_requests,key_group_at_use,
-                 pricing_version,priced_from_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                 pricing_version,priced_from_ms) VALUES ($1,$2,$3,$4,$5::text::numeric,$6::text::numeric,$7::text::numeric,$8::text::numeric,$9::text::numeric,$10::text::numeric,$11,$12,$13)",
                 params,
             ).await.store()?;
         }
-        let units: Vec<(&String, i64)> = d
+        let units: Vec<(&String, String)> = d
             .usage_units
             .iter()
             .filter(|(_, v)| **v != 0)
-            .map(|(u, v)| (u, clamp(*v)))
+            .map(|(u, v)| (u, v.to_string()))
             .collect();
         for units in units.chunks((pgwire::MAX_BIND_PARAMETERS - 7) / 2) {
             let mut sql = String::from("WITH incoming(unit,count) AS (VALUES ");
@@ -2412,7 +2417,7 @@ impl Session {
                     sql.push(',');
                 }
                 let base = 8 + i * 2;
-                sql.push_str(&format!("(${}::text,${}::bigint)", base, base + 1));
+                sql.push_str(&format!("(${}::text,${}::text::numeric)", base, base + 1));
                 params.push(*unit);
                 params.push(count);
             }
@@ -2425,7 +2430,7 @@ impl Session {
                  (key_id,bucket,model,provider,priced_from_ms,key_group_at_use,pricing_version,unit,count)
                  SELECT $1,$2,$3,$4,$5,$6,$7,v.unit,v.count FROM incoming v
                  WHERE NOT EXISTS (SELECT 1 FROM updated u WHERE u.unit=v.unit)",
-                sat_add("u.count","v.count",false),
+                quantity_add("u.count","v.count"),
             ));
             tx.execute(&sql, &params).await.store()?;
         }

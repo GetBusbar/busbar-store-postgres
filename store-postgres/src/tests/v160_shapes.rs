@@ -106,11 +106,11 @@ CREATE TABLE IF NOT EXISTS denylist (
 
 ";
 
-fn units(pairs: &[(&str, u64)]) -> BTreeMap<String, u64> {
+fn units(pairs: &[(&str, i128)]) -> BTreeMap<String, i128> {
     pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
 }
 
-fn signed(pairs: &[(&str, i64)]) -> BTreeMap<String, i64> {
+fn signed(pairs: &[(&str, i128)]) -> BTreeMap<String, i128> {
     pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
 }
 
@@ -536,38 +536,42 @@ fn the_usage_ledger_carries_open_units_and_applies_refunds() {
 
     let got = store.get_usage(bucket, ws).unwrap();
     let mut expect = smaller.clone();
-    expect.apply_delta(&UsageDelta {
-        requests: 2,
-        billable_requests: 1,
-        models: vec![
-            ModelTokensDelta {
-                scale: 6,
-                model: "model-a".into(),
-                usage_units: signed(&[(UNIT_INPUT, 4), ("search_units", 7)]),
-            },
-            ModelTokensDelta {
-                scale: 6,
-                model: "model-c".into(),
-                usage_units: signed(&[(UNIT_OUTPUT, 9)]),
-            },
-        ],
-    });
-    expect.apply_delta(&UsageDelta {
-        requests: 0,
-        billable_requests: -1,
-        models: vec![
-            ModelTokensDelta {
-                scale: 6,
-                model: "model-a".into(),
-                usage_units: signed(&[(UNIT_INPUT, -2), ("search_units", -100)]),
-            },
-            ModelTokensDelta {
-                scale: 6,
-                model: "model-d".into(),
-                usage_units: signed(&[(UNIT_OUTPUT, -5)]),
-            },
-        ],
-    });
+    expect
+        .checked_apply_delta(&UsageDelta {
+            requests: 2,
+            billable_requests: 1,
+            models: vec![
+                ModelTokensDelta {
+                    scale: 6,
+                    model: "model-a".into(),
+                    usage_units: signed(&[(UNIT_INPUT, 4), ("search_units", 7)]),
+                },
+                ModelTokensDelta {
+                    scale: 6,
+                    model: "model-c".into(),
+                    usage_units: signed(&[(UNIT_OUTPUT, 9)]),
+                },
+            ],
+        })
+        .unwrap();
+    expect
+        .checked_apply_delta(&UsageDelta {
+            requests: 0,
+            billable_requests: -1,
+            models: vec![
+                ModelTokensDelta {
+                    scale: 6,
+                    model: "model-a".into(),
+                    usage_units: signed(&[(UNIT_INPUT, -2), ("search_units", -100)]),
+                },
+                ModelTokensDelta {
+                    scale: 6,
+                    model: "model-d".into(),
+                    usage_units: signed(&[(UNIT_OUTPUT, -5)]),
+                },
+            ],
+        })
+        .unwrap();
 
     for m in &mut expect.models {
         m.usage_units.retain(|_, v| *v != 0);
@@ -597,7 +601,7 @@ fn metering_splits_on_priced_from_ms_and_carries_open_classes() {
     let store = connect_store_with_retry(&url).expect("connect");
     let key_id = format!("vk_meter_units_{}", unique_suffix());
     let bucket = 20_270_611u64;
-    let delta = |priced_from_ms: u64, input: u64, classes: &[(&str, u64)]| MeteringDelta {
+    let delta = |priced_from_ms: u64, input: i128, classes: &[(&str, i128)]| MeteringDelta {
         scale: 6,
         key_id: key_id.clone(),
         bucket,
@@ -791,7 +795,7 @@ fn restore_1_5_5(url: &str) -> TempDb {
     tmp
 }
 
-fn reserved_units(row: &serde_json::Value) -> BTreeMap<String, u64> {
+fn reserved_units(row: &serde_json::Value) -> BTreeMap<String, i128> {
     let mut m = BTreeMap::new();
     for (unit, col) in [
         (UNIT_INPUT, "tokens_input"),
@@ -799,7 +803,7 @@ fn reserved_units(row: &serde_json::Value) -> BTreeMap<String, u64> {
         (UNIT_CACHE_READ, "tokens_cache_read"),
         (UNIT_CACHE_WRITE, "tokens_cache_write"),
     ] {
-        let v = fx_u64(row, col) * 1_000_000;
+        let v = i128::from(fx_u64(row, col)) * 1_000_000;
         if v != 0 {
             m.insert(unit.to_string(), v);
         }
@@ -823,7 +827,7 @@ fn assert_recorded_1_5_5_admin_counts(store: &TestStore) {
             .collect();
         assert!(rows.iter().all(|row| row.scale == 6));
         let actual = [
-            rows.iter().map(|row| row.requests).sum::<u64>(),
+            i128::from(rows.iter().map(|row| row.requests).sum::<u64>()),
             rows.iter().map(|row| row.tokens_input).sum(),
             rows.iter().map(|row| row.tokens_output).sum(),
             rows.iter().map(|row| row.tokens_cache_read).sum(),
@@ -837,7 +841,8 @@ fn assert_recorded_1_5_5_admin_counts(store: &TestStore) {
             "tokens_cache_creation",
         ]
         .map(|field| {
-            expected[field].as_u64().unwrap() * if field == "requests" { 1 } else { 1_000_000 }
+            i128::from(expected[field].as_u64().unwrap())
+                * if field == "requests" { 1 } else { 1_000_000 }
         });
         assert_eq!(
             actual, expected,
@@ -859,17 +864,20 @@ fn assert_recorded_1_5_5_admin_counts(store: &TestStore) {
             "preserve the independently recorded key-window count, including historical differences from metering"
         );
         assert!(got.models.iter().all(|model| model.scale == 6));
-        let tokens: u64 = got
+        let tokens: i128 = got
             .models
             .iter()
             .map(|model| {
                 [UNIT_INPUT, UNIT_OUTPUT, UNIT_CACHE_READ, UNIT_CACHE_WRITE]
                     .iter()
                     .map(|unit| model.usage_units.get(*unit).copied().unwrap_or(0))
-                    .sum::<u64>()
+                    .sum::<i128>()
             })
             .sum();
-        assert_eq!(tokens, expected["tokens"].as_u64().unwrap() * 1_000_000);
+        assert_eq!(
+            tokens,
+            i128::from(expected["tokens"].as_u64().unwrap()) * 1_000_000
+        );
     }
 }
 
@@ -925,22 +933,22 @@ fn assert_1_5_5_rows_read_back(store: &TestStore) {
             assert_eq!(row.pricing_version, fx_str(w, "pricing_version"), "{w}");
             assert_eq!(
                 row.tokens_input,
-                fx_u64(w, "tokens_input") * 1_000_000,
+                i128::from(fx_u64(w, "tokens_input")) * 1_000_000,
                 "{w}"
             );
             assert_eq!(
                 row.tokens_output,
-                fx_u64(w, "tokens_output") * 1_000_000,
+                i128::from(fx_u64(w, "tokens_output")) * 1_000_000,
                 "{w}"
             );
             assert_eq!(
                 row.tokens_cache_read,
-                fx_u64(w, "tokens_cache_read") * 1_000_000,
+                i128::from(fx_u64(w, "tokens_cache_read")) * 1_000_000,
                 "{w}"
             );
             assert_eq!(
                 row.tokens_cache_write,
-                fx_u64(w, "tokens_cache_write") * 1_000_000,
+                i128::from(fx_u64(w, "tokens_cache_write")) * 1_000_000,
                 "{w}"
             );
             assert_eq!(row.priced_from_ms, 0, "a 1.5.5 row is undated: {w}");
@@ -1091,7 +1099,7 @@ fn migrate_over_the_1_5_5_rows_is_idempotent() {
 }
 
 /// `UsageDelta.models` may name one model twice. `add_usage` must fold the entries sequentially,
-/// flooring each counter at 0 after every entry, exactly as `UsageLedger::apply_delta` does —
+/// flooring each counter at 0 after every entry, exactly as `UsageLedger::checked_apply_delta` does —
 /// a joined `UPDATE … FROM (VALUES …)` alone applies only one row per target and lost the other.
 #[test]
 fn add_usage_folds_a_model_named_twice_sequentially() {
@@ -1100,7 +1108,7 @@ fn add_usage_folds_a_model_named_twice_sequentially() {
     let url = database.url();
     let store = connect_store_with_retry(&url).expect("connect");
     let ws = 20_270_601u64;
-    let entry = |m: &str, u: &[(&str, i64)]| ModelTokensDelta {
+    let entry = |m: &str, u: &[(&str, i128)]| ModelTokensDelta {
         scale: 6,
         model: m.into(),
         usage_units: signed(u),
@@ -1148,7 +1156,7 @@ fn add_usage_folds_a_model_named_twice_sequentially() {
     };
     store.add_usage(bucket, ws, &refund).unwrap();
     let mut expect = start.clone();
-    expect.apply_delta(&refund);
+    expect.checked_apply_delta(&refund).unwrap();
     let got = store.get_usage(bucket, ws).unwrap();
     assert_eq!(got, expect);
     assert_eq!(got.models[0].usage_units.get(UNIT_INPUT), Some(&100));
@@ -1166,7 +1174,7 @@ fn add_usage_folds_a_model_named_twice_sequentially() {
     };
     store.add_usage(bucket, ws, &d).unwrap();
     let mut expect = UsageLedger::default();
-    expect.apply_delta(&d);
+    expect.checked_apply_delta(&d).unwrap();
     let got = store.get_usage(bucket, ws).unwrap();
     assert_eq!(got, expect);
     let m = got.models.iter().find(|x| x.model == "m").unwrap();

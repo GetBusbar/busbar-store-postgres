@@ -60,6 +60,7 @@ pub const NEEDS: &[Need] = &[Need {
 
 busbar_contract::statement_extensions!(EXTENSIONS: [
     ("busbar.store.count-scale", b"6"),
+    ("busbar.store.count-range", b"i128"),
     (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
     (busbar_contract::abi::sdk::store::rewrap::INTENT, b"1"),
     (busbar_contract::abi::sdk::store::conditional::CAPABILITY, b"1"),
@@ -258,7 +259,8 @@ impl Session {
         Ok(correction::Decision::Applied)
     }
 
-    /// NUMERIC stores the exact u64 domain; text parameters avoid the wire client's i64 codec.
+    /// NUMERIC stores exact i128 quantity mantissas and independent u64 request counters.
+    /// Text parameters avoid narrowing quantities through the wire client's i64 codec.
     async fn replace_usage_exact_in(
         tx: &mut Transaction<'_>,
         change: &correction::UsageChange,

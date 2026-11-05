@@ -118,7 +118,7 @@ fn open_usage_and_metering_unit_lists_cross_the_bind_frame_width_atomically() {
     let db = TempDb::create(&url, "spg_units_bind");
     let store = TestStore::open(&db.url()).unwrap();
     let count = (usize::from(u16::MAX) - 5) / 2 + 1;
-    let units: BTreeMap<String, u64> = (0..count).map(|i| (format!("unit{i}"), 1)).collect();
+    let units: BTreeMap<String, i128> = (0..count).map(|i| (format!("unit{i}"), 1)).collect();
     let ledger = UsageLedger {
         requests: 1,
         billable_requests: 1,
@@ -135,7 +135,7 @@ fn open_usage_and_metering_unit_lists_cross_the_bind_frame_width_atomically() {
         models: vec![ModelTokensDelta {
             scale: 6,
             model: "model".into(),
-            usage_units: units.iter().map(|(k, v)| (k.clone(), *v as i64)).collect(),
+            usage_units: units.clone(),
         }],
     };
     store.add_usage("bucket", 60, &delta).unwrap();

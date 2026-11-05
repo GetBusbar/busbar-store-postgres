@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! Unit tests for the Postgres store (schema v7, generic credentials): DSN-password scrubbing plus
+//! Unit tests for the Postgres store (schema v9, generic credentials): DSN-password scrubbing plus
 //! (gated on `BUSBAR_TEST_POSTGRES_URL`) real round-trip and invariant coverage against a live
 //! `postgres:16`.
 
@@ -64,10 +64,10 @@ impl Lookup for TestStore {
 /// store reads them back).
 fn mt(
     model: impl Into<String>,
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write: u64,
+    input: i128,
+    output: i128,
+    cache_read: i128,
+    cache_write: i128,
 ) -> ModelTokens {
     let mut usage_units = BTreeMap::new();
     for (u, v) in [
@@ -90,10 +90,10 @@ fn mt(
 /// The signed twin of [`mt`], for `add_usage`.
 fn mtd(
     model: impl Into<String>,
-    input: i64,
-    output: i64,
-    cache_read: i64,
-    cache_write: i64,
+    input: i128,
+    output: i128,
+    cache_read: i128,
+    cache_write: i128,
 ) -> ModelTokensDelta {
     let mut usage_units = BTreeMap::new();
     for (u, v) in [
@@ -996,14 +996,14 @@ fn put_usage_and_add_usage_batch_multiple_models_correctly() {
 fn usage_accruals_refuse_quantity_overflow_and_keep_request_width() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let max = i64::MAX;
+    let max = i128::MAX;
     let bucket = format!("vk_sat_{}", unique_suffix());
     let ws = 20_270_501u64;
     let mut open_units = mtd("m", max, max, max, max);
     open_units.usage_units.insert("audio_s".into(), max);
     let mut delta = UsageDelta {
-        requests: max,
-        billable_requests: max,
+        requests: i64::MAX,
+        billable_requests: i64::MAX,
         models: vec![open_units],
     };
     store.add_usage(&bucket, ws, &delta).unwrap();
@@ -1016,9 +1016,9 @@ fn usage_accruals_refuse_quantity_overflow_and_keep_request_width() {
     let got = store.get_usage(&bucket, ws).unwrap();
     assert_eq!(got.requests, u64::MAX);
     assert_eq!(got.billable_requests, u64::MAX);
-    assert_eq!(got.models[0].tier(UNIT_INPUT), i64::MAX as u64);
-    assert_eq!(got.models[0].tier(UNIT_CACHE_WRITE), i64::MAX as u64);
-    assert_eq!(got.models[0].tier("audio_s"), i64::MAX as u64);
+    assert_eq!(got.models[0].tier(UNIT_INPUT), i128::MAX);
+    assert_eq!(got.models[0].tier(UNIT_CACHE_WRITE), i128::MAX);
+    assert_eq!(got.models[0].tier("audio_s"), i128::MAX);
 
     let mut refund = mtd("m", -1, 0, 0, 0);
     refund.usage_units.insert("audio_s".into(), -1);
@@ -1035,8 +1035,8 @@ fn usage_accruals_refuse_quantity_overflow_and_keep_request_width() {
         .unwrap();
     let got = store.get_usage(&bucket, ws).unwrap();
     assert_eq!(got.requests, u64::MAX - 1);
-    assert_eq!(got.models[0].tier(UNIT_INPUT), i64::MAX as u64 - 1);
-    assert_eq!(got.models[0].tier("audio_s"), i64::MAX as u64 - 1);
+    assert_eq!(got.models[0].tier(UNIT_INPUT), i128::MAX - 1);
+    assert_eq!(got.models[0].tier("audio_s"), i128::MAX - 1);
 }
 
 /// Metering quantities refuse overflow without changing request or quantity columns.
@@ -1044,20 +1044,20 @@ fn usage_accruals_refuse_quantity_overflow_and_keep_request_width() {
 fn metering_accruals_refuse_quantity_overflow() {
     let Some(url) = live_url() else { return };
     let store = connect_store_with_retry(&url).expect("connect");
-    let max = i64::MAX;
+    let max = i128::MAX;
     let key = format!("vk_sat_m_{}", unique_suffix());
     let mut units = BTreeMap::new();
-    units.insert("audio_s".to_string(), max as u64);
+    units.insert("audio_s".to_string(), max);
     let meter = busbar_contract::records::MeteringDelta {
         scale: 6,
         key_id: key.clone(),
         bucket: 20_270_502,
         model: "m".into(),
         provider: "p".into(),
-        tokens_input: max as u64,
-        tokens_output: max as u64,
-        tokens_cache_read: max as u64,
-        tokens_cache_write: max as u64,
+        tokens_input: max,
+        tokens_output: max,
+        tokens_cache_read: max,
+        tokens_cache_write: max,
         requests: u64::MAX,
         billable_requests: u64::MAX,
         key_group_at_use: "g".into(),
@@ -1069,10 +1069,10 @@ fn metering_accruals_refuse_quantity_overflow() {
     assert!(store.add_metering(&meter).is_err());
     let rows = store.list_metering(20_270_502).unwrap();
     let row = rows.iter().find(|r| r.key_id == key).unwrap();
-    assert_eq!(row.tokens_input, max as u64);
-    assert_eq!(row.requests, max as u64);
-    assert_eq!(row.billable_requests, max as u64);
-    assert_eq!(row.usage_units["audio_s"], max as u64);
+    assert_eq!(row.tokens_input, max);
+    assert_eq!(row.requests, u64::MAX);
+    assert_eq!(row.billable_requests, u64::MAX);
+    assert_eq!(row.usage_units["audio_s"], max);
 }
 
 /// The denylist pair: `add_denylist` is idempotent, a repeat add keeps the first reason.
@@ -2209,13 +2209,16 @@ fn usage_cleanup_keeps_boundaries_billing_and_rolls_back_every_usage_table() {
     let row = store
         .lock()
         .query_one(
-            "SELECT (SELECT requests FROM usage_metering WHERE key_id='billed'),
-                (SELECT count FROM usage_metering_units WHERE key_id='billed')",
+            "SELECT (SELECT requests::text FROM usage_metering WHERE key_id='billed'),
+                (SELECT count::text FROM usage_metering_units WHERE key_id='billed')",
             &[],
         )
         .unwrap();
     assert_eq!(
-        (row.get::<_, i64>(0), row.get::<_, i64>(1)),
+        (
+            row.get::<_, String>(0).parse::<u64>().unwrap(),
+            row.get::<_, String>(1).parse::<i128>().unwrap()
+        ),
         (17, 19),
         "billing history and its open units are untouched"
     );

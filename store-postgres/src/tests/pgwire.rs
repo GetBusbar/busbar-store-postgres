@@ -144,11 +144,9 @@ fn sslmode_values_map_to_their_modes() {
     }
 }
 
-/// The libpq socket options a 1.5.5 DSN carried are ACCEPTED (1.5.5's driver accepted them; a 1.5.5
-/// config keeps booting): what the host's connector does anyway is accepted quietly, what it cannot
-/// apply is accepted and logged at debug, naming the option and why.
+/// Accept settings implemented by the connector; refuse requests whose behavior is unavailable.
 #[test]
-fn socket_options_are_accepted_and_what_cannot_apply_is_logged() {
+fn socket_options_accept_only_effective_settings() {
     let logged = |dsn: &str| -> (Result<(), String>, String) {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let sink = buf.clone();
@@ -169,10 +167,13 @@ fn socket_options_are_accepted_and_what_cannot_apply_is_logged() {
         "keepalives=7",
         "keepalives_idle=60",
         "keepalives_idle=0",
+        "keepalives_idle=-1",
         "keepalives_interval=0",
+        "keepalives_interval=-1",
         "keepalives_count=0",
         "keepalives_retries=0",
         "tcp_user_timeout=0",
+        "tcp_user_timeout=-1",
         "load_balance_hosts=disable",
         "sslnegotiation=postgres",
     ] {
@@ -200,19 +201,28 @@ fn socket_options_are_accepted_and_what_cannot_apply_is_logged() {
             format!("postgres://u:zq9pw@db/d?{opt}"),
         ] {
             let (r, text) = logged(&dsn);
-            assert_eq!(r, Ok(()), "{dsn}");
-            let lines: Vec<&str> = text
-                .lines()
-                .filter(|l| l.contains("has no effect"))
-                .collect();
-            assert_eq!(lines.len(), 1, "{dsn}: {text}");
+            let error = r.expect_err("unsupported behavior must fail validation");
+            let name = opt.split('=').next().unwrap();
             assert!(
-                lines[0].contains("DEBUG")
-                    && lines[0].contains(&format!("option {opt} has no effect"))
-                    && lines[0].contains(why)
-                    && !lines[0].contains("zq9pw"),
-                "{dsn}: {text}"
+                error.contains(name)
+                    && error.contains("not supported")
+                    && error.contains(why)
+                    && !error.contains("zq9pw"),
+                "{dsn}: {error}"
             );
+            assert!(!text.contains("has no effect"), "{dsn}: {text}");
+
+            let settings = serde_json::json!({ "url": dsn }).to_string();
+            let error =
+                <crate::PostgresStore as busbar_contract::abi::sdk::store::StoreSlots>::validate(
+                    settings.as_bytes(),
+                )
+                .expect_err("the Store lifecycle must reject the same unsupported settings");
+            assert!(
+                error.contains("invalid postgres plugin config: url:"),
+                "{error}"
+            );
+            assert!(error.contains(name) && !error.contains("zq9pw"), "{error}");
         }
     }
 
