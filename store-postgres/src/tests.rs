@@ -2376,7 +2376,7 @@ fn legacy_revoked_secrets_are_scrubbed_on_upgrade_and_on_repeated_revoke() {
             after.meta.revision > before.meta.revision,
             "scrubbing is observable in hydration deltas"
         );
-        let mut expected = before.meta;
+        let mut expected = before.meta.clone();
         expected.secret_form = SecretForm::None;
         expected.revision = after.meta.revision;
         assert_eq!(

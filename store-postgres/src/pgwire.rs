@@ -22,6 +22,9 @@ use busbar_contract::abi::sdk::chip::pg_scram_nonce;
 use busbar_contract::abi::sdk::cred::{CredUrl, PgAuth, RequireAuth, Seal};
 use busbar_contract::abi::sdk::store::wire::Wire;
 
+mod receive;
+use receive::ReceiveBuffer;
+
 /// Whether the connection is secured (libpq's `sslmode`). `disable` and `allow` connect in
 /// plaintext (no SSLRequest); `prefer` asks the server for TLS and secures the connection when it
 /// accepts, without verifying its certificate, else goes on in plaintext; `require`, `verify-ca`
@@ -854,7 +857,7 @@ pub struct Client {
     wire: Wire,
     authenticated: bool,
     credentials: CredUrl,
-    buf: BytesMut,
+    buf: ReceiveBuffer,
     /// A `Transaction` was dropped uncommitted: roll it back before the next statement.
     rollback_pending: bool,
     /// The transaction status of the last `ReadyForQuery` (`I` idle, `T` in a transaction, `E` in
@@ -1027,7 +1030,7 @@ impl Client {
             wire: wire.clone(),
             authenticated: reused,
             credentials: cfg.credentials.clone(),
-            buf: BytesMut::new(),
+            buf: ReceiveBuffer::default(),
             rollback_pending: false,
             status: b'I',
             at_ready: true,
@@ -1265,8 +1268,8 @@ impl Client {
         }
         let buf = &mut self.buf;
         self.wire.input(|i| {
-            buf.extend_from_slice(i);
-            i.clear();
+            buf.append(i);
+            zeroize::Zeroize::zeroize(i);
         });
         Ok(())
     }
@@ -1276,7 +1279,7 @@ impl Client {
             self.more().await?;
         }
         let b = self.buf[0];
-        let _ = self.buf.split_to(1);
+        self.buf.consume(1);
         Ok(b)
     }
 
@@ -1291,7 +1294,7 @@ impl Client {
                     ))));
                 }
             }
-            match Message::parse(&mut self.buf).map_err(parse_err)? {
+            match self.buf.message().map_err(parse_err)? {
                 Some(
                     Message::ParameterStatus(_)
                     | Message::NoticeResponse(_)
