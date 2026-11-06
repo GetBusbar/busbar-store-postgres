@@ -324,3 +324,52 @@ fn inputs() -> String {
     ));
     config.to_string()
 }
+
+/// A mandatory live fixture and the actual own-image path exercise only the lifecycle,
+/// independently of the full semantic transcript.
+#[test]
+fn fresh_linked_and_dropped_images_open_ready_read_and_close() {
+    let url = std::env::var("BUSBAR_TEST_POSTGRES_URL")
+        .expect("BUSBAR_TEST_POSTGRES_URL must name the owned live Postgres fixture; no skip");
+    assert!(
+        !url.trim().is_empty(),
+        "the owned Postgres fixture URL is empty"
+    );
+    let image = common::plugin_path();
+    let stated = common::stated();
+    let settings = serde_json::json!({ "url": url }).to_string();
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("host clock")
+        .as_nanos();
+    for door in ["linked", "dropped"] {
+        let (plugin, dispatcher) = if door == "linked" {
+            linked()
+        } else {
+            dropped(&image, &stated)
+        };
+        let store = LoadedStore::open(
+            plugin,
+            Arc::clone(&dispatcher),
+            settings.as_bytes(),
+            common::mint,
+        )
+        .expect("actual Postgres image opens on the owned live fixture");
+        store
+            .plugin()
+            .ready(&dispatcher, std::time::Duration::from_secs(30))
+            .expect("actual Postgres image becomes ready");
+        let namespace = format!("lifecycle-{}-{nonce}-{door}", std::process::id());
+        assert_eq!(
+            store
+                .record_get(&namespace, b"absent")
+                .expect("one benign read"),
+            None,
+            "a new lifecycle namespace has no record"
+        );
+        // LoadedStore::drop invokes the loader's close lifecycle slot while the
+        // dispatcher and the actual library remain alive.
+        drop(store);
+        drop(dispatcher);
+    }
+}
