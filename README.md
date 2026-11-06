@@ -7,7 +7,6 @@ First-party signed kind:store plugin cdylib: the Postgres backend for busbar's d
 |---|---|---|---|---|
 | `store` | `postgres` | `busbar-store-postgres-plugin` | 1.6.0 (pinned in `.busbar-ref`) | Apache-2.0 |
 
-[![ci](https://github.com/GetBusbar/busbar-store-postgres/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/GetBusbar/busbar-store-postgres/actions/workflows/ci.yml)
 <!-- fleet:header:end -->
 
 ## What it is for
@@ -15,7 +14,6 @@ First-party signed kind:store plugin cdylib: the Postgres backend for busbar's d
 **This plugin's version: v1.6.0.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
 
-[![CI](https://github.com/GetBusbar/busbar-store-postgres/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/busbar-store-postgres/actions/workflows/ci.yml)
 [![Coverage](https://codecov.io/gh/GetBusbar/busbar-store-postgres/branch/dev/graph/badge.svg)](https://codecov.io/gh/GetBusbar/busbar-store-postgres)
 [![Release](https://img.shields.io/github/v/release/GetBusbar/busbar-store-postgres)](https://github.com/GetBusbar/busbar-store-postgres/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
