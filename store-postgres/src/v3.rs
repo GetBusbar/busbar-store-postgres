@@ -188,21 +188,8 @@ impl Session {
         request: &correction::Request,
     ) -> OpResult<correction::Decision> {
         let dedupe = Dedupe::usage_correction(request);
-        let mut normalized_request = request.clone();
-        for row in &mut normalized_request.metering {
-            row.normalize_scale6()
-                .map_err(|e| OpRefused::Refused(e.to_string()))?;
-        }
-        for change in &mut normalized_request.usage {
-            change
-                .expected
-                .normalize_scale6()
-                .map_err(|e| OpRefused::Refused(e.to_string()))?;
-            change
-                .replacement
-                .normalize_scale6()
-                .map_err(|e| OpRefused::Refused(e.to_string()))?;
-        }
+        let normalized_request =
+            correction::normalized(request).map_err(|e| OpRefused::Refused(e.to_string()))?;
         let request = &normalized_request;
         let mut tx = self
             .client()
@@ -867,7 +854,6 @@ impl StoreSlots for PostgresStore {
         purge_usage_before(before = u64) -> u64;
         list_metering(bucket = u64) -> Vec<MeteringRow>;
         put_credential(secret: &CredentialSecret) -> ();
-        rewrap_credential(expected: &CredentialSecret, replacement: &str) -> bool;
         put_key_with_credential(key: &VirtualKey, secret: &CredentialSecret) -> ();
         list_credentials(key_id: &str) -> Vec<CredentialMeta>;
         revoke_credential(id: &str, reason: &str) -> ();
@@ -882,6 +868,19 @@ impl StoreSlots for PostgresStore {
         delete_plane_record(kind: &str, id: &str) -> ();
         redeem_plane_token(kind: &str, token: &str, expires_at = u64, now = u64) -> bool;
         plane_token_live(kind: &str, token: &str, expires_at = u64, now = u64) -> bool;
+    }
+
+    fn rewrap_credential(
+        &self,
+        cx: &mut Op<'_>,
+        expected: &CredentialSecret,
+        replacement: &str,
+    ) -> Step<RecordStoreResult<bool>> {
+        // Both owned envelopes must be wiped when the parked operation completes or cancels.
+        let request = busbar_contract::abi::sdk::store::rewrap::Request::new(expected, replacement);
+        on_conn!(self, cx, RecordStoreError, |s| s
+            .rewrap_credential(&request.expected, &request.replacement)
+            .await)
     }
 
     fn upsert_plane_record(
