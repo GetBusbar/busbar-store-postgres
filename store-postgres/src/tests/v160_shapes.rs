@@ -11,7 +11,7 @@ use busbar_contract::records::{ScopeRef, UsageDelta};
 
 /// The schema a RELEASED 1.5.x build (store-postgres v1.0.0-v1.0.6, schema v6) created, verbatim
 /// from `main` (comments stripped).
-const V6_SCHEMA: &str = "
+pub(super) const V6_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS busbar_schema (
     version BIGINT PRIMARY KEY
 );

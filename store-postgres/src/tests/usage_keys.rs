@@ -225,23 +225,30 @@ fn unsigned_usage_purge_preserves_zero_equal_cutoffs_and_metering() {
 fn released_v6_usage_keys_migrate_without_reinterpreting_existing_maximum_rows() {
     let Some(url) = live_url() else { return };
     let db = TempDb::create(&url, "spg_usage_v16");
-    let store = TestStore::open(&db.url()).unwrap();
-    for key in [0, 1, i64::MAX as u64] {
-        store.put_usage("bucket", key, &ledger(7)).unwrap();
-        store.add_metering(&meter(key, 9)).unwrap();
-    }
-    store
-        .lock()
-        .batch_execute(&format!("DELETE FROM busbar_schema; INSERT INTO busbar_schema(version) VALUES ({FIRST_RELEASED_SCHEMA})"))
+    let mut legacy = connect_client_with_retry(&db.url());
+    legacy.batch_execute(super::v160_shapes::V6_SCHEMA).unwrap();
+    legacy
+        .batch_execute(&format!(
+            "INSERT INTO busbar_schema(version) VALUES ({FIRST_RELEASED_SCHEMA})"
+        ))
         .unwrap();
-    drop(store);
+    for key in [0_i64, 1, i64::MAX] {
+        legacy.execute("INSERT INTO usage_windows (bucket_id, window_start, requests, billable_requests) VALUES ('bucket', $1, 7, 7)", &[&key]).unwrap();
+        legacy.execute("INSERT INTO usage_ledger (bucket_id, window_start, model, tokens_input) VALUES ('bucket', $1, 'model', 7)", &[&key]).unwrap();
+        legacy.execute("INSERT INTO usage_metering (key_id, bucket, model, provider, tokens_input, requests, billable_requests) VALUES ('key', $1, 'model', 'provider', 9, 9, 9)", &[&key]).unwrap();
+    }
+    drop(legacy);
+    // Released v6 quantities are whole units; current ledgers contain micro-units.
+    let mut migrated = ledger(7);
+    migrated.models[0].usage_units = BTreeMap::from([(UNIT_INPUT.into(), 7_000_000)]);
     let reopened = TestStore::open(&db.url()).unwrap();
     for key in [0, 1, i64::MAX as u64] {
-        assert_eq!(reopened.get_usage("bucket", key).unwrap(), ledger(7));
+        assert_eq!(reopened.get_usage("bucket", key).unwrap(), migrated);
         let rows = reopened.list_metering(key).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].requests, 9);
-        assert_eq!(rows[0].usage_units.get("audio_seconds"), Some(&9));
+        assert_eq!(rows[0].tokens_input, 9_000_000);
+        assert!(rows[0].usage_units.is_empty());
     }
     assert_eq!(
         reopened.get_usage("bucket", u64::MAX).unwrap(),
@@ -252,7 +259,7 @@ fn released_v6_usage_keys_migrate_without_reinterpreting_existing_maximum_rows()
     reopened.add_metering(&meter(u64::MAX, 13)).unwrap();
     assert_eq!(
         reopened.get_usage("bucket", i64::MAX as u64).unwrap(),
-        ledger(7)
+        migrated
     );
     assert_eq!(reopened.get_usage("bucket", u64::MAX).unwrap(), ledger(11));
     assert_eq!(

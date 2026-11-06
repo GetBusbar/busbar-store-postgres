@@ -1217,3 +1217,26 @@ fn a_startup_refusal_is_not_retried_before_every_pooled_operation() {
         "pooled operations reuse the successful endpoint without retrying the failed handshake"
     );
 }
+
+/// A legal ParameterDescription can cover all Bind parameters, but no larger body is possible.
+#[test]
+fn an_oversized_parameter_description_is_refused_at_its_header() {
+    let port = fake_server(|mut s| {
+        if read_startup(&mut s).is_ok()
+            && s.write_all(&welcome()).is_ok()
+            && read_frontend(&mut s).is_ok()
+        {
+            let mut message = vec![b't'];
+            message.extend_from_slice(&(4 + 2 + 4 * u32::from(u16::MAX) + 1).to_be_bytes());
+            let _ = s.write_all(&message);
+            std::thread::sleep(Duration::from_secs(3));
+        }
+    });
+    let error = open_within(
+        settings_of(&format!("postgres://u:zq9pw@127.0.0.1:{port}/d")),
+        Duration::from_secs(1),
+    )
+    .expect("header rejected promptly")
+    .expect_err("oversized parameter description");
+    assert!(error.contains("protocol message limit"), "{error}");
+}

@@ -298,9 +298,12 @@ fn lists_come_back_in_a_deterministic_order() {
     store
         .put_credential(&sample_cred(owner, 0, &format!("AKIA_W5_0_{id}")))
         .unwrap();
-    let mut other = sample_cred(owner, 2, &format!("AKIA_W5_OTHER_{id}"));
+    let mut other = sample_cred(owner, 0, &format!("AKIA_W5_OTHER_{id}"));
     other.meta.kind = "aaa".into();
-    store.put_credential(&other).unwrap();
+    assert!(
+        store.put_credential(&other).is_err(),
+        "unsupported credential kind is refused"
+    );
     let slots: Vec<(String, u8)> = store
         .list_credentials(owner)
         .unwrap()
@@ -309,7 +312,7 @@ fn lists_come_back_in_a_deterministic_order() {
         .collect();
     assert_eq!(
         slots,
-        [("aaa".into(), 2), ("sigv4".into(), 0), ("sigv4".into(), 1)],
+        [("sigv4".into(), 0), ("sigv4".into(), 1)],
         "list_credentials is (kind, slot) ascending"
     );
     for k in &ids {

@@ -114,6 +114,9 @@ const MAX_CONTROL_MESSAGE_LEN: u32 = 30_000;
 fn message_limit(tag: u8, authenticated: bool) -> u32 {
     if authenticated && matches!(tag, b'D' | b'E' | b'N' | b'A' | b'd') {
         MAX_MESSAGE_LEN
+    } else if authenticated && tag == b't' {
+        // ParameterDescription: length word, u16 count, then one u32 OID per parameter.
+        4 + 2 + 4 * u32::from(u16::MAX)
     } else {
         MAX_CONTROL_MESSAGE_LEN
     }
