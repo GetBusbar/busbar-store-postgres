@@ -70,6 +70,7 @@ fn drop_fold_schema(namespace: &str, settings: &[u8]) {
 }
 
 use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
+use busbar_contract::store_calls::StoreCalls;
 use busbar_plugin_loader::dispatch::kinds::secret::Secret;
 use busbar_plugin_loader::dispatch::{
     load_dropped, load_linked, rendering_of_library, Bind, ConnTable, DispatchConfig, Dispatcher,
@@ -342,6 +343,7 @@ fn fresh_linked_and_dropped_images_open_ready_read_and_close() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("host clock")
         .as_nanos();
+    let runtime = tokio::runtime::Runtime::new().expect("lifecycle read runtime");
     for door in ["linked", "dropped"] {
         let (plugin, dispatcher) = if door == "linked" {
             linked()
@@ -361,8 +363,8 @@ fn fresh_linked_and_dropped_images_open_ready_read_and_close() {
             .expect("actual Postgres image becomes ready");
         let namespace = format!("lifecycle-{}-{nonce}-{door}", std::process::id());
         assert_eq!(
-            store
-                .record_get(&namespace, b"absent")
+            runtime
+                .block_on(store.record_get(&namespace, b"absent"))
                 .expect("one benign read"),
             None,
             "a new lifecycle namespace has no record"
