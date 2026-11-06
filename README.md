@@ -137,7 +137,9 @@ described below. The v7 changes remain part of an upgrade from v6:
   the operation receipt commit together. A condition conflict writes nothing;
   an unknown commit outcome requires replaying the exact operation id and body.
   Fresh unconditional writes to reserved usage adjustment buckets are refused;
-  already-applied legacy receipts remain replayable.
+  already-applied current-digest receipts remain replayable. Retired Debug-format
+  operation receipts are preserved but conflict for both identical and changed
+  inputs; rejection applies no mutation and does not replace the receipt.
 
 Drain and stop older store processes before the v9 upgrade, then reopen every
 node with this build. A newer-schema check cannot fence an already-open process.

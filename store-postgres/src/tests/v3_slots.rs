@@ -523,10 +523,10 @@ fn a_new_op_records_its_digest() {
     assert_eq!(recorded, Dedupe::usage(&cells).body_hex());
 }
 
-/// A body an older build recorded (`<slot>:{:?}`) still replays across the upgrade, and a
-/// different op under its `op_id` is still a conflict; neither applies anything.
+/// Retired Debug receipt bodies conflict for both original and changed inputs.
+/// Their persisted bytes and every affected store row remain unchanged.
 #[test]
-fn an_op_recorded_by_an_older_build_replays() {
+fn retired_debug_receipts_are_rejected_without_mutation() {
     let Some(url) = live_url() else {
         return;
     };
@@ -541,6 +541,17 @@ fn an_op_recorded_by_an_older_build_replays() {
             .unwrap();
     };
 
+    let receipt = |id: OpId| -> (String, String, i64) {
+        let row = s
+            .lock()
+            .query_one(
+                "SELECT body, answer, recorded_at FROM store_ops WHERE op_id = $1",
+                &[&&id.0[..]],
+            )
+            .unwrap();
+        (row.get(0), row.get(1), row.get(2))
+    };
+
     const WINDOW: u64 = 4_000_000_000_000_002;
     let bucket = format!("{ns}-b");
     let delta = UsageDelta {
@@ -548,11 +559,21 @@ fn an_op_recorded_by_an_older_build_replays() {
         billable_requests: 1,
         ..Default::default()
     };
-    let cells = [(bucket.as_str(), WINDOW, delta.clone())];
     let id = op();
-    old_row(id, format!("add_usage_batch:{cells:?}"));
-    s.add_usage_op(id, &bucket, WINDOW, &delta)
-        .expect("an older body replays");
+    // Frozen retired layout: do not regenerate it through current SDK Debug.
+    old_row(
+        id,
+        format!(
+            r#"add_usage_batch:[({bucket:?}, {WINDOW}, UsageDelta {{ requests: 1, billable_requests: 1, models: [] }})]"#
+        ),
+    );
+    let saved = receipt(id);
+    let usage_before = s.get_usage(&bucket, WINDOW).expect("read");
+    assert_eq!(
+        s.add_usage_op(id, &bucket, WINDOW, &delta),
+        Err(OpRefused::Conflict)
+    );
+    assert_eq!(receipt(id), saved);
     let other = UsageDelta {
         requests: 2,
         ..Default::default()
@@ -561,7 +582,8 @@ fn an_op_recorded_by_an_older_build_replays() {
         s.add_usage_op(id, &bucket, WINDOW, &other),
         Err(OpRefused::Conflict)
     );
-    assert_eq!(s.get_usage(&bucket, WINDOW).expect("read").requests, 0);
+    assert_eq!(s.get_usage(&bucket, WINDOW).expect("read"), usage_before);
+    assert_eq!(receipt(id), saved);
 
     const BUCKET: u64 = 4_000_000_000_000_003;
     let key_id = format!("{ns}-k");
@@ -590,18 +612,18 @@ fn an_op_recorded_by_an_older_build_replays() {
             m.key_id,
         ),
     );
-    s.add_metering_op(id, &m).expect("an older body replays");
+    let saved = receipt(id);
+    let metering_before = s.list_metering(BUCKET).expect("read");
+    assert_eq!(s.add_metering_op(id, &m), Err(OpRefused::Conflict));
+    assert_eq!(receipt(id), saved);
     let other = MeteringDelta {
         scale: 0,
         tokens_input: 11,
         ..m.clone()
     };
     assert_eq!(s.add_metering_op(id, &other), Err(OpRefused::Conflict));
-    assert!(s
-        .list_metering(BUCKET)
-        .expect("read")
-        .iter()
-        .all(|r| r.key_id != key_id));
+    assert_eq!(s.list_metering(BUCKET).expect("read"), metering_before);
+    assert_eq!(receipt(id), saved);
 
     let parent = format!("{ns}-chain");
     let rec = |hash: &str| PlaneRecord {
@@ -614,9 +636,18 @@ fn an_op_recorded_by_an_older_build_replays() {
         body: format!("{{\"hash\":\"{hash}\"}}").into_bytes(),
     };
     let id = op();
-    old_row(id, format!("append_plane_record:{:?}", rec("one")));
-    s.append_plane_record_op(id, rec("one").view())
-        .expect("an older body replays");
+    old_row(
+        id,
+        format!(
+            r#"append_plane_record:PlaneRecord {{ kind: "call", id: {parent:?}, parent: Some({parent:?}), seq: 1, ts: 5000000000, disposition: Active, body: [123, 34, 104, 97, 115, 104, 34, 58, 34, 111, 110, 101, 34, 125] }}"#
+        ),
+    );
+    let saved = receipt(id);
+    assert_eq!(
+        s.append_plane_record_op(id, rec("one").view()),
+        Err(OpRefused::Conflict)
+    );
+    assert_eq!(receipt(id), saved);
     assert_eq!(
         s.append_plane_record_op(id, rec("two").view()),
         Err(OpRefused::Conflict)
@@ -629,7 +660,8 @@ fn an_op_recorded_by_an_older_build_replays() {
         )
         .unwrap()
         .get(0);
-    assert_eq!(n, 0, "the replay and the conflict applied nothing");
+    assert_eq!(n, 0, "both retired receipt conflicts applied nothing");
+    assert_eq!(receipt(id), saved);
 }
 
 /// The journal, sessions and kernel-held records.
