@@ -600,8 +600,9 @@ fn plaintext_after_the_servers_s_is_refused_before_the_upgrade() {
         let mut tls = rustls::StreamOwned::new(conn, s);
         let _ = tls.read(&mut [0_u8; 1024]);
     });
+    // Match fake_server's IPv4 listener; localhost can resolve to IPv6 first.
     let settings = settings_of(&format!(
-        "postgres://u:zq9pw@localhost:{port}/d?sslmode=verify-full"
+        "postgres://u:zq9pw@127.0.0.1:{port}/d?sslmode=verify-full"
     ));
     let e = open_loaded_over(&settings, |d| {
         trusting_host(d.conn_waker(), &ca_der, None, false)
