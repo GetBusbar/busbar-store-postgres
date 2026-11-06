@@ -14,7 +14,6 @@ First-party signed kind:store plugin cdylib: the Postgres backend for busbar's d
 **This plugin's version: v1.6.0.** (Independently versioned from busbar
 itself — see [Versioning](#versioning) below.)
 
-[![Coverage](https://codecov.io/gh/GetBusbar/busbar-store-postgres/branch/dev/graph/badge.svg)](https://codecov.io/gh/GetBusbar/busbar-store-postgres)
 [![Release](https://img.shields.io/github/v/release/GetBusbar/busbar-store-postgres)](https://github.com/GetBusbar/busbar-store-postgres/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
@@ -149,6 +148,8 @@ older build, not reopening the upgraded database with an older binary.
 Unreleased development databases are not supported upgrade sources. Markers
 above v9 are refused; a database stamped v7, v8 or v9 must already have the corresponding
 layout. Legacy application tables are left untouched.
+
+## How it is built
 
 It is a `cdylib` that serves busbar's store v3 table (`StoreSlots`, via the plugin SDK in
 [`busbar-contract`](https://github.com/GetBusbar/busbar/tree/main/crates/busbar-contract))
@@ -318,12 +319,12 @@ Its one busbar dependency is `busbar-contract` (plus
 tests): a **git dependency** on
 [GetBusbar/busbar](https://github.com/GetBusbar/busbar) pinned to the
 rev in field 1 of [`.busbar-ref`](.busbar-ref). No sibling-checkout
-path dependency ships in any manifest; CI's `pin` job refuses one, and
-refuses a manifest rev that disagrees with `.busbar-ref`.
+path dependency ships in any manifest, and the manifest revs must agree
+with `.busbar-ref`.
 
 The end-to-end tests drive the REAL `busbar` binary, built from a
 busbar checkout at that same rev: `BUSBAR_CHECKOUT=<path>`, or a
-`busbar/` checkout beside this repo (CI checks one out there).
+`busbar/` checkout beside this repo.
 
 `store-postgres-plugin/tests/conformance.rs` holds the store to ONE
 Statement and ONE behaviour through both doors — compiled in (the
@@ -378,11 +379,10 @@ Locally, with the env var unset, most live cases print a `skip:`
 message and pass. The trust-state cases (demotions, the single-use token
 ledger, push-callback liveness — in `plane_records.rs` and the
 `trust_state_…` e2e case) deliberately FAIL instead of skipping, because
-their unimplemented form is silently green; run them against a database. Under
-CI (`CI` env var set — see `.github/workflows/ci.yml`), a *missing*
-`BUSBAR_TEST_POSTGRES_URL` is a **hard failure**, not a silent skip:
-CI provisions a real `postgres:16` GitHub Actions service container on
-every push, specifically so this coverage can never quietly vanish.
+their unimplemented form is silently green; run them against a database. When
+the `CI` env var is set, a *missing* `BUSBAR_TEST_POSTGRES_URL` is a **hard
+failure**, not a silent skip, so CI must provision a real Postgres 16+ database
+and export its URL; this coverage can never quietly vanish there.
 
 ### Pack and sign
 
@@ -416,12 +416,7 @@ store:
 — see [`docs/configuration.md`](https://github.com/GetBusbar/busbar/blob/main/docs/configuration.md)
 for the full store config reference.
 
-## License
-
-Licensed **Apache-2.0** ([LICENSE](LICENSE)). Contributions welcome — see
-[CONTRIBUTING.md](CONTRIBUTING.md). Governed by our
-[Code of Conduct](CODE_OF_CONDUCT.md); security issues go through
-[SECURITY.md](SECURITY.md), not public issues.
+## Replay tokens and tickets
 
 Replay-token expiry uses the shared database server's Unix clock. `expires_at` remains an
 absolute Unix-seconds deadline; the caller clock argument does not expire or reclaim tokens.
@@ -433,6 +428,13 @@ expired or mismatched receipts return false. Other kinds keep their Active/calle
 Built-in `ticket` records store their absolute expiry in `ts`. Their retention cutoff is
 capped at the database clock, preserving still-live receipts even when a caller requests
 a future cutoff. Equal deadlines are retained; other record kinds keep their existing rules.
+
+## License
+
+Licensed **Apache-2.0** ([LICENSE](LICENSE)). Contributions welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md). Governed by our
+[Code of Conduct](CODE_OF_CONDUCT.md); security issues go through
+[SECURITY.md](SECURITY.md), not public issues.
 
 ## Differences from 1.5.5
 

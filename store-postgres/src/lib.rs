@@ -63,13 +63,8 @@ fn render_pg_error(e: &pgwire::Error) -> String {
     safe
 }
 
-/// True when a postgres error is SQLSTATE 42P01 (`undefined_table`), the ONE case `migrate()` reads
-/// as an unversioned database; any other class must never be read as "fresh" and drop a populated one.
-fn is_undefined_table(e: &pgwire::Error) -> bool {
-    e.code().map(pgwire::SqlState::code) == Some(pgwire::SqlState::UNDEFINED_TABLE)
-}
-
-/// Store schema version. v9 widens quantity mantissas to signed i128 without rescaling
+/// Store schema version. v9 widens quantity mantissas to `NUMERIC(39,0)` (nonnegative,
+/// `0..=i128::MAX`) without rescaling
 /// existing v8 micro-units. Request counters keep their independent whole-number domain.
 pub const SCHEMA_VERSION: i64 = 9;
 
@@ -294,6 +289,7 @@ ALTER TABLE usage_metering ADD COLUMN IF NOT EXISTS priced_from_ms BIGINT NOT NU
 ";
 
 /// Postgres `Store` backend (durable, shared across a cluster): the parsed connection settings and
+/// the kept connections every op of this instance shares.
 pub struct PostgresStore {
     shared: std::sync::Arc<Shared>,
 }
@@ -310,6 +306,7 @@ pub(crate) struct Shared {
     /// The instance's kept connections, bounded at [`KEPT_CONNECTIONS`] (there is no pool setting).
     pub(crate) pool: std::sync::Arc<busbar_contract::abi::sdk::store::wire::Pool>,
     /// The endpoint (an index into the DSN's list) that last connected: the next connect tries it
+    /// first.
     pub(crate) endpoint: std::sync::atomic::AtomicUsize,
 }
 
@@ -446,15 +443,12 @@ impl Session {
             .batch_execute("CREATE TABLE IF NOT EXISTS busbar_schema (version BIGINT PRIMARY KEY)")
             .await
             .store()?;
-        let version: i64 = match client
-            .query_opt("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[])
+        let version: i64 = client
+            .query_one("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[])
             .await
-        {
-            Ok(Some(r)) => r.try_get(0).store()?,
-            Ok(None) => 0,
-            Err(e) if is_undefined_table(&e) => 0,
-            Err(e) => return Err(RecordStoreError(render_pg_error(&e))),
-        };
+            .store()?
+            .try_get(0)
+            .store()?;
 
         if version > SCHEMA_VERSION {
             return Err(RecordStoreError(format!(
@@ -717,7 +711,8 @@ impl Session {
         Ok(())
     }
 
-    /// Lock the store-global revision inside the caller's open transaction. Acquire this
+    /// Lock the store-global revision inside the caller's open transaction. Acquire this before
+    /// any other ledger, metering or key lock so every writer takes locks in the same order.
     async fn lock_revision(tx: &mut Transaction<'_>) -> RecordStoreResult<()> {
         tx.query_one(
             "SELECT revision FROM store_revision WHERE only_row FOR UPDATE",

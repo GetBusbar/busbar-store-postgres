@@ -64,8 +64,8 @@ pub struct Endpoint {
 /// A parsed connection string (the URL or the libpq keyword form).
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
-    /// The servers, in the order a connect tries them (libpq's multi-host list): a connect the
-    /// first fails tries each in turn.
+    /// The servers, in the DSN's order (libpq's multi-host list). A connect tries the endpoint that
+    /// last connected first, then the rest in this order.
     endpoints: Vec<Endpoint>,
     pub user: String,
     /// Public connection text and SDK-sealed passwords, including redaction aliases.
@@ -112,7 +112,7 @@ const MAX_MESSAGE_LEN: u32 = (1 << 30) + 4;
 const MAX_CONTROL_MESSAGE_LEN: u32 = 30_000;
 
 fn message_limit(tag: u8, authenticated: bool) -> u32 {
-    if authenticated && matches!(tag, b'D' | b'E' | b'N' | b'A' | b'd') {
+    if authenticated && matches!(tag, b'D' | b'E' | b'N' | b'A' | b'd' | b'T') {
         MAX_MESSAGE_LEN
     } else if authenticated && tag == b't' {
         // ParameterDescription: length word, u16 count, then one u32 OID per parameter.
@@ -553,9 +553,6 @@ pub(super) fn keywords(s: &str) -> Result<Vec<(String, String)>, Error> {
 pub struct SqlState(String);
 
 impl SqlState {
-    /// `42P01`, `undefined_table`.
-    pub const UNDEFINED_TABLE: &'static str = "42P01";
-
     /// The five-character code.
     #[must_use]
     pub fn code(&self) -> &str {

@@ -115,6 +115,16 @@ fn loaded_rewrap_cannot_resurrect_revoked_deleted_or_reclaimed_rows() {
         assert!(store.list_credentials_since(0).unwrap() == retired);
         assert_eq!(revision(&store), before);
         if !delete {
+            // A CURRENT snapshot of the revoked row matches the database exactly, so only the
+            // revoked/non-recoverable guard keeps it from receiving a fresh secret.
+            let current = store
+                .lookup_credential_secret("sigv4", public)
+                .unwrap()
+                .expect("a revoked credential still reads back");
+            assert!(current.meta.revoked_at.is_some());
+            assert!(!rewrap(&store, &current, "resurrection").unwrap());
+            assert!(store.list_credentials_since(0).unwrap() == retired);
+            assert_eq!(revision(&store), before);
             store
                 .put_credential(&sample_cred(owner, 0, "reclaimed"))
                 .unwrap();

@@ -14,22 +14,6 @@ mod host_boundaries;
 #[path = "support/store_contract.rs"]
 mod store_contract;
 
-/// The live Postgres's address (`BUSBAR_TEST_POSTGRES_URL`'s authority; the service container's
-/// default when unset).
-fn upstream() -> &'static str {
-    static AT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    AT.get_or_init(|| {
-        let url = std::env::var("BUSBAR_TEST_POSTGRES_URL").unwrap_or_default();
-        url.split_once("://")
-            .map(|(_, rest)| rest)
-            .and_then(|rest| rest.rsplit_once('@').map_or(Some(rest), |(_, at)| Some(at)))
-            .and_then(|at| at.split('/').next())
-            .filter(|at| !at.is_empty())
-            .unwrap_or("localhost:5432")
-            .to_owned()
-    })
-}
-
 /// The live server a fold's filled settings name, on a connection of the `postgres` driver's own.
 fn fold_client(settings: &[u8]) -> postgres::Client {
     let v: serde_json::Value =
@@ -38,9 +22,7 @@ fn fold_client(settings: &[u8]) -> postgres::Client {
         .as_str()
         .expect("conformance.json's settings name a url");
 
-    let url = url
-        .replace("localhost:52670", upstream())
-        .replace("sslmode=require", "sslmode=disable");
+    let url = url.replace("sslmode=require", "sslmode=disable");
     postgres::Client::connect(&url, postgres::NoTls)
         .expect("the live Postgres accepts the test client")
 }

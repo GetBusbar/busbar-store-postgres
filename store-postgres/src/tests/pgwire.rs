@@ -709,3 +709,11 @@ fn an_empty_server_message_preserves_its_sqlstate() {
     assert_eq!(error.code().map(SqlState::code), Some("23514"));
     assert_eq!(error.as_db_error().unwrap().message(), "");
 }
+
+#[test]
+fn a_long_row_description_keeps_the_data_ceiling_after_authentication() {
+    // libpq's VALID_LONG_MESSAGE_TYPE includes RowDescription: a wide result's description may
+    // exceed the 30,000-byte control cap.
+    assert_eq!(message_limit(b'T', true), MAX_MESSAGE_LEN);
+    assert_eq!(message_limit(b'T', false), MAX_CONTROL_MESSAGE_LEN);
+}

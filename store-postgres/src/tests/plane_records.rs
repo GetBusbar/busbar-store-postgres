@@ -1003,7 +1003,7 @@ fn a_sidecar_value_beyond_the_storable_range_is_refused_rather_than_clamped() {
         .upsert_plane_record(task(t, "working", u64::MAX, PlaneDisposition::Active).view())
         .expect_err("a ts above i64::MAX must be refused, never silently clamped");
     assert!(
-        format!("{err}").contains("ts"),
+        format!("{err}").contains(&format!("upsert_plane_record: ts {}", u64::MAX)),
         "the refusal names the field; got {err}"
     );
     let mut seq_too_big = task(t, "working", LIVE_TS, PlaneDisposition::Active);

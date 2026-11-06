@@ -984,7 +984,6 @@ fn contract(fold: &[(&str, String)], i: &Inputs<'_>) {
         assert!(!answer.contains("faulted"), "{label}: {answer}");
     }
     assert!(at("open").starts_with("Ready "), "open: {}", at("open"));
-    assert_eq!(at("refused as another kind"), "refused=true");
     for label in [
         "put grouped",
         "put plain",

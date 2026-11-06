@@ -842,26 +842,6 @@ fn password_capture_percent_decoding_edge_cases() {
     }
 }
 
-/// `is_undefined_table` must discriminate the ONE SQLSTATE (`42P01`/undefined_table) it exists to
-/// recognize from every other error class, so neither an inverted comparison nor an unconditional
-/// true/false passes.
-#[test]
-fn is_undefined_table_matches_only_the_real_sqlstate() {
-    let missing = crate::pgwire::Error::server("42P01", "relation \"x\" does not exist");
-    assert!(
-        is_undefined_table(&missing),
-        "a missing table must be classified as undefined_table: {missing}"
-    );
-    let syntax_err = crate::pgwire::Error::server("42601", "syntax error at or near \"SELEC\"");
-    assert!(
-        !is_undefined_table(&syntax_err),
-        "a syntax error must NOT be misclassified as undefined_table: {syntax_err}"
-    );
-    assert!(!is_undefined_table(&crate::pgwire::Error::connect(
-        "refused"
-    )));
-}
-
 /// `labels_to_storage`'s serialization -- not just the empty-map default -- must round-trip a
 /// non-empty label set.
 #[test]
