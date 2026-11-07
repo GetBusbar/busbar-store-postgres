@@ -1,48 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! End-to-end coverage of the `busbar-store-postgres-plugin` cdylib, loaded the way a REAL operator
-//! actually loads a plugin — not via a direct in-process load of the library
-//! (flagged, correctly, as testing a mechanism no end user ever uses: nobody imports
-//! `busbar-plugin-loader` and calls its internal function).
-//!
-//! `load_and_exercise_postgres_plugin_via_file_drop` instead: packs the built cdylib into a real
-//! tarball (the same `busbar-plugin-pack` tool CI's own SIGNOFF step uses), drops it into a real
-//! `plugins.dir`, and boots a REAL `busbar` process (no `--validate`) against a config naming
-//! `store: { module: postgres }` — the documented file-drop install path (see
-//! `crates/plugin-loader/src/lib.rs::list_plugin_files`/boot-time discovery).
-//!
-//! `--validate` is DELIBERATELY not used for the load-proof itself: it is manifest-only by design
-//! ("no server, no network, no state, no dlopen" — `crates/busbar/src/main.rs`'s own `--help` text)
-//! and never opens the store, so checking the schema after `--validate` alone would prove nothing
-//! about the real boot path. A clean `--validate` run first proves the file-dropped plugin passes
-//! the trust/manifest gate; then a REAL BOOT (no `--validate` flag) is the only thing that actually
-//! `dlopen`s the plugin and runs `Store::connect`/migration (busbar's own gate-assembly code calls
-//! `plugin_registry.open_store` synchronously during construction, before the listener ever binds —
-//! see `crates/busbar/src/main.rs`), so that's what proves the persistence claim.
-//!
-//! Persistence is then proven the same two independent ways the prior direct-call test used (kept —
-//! this part was always sound, only the LOADING mechanism was wrong):
-//!   1. The boot runs against a DISPOSABLE, freshly created, genuinely empty database, and is polled
-//!      via a RAW independent `postgres::Client` connection (never the store itself, so this
-//!      check can't create the schema itself) for the `keys` table to appear within a timeout. The
-//!      empty database is what makes this a proof rather than a formality: against the shared test
-//!      database, every live unit test in this workspace has already migrated a `keys` table into
-//!      existence, so the same poll would break true on its first iteration even if `busbar` had
-//!      failed to load the plugin and exited immediately. Then the schema VERSION the boot wrote is
-//!      read back, and the child is confirmed still running rather than having died after migrating.
-//!   2. Only AFTER those proofs, a second, independent open of the LINKED door (bypassing the
-//!      plugin/ABI/loader entirely) confirms the store type itself can talk to the same schema.
-//!
-//! The two ABI-contract error-path tests below (`bad_config_fails_over_abi`, `refuses_non_plugin`)
-//! are DELIBERATELY left loading the dropped-in door directly (`common::dropped_at`) — they test the loader's own error-surface
-//! contract in isolation (a legitimate internal unit-test target: "does a bad config produce a clean
-//! Err across the ABI, never a panic"), which is a different question from "does a real end-user
-//! install work," and converting them to a full process-boot-and-capture-stderr harness for each
-//! error shape is a much larger, lower-value lift than the persistence test's conversion.
-
-//! These development fixtures permit unsigned plugins; they verify manifest and archive
-//! integrity and loading, not production release-signature trust policy.
+//! Actual file-drop boot plus native persistence across plugin unload/reload.
+//! Business policy is exercised through the core HTTP scenario in admin_api_e2e.
 
 mod common;
 use common::temp_db::TempDb;
@@ -216,7 +176,7 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     let booted = loop {
         if let Ok(mut raw) = postgres::Client::connect(&url, postgres::NoTls) {
             if let Ok(row) = raw.query_one(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='keys')",
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='busbar_persistence_v4' AND table_name='metadata')",
                 &[],
             ) {
                 let exists: bool = row.get(0);
@@ -239,23 +199,20 @@ fn load_and_exercise_postgres_plugin_via_file_drop() {
     };
     assert!(
         booted,
-        "a real busbar boot with the file-dropped postgres plugin must create the `keys` table \
-         (via RecordStore::connect/migrate) within 15s -- proof the real dlopen+connect path executed \
+        "a real busbar boot with the file-dropped postgres plugin must create the native metadata table \
+         (via primitive Store readiness) within 15s -- proof the real dlopen+connect path executed \
          during boot, not a no-op\n--- boot output ---\n{}",
         guard.output()
     );
 
     let mut raw = postgres::Client::connect(&url, postgres::NoTls)
         .expect("raw connect to the fresh database");
-    let version: i64 = raw
-        .query_one("SELECT COALESCE(MAX(version), 0) FROM busbar_schema", &[])
-        .expect("the boot must have created busbar_schema")
+    let facts: Vec<u8> = raw
+        .query_one("SELECT facts FROM busbar_persistence_v4.metadata", &[])
+        .expect("native metadata committed")
         .get(0);
-    assert_eq!(
-        version,
-        busbar_store_postgres::SCHEMA_VERSION,
-        "the plugin-loaded boot must have landed the current schema version"
-    );
+    let facts = busbar_contract::abi::sdk::store::v4::metadata::decode(&facts).unwrap();
+    assert_ne!(facts.dataset.0, [0; 16]);
 
     assert!(
         matches!(guard.0.try_wait(), Ok(None)),
@@ -301,8 +258,7 @@ fn load_and_exercise_postgres_plugin_bad_config_fails_over_abi() {
     )
     .expect_err("an unreachable postgres target must fail to load");
     assert!(
-        err.contains("postgres store: failed to connect: ")
-            && err.contains("error connecting to server"),
+        err.contains("postgres") && (err.contains("ready failed") || err.contains("open failed")),
         "expected tokio-postgres's own connect-failure message to survive the ABI crossing, got: {err}"
     );
 }
@@ -318,544 +274,360 @@ fn refuses_non_plugin() {
     assert!(err.contains("the library did not load"), "got: {err}");
 }
 
-/// Serialize a stand-in plane-record body. The store never decodes a body, so the shape only has to
-/// be something THIS test can decode again on the way back.
-fn plane_body(v: serde_json::Value) -> Vec<u8> {
-    serde_json::to_vec(&v).expect("serialize a stand-in body")
+use busbar_contract::persistence::*;
+use std::sync::Arc;
+fn body(value: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&value).unwrap()
 }
-
-fn plane_decode(b: &[u8]) -> serde_json::Value {
-    serde_json::from_slice(b).expect("a body this test wrote decodes")
+fn raw_json(url: &str, at: &Address) -> serde_json::Value {
+    serde_json::from_slice(&common::raw_value(url, at).unwrap()).unwrap()
 }
-
-/// THE DURABILITY PROOF FOR THE `call` PLANE KIND (the MCP call log), OVER THE REAL PLUGIN PATH.
+fn page(store: &busbar_plugin_loader::store_v4::LoadedPersistence, namespace: u8) -> Page {
+    common::run(store.scan(Arc::new(Scan {
+        dataset: store.info().dataset,
+        namespace: NamespaceId([namespace; 16]),
+        prefix: vec![],
+        after: None,
+        generation: None,
+        allow_change: false,
+        max_items: 100,
+        max_bytes: 1 << 20,
+    })))
+    .unwrap()
+}
 #[test]
 fn mcp_call_log_survives_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
-
-    let path = plugin_path();
-    let Some(url) = postgres_url() else {
-        return;
-    };
-    let cfg = cfg(&url);
-
-    let direct = common::linked(&cfg).expect("connect directly to verify");
-
-    let stamp = format!(
-        "{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let kind = format!("call_abi_{stamp}");
-    let p_main = format!("vk_abi_main_{stamp}");
-    let p_other = format!("vk_abi_other_{stamp}");
-
-    let call = |principal: &str, seq: u64, prev: &str, hash: &str| PlaneRecord {
-        kind: kind.clone(),
-        id: principal.into(),
-        parent: Some(principal.into()),
-        seq,
-        ts: 2_000 + seq,
-        disposition: PlaneDisposition::Active,
-        body: plane_body(serde_json::json!({
-            "seq": seq,
-            "prev_hash": prev,
-            "hash": hash,
-            "content": {
-                "server": "srv",
-                "tool": "srv_read_file",
-                "outcome": "dispatched",
-                "tool_digest": format!("sha256:tool{seq}"),
-                "pin_generation": 3,
-                "request_id": format!("req-{seq}"),
-            },
-        })),
-    };
-    let chain = |store: &dyn RecordStore, principal: &str| -> Vec<serde_json::Value> {
-        store
-            .list_plane_records(&kind, &PlaneSelector::Parent(principal.to_string().into()))
-            .expect("list_plane_records over the ABI")
-            .iter()
-            .map(|b| plane_decode(b))
-            .collect()
-    };
-
-    {
-        let store = common::dropped_at(&path, &cfg)
-            .expect("the postgres plugin must load over the real ABI");
-        for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
-            store
-                .append_plane_record(call(&p_main, seq, prev, hash).view())
-                .expect("append_plane_record over the ABI");
-        }
-        store
-            .append_plane_record(call(&p_other, 1, "", "o1").view())
-            .expect("append_plane_record over the ABI");
-
-        drop(store);
-    }
-
-    let store = common::dropped_at(&path, &cfg)
-        .expect("the postgres plugin must load again over the real ABI");
-
-    let calls = chain(&store, &p_main);
-    assert_eq!(
-        calls
-            .iter()
-            .map(|c| c["seq"].as_u64().unwrap())
-            .collect::<Vec<_>>(),
-        vec![1, 2, 3],
-        "the per-principal call chain must survive the unload/reload over the plugin ABI in chain \
-         order; got {} record(s) back, which is the accept-and-keep-nothing shape of the trait \
-         default an unrelayed seam substitutes",
-        calls.len()
-    );
-    for w in calls.windows(2) {
-        assert_eq!(
-            w[1]["prev_hash"], w[0]["hash"],
-            "the chain must still link after the reload"
+    let Some(admin) = postgres_url() else { return };
+    let database = TempDb::create(&admin, "spg_calls");
+    let url = database.url();
+    let settings = cfg(&url);
+    let store = common::dropped(&settings).unwrap();
+    common::initialize(&store);
+    let mut last = None;
+    for seq in 1u64..=3 {
+        let at = common::address(30, &seq.to_be_bytes());
+        let bytes = body(
+            serde_json::json!({"seq":seq,"prev_hash":if seq==1 {String::new()} else {format!("h{}",seq-1)},"hash":format!("h{seq}"),"content":{"server":"srv","tool":"srv_read_file","outcome":"dispatched","tool_digest":format!("sha256:tool{seq}"),"pin_generation":3,"request_id":format!("req-{seq}")}}),
         );
+        let candidate = common::prepare(
+            &store,
+            seq as u128 + 1,
+            vec![Predicate {
+                address: at.clone(),
+                expected: ExpectedValue::Absent,
+            }],
+            vec![common::put(at, &bytes)],
+        );
+        assert!(matches!(
+            common::run(store.commit(candidate.clone())).unwrap(),
+            Decision::Applied(_)
+        ));
+        last = Some(candidate);
     }
-
+    assert!(matches!(
+        common::commit(
+            &store,
+            5,
+            vec![],
+            vec![common::put(
+                common::address(31, &1u64.to_be_bytes()),
+                b"other principal"
+            )]
+        ),
+        Decision::Applied(_)
+    ));
+    let info = store.info();
+    drop(store);
+    let store = common::dropped(&settings).unwrap();
+    assert_eq!(store.info(), info);
+    assert_eq!(
+        page(&store, 30)
+            .rows
+            .iter()
+            .map(|(at, _)| u64::from_be_bytes(at.key.as_slice().try_into().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    let calls: Vec<_> = (1u64..=3)
+        .map(|seq| raw_json(&url, &common::address(30, &seq.to_be_bytes())))
+        .collect();
+    for pair in calls.windows(2) {
+        assert_eq!(pair[1]["prev_hash"], pair[0]["hash"]);
+    }
     assert_eq!(calls[2]["content"]["tool_digest"], "sha256:tool3");
     assert_eq!(calls[2]["content"]["request_id"], "req-3");
     assert_eq!(calls[2]["content"]["outcome"], "dispatched");
     assert_eq!(calls[1]["content"]["pin_generation"], 3);
+    assert_eq!(page(&store, 31).rows.len(), 1);
+    assert!(matches!(
+        common::run(store.commit(last.unwrap())).unwrap(),
+        Decision::Applied(_)
+    ));
+    assert!(matches!(
+        common::commit(
+            &store,
+            4,
+            vec![],
+            vec![common::put(
+                common::address(30, &3u64.to_be_bytes()),
+                b"FORKED"
+            )]
+        ),
+        Decision::OpIdConflict
+    ));
+    assert_eq!(page(&store, 30).rows.len(), 3);
+    assert!(matches!(
+        common::commit(
+            &store,
+            6,
+            vec![],
+            vec![Mutation::Delete(common::address(30, &1u64.to_be_bytes()))]
+        ),
+        Decision::Applied(_)
+    ));
+    let direct = common::linked(&settings).unwrap();
     assert_eq!(
-        chain(&store, &p_other).len(),
-        1,
-        "one principal's chain must not carry another's records"
-    );
-
-    store
-        .append_plane_record(call(&p_main, 3, "h2", "h3").view())
-        .expect("an identical replay is Ok over the ABI");
-    assert!(
-        store
-            .append_plane_record(call(&p_main, 3, "h2", "FORKED").view())
-            .is_err(),
-        "a forked chain must surface as an error across the ABI, not be swallowed"
-    );
-
-    let principals = store
-        .list_plane_record_parents(&kind)
-        .expect("list_plane_record_parents");
-    assert_eq!(
-        principals,
-        vec![p_main.clone(), p_other.clone()],
-        "the boot enumeration must name every principal holding records, exactly once each"
-    );
-
-    assert_eq!(
-        store
-            .purge_plane_records_before(&kind, 2_002)
-            .expect("purge"),
-        2,
-        "both records at ts 2001 go (one per principal); the one sitting exactly at the cutoff stays"
-    );
-    assert_eq!(chain(&store, &p_main).len(), 2);
-    assert!(chain(&store, &p_other).is_empty());
-    assert_eq!(
-        store
-            .list_plane_record_parents(&kind)
-            .expect("list_plane_record_parents"),
-        vec![p_main.clone()],
-        "a principal whose chain the sweep emptied must leave the enumeration, or a boot keeps \
-         resuming a chain with nothing in it"
-    );
-    drop(store);
-
-    let direct_calls = chain(&direct, &p_main);
-    assert_eq!(
-        direct_calls
+        page(&direct, 30)
+            .rows
             .iter()
-            .map(|c| c["seq"].as_u64().unwrap())
+            .map(|(at, _)| u64::from_be_bytes(at.key.as_slice().try_into().unwrap()))
             .collect::<Vec<_>>(),
-        vec![2, 3],
-        "the records must be physically present in Postgres, not just cached in-process by the plugin"
+        vec![2, 3]
     );
-    assert_eq!(direct_calls[1]["hash"], "h3");
-
-    RecordStore::purge_plane_records_before(&direct, &kind, i64::MAX as u64)
-        .expect("clean up this run's records");
+    assert_eq!(
+        raw_json(&url, &common::address(30, &3u64.to_be_bytes()))["hash"],
+        "h3"
+    );
 }
-
-/// THE DURABILITY PROOF FOR THE `task` / `task_event` PLANE KINDS (the A2A task store), OVER THE REAL
-/// PLUGIN PATH.
 #[test]
 fn task_store_survives_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
-
-    let path = plugin_path();
-    let Some(admin_url) = postgres_url() else {
-        return;
-    };
-
-    let db = TempDb::create(&admin_url, "spg_task_durability");
-    let cfg = cfg(&db.url());
-    let direct = common::linked(&cfg).expect("connect directly to verify");
-
-    let stamp = format!(
-        "{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+    let Some(admin) = postgres_url() else { return };
+    let database = TempDb::create(&admin, "spg_tasks");
+    let url = database.url();
+    let settings = cfg(&url);
+    let store = common::dropped(&settings).unwrap();
+    common::initialize(&store);
+    let live = common::address(32, b"live");
+    let done = common::address(32, b"done");
+    let original = body(
+        serde_json::json!({"task_id":"live","state":"working","artifact_cursor":3,"updated_at":4000000100u64}),
     );
-    let t_live = format!("task_abi_live_{stamp}");
-    let t_done = format!("task_abi_done_{stamp}");
-    const BASE_TS: u64 = 4_000_000_000;
-
-    let task = |id: &str, state: &str, ts: u64, cursor: u64, d: PlaneDisposition| PlaneRecord {
-        kind: "task".into(),
-        id: id.into(),
-        parent: None,
-        seq: 0,
-        ts,
-        disposition: d,
-        body: plane_body(serde_json::json!({
-            "task_id": id,
-            "context_id": format!("ctx-{id}"),
-            "principal": "vk_task_abi",
-            "state": state,
-            "artifact_cursor": cursor,
-            "updated_at": ts,
-        })),
-    };
-    let event = |id: &str, seq: u64, kind: &str, prev: &str, hash: &str| PlaneRecord {
-        kind: "task_event".into(),
-        id: id.into(),
-        parent: Some(id.into()),
-        seq,
-        ts: BASE_TS + seq,
-        disposition: PlaneDisposition::Active,
-        body: plane_body(serde_json::json!({
-            "seq": seq, "prev_hash": prev, "hash": hash,
-            "content": { "kind": kind, "request_id": format!("req-{seq}") },
-        })),
-    };
-    let events = |store: &dyn RecordStore, id: &str| -> Vec<serde_json::Value> {
-        store
-            .list_plane_records("task_event", &PlaneSelector::Parent(id.to_string().into()))
-            .expect("list_plane_records over the ABI")
-            .iter()
-            .map(|b| plane_decode(b))
-            .collect()
-    };
-    let interrupted = task(
-        &t_live,
-        "input-required",
-        BASE_TS + 20,
-        9,
-        PlaneDisposition::Active,
+    let interrupted = body(
+        serde_json::json!({"task_id":"live","state":"input-required","artifact_cursor":9,"updated_at":4000000020u64}),
     );
-
-    {
-        let store = common::dropped_at(&path, &cfg)
-            .expect("the postgres plugin must load over the real ABI");
-        store
-            .upsert_plane_record(
-                task(
-                    &t_live,
-                    "working",
-                    BASE_TS + 100,
-                    3,
-                    PlaneDisposition::Active,
+    assert!(matches!(
+        common::commit(
+            &store,
+            2,
+            vec![],
+            vec![common::put(live.clone(), &original)]
+        ),
+        Decision::Applied(_)
+    ));
+    assert!(matches!(
+        common::commit(
+            &store,
+            3,
+            vec![],
+            vec![
+                common::put(live.clone(), &interrupted),
+                common::put(
+                    done.clone(),
+                    &body(serde_json::json!({"task_id":"done","state":"completed"}))
                 )
-                .view(),
-            )
-            .expect("upsert_plane_record over the ABI");
-
-        store
-            .upsert_plane_record(interrupted.view())
-            .expect("upsert_plane_record over the ABI");
-        store
-            .upsert_plane_record(
-                task(
-                    &t_done,
-                    "completed",
-                    BASE_TS + 50,
-                    1,
-                    PlaneDisposition::Terminal,
-                )
-                .view(),
-            )
-            .expect("upsert_plane_record over the ABI");
-        for (seq, prev, hash) in [(1_u64, "", "h1"), (2, "h1", "h2"), (3, "h2", "h3")] {
-            store
-                .append_plane_record(event(&t_live, seq, "task.working", prev, hash).view())
-                .expect("append_plane_record over the ABI");
-        }
-        store
-            .append_plane_record(event(&t_done, 1, "task.completed", "", "d1").view())
-            .expect("append_plane_record over the ABI");
-        drop(store);
+            ]
+        ),
+        Decision::Applied(_)
+    ));
+    for seq in 1u64..=3 {
+        assert!(matches!(
+            common::commit(
+                &store,
+                seq as u128 + 3,
+                vec![],
+                vec![common::put(
+                    common::address(33, &seq.to_be_bytes()),
+                    &body(
+                        serde_json::json!({"seq":seq,"prev_hash":if seq==1 {String::new()} else {format!("h{}",seq-1)},"hash":format!("h{seq}"),"content":{"kind":"task.working","request_id":format!("req-{seq}")}})
+                    )
+                )]
+            ),
+            Decision::Applied(_)
+        ));
     }
-
-    let store = common::dropped_at(&path, &cfg)
-        .expect("the postgres plugin must load again over the real ABI");
-
-    let got = store
-        .get_plane_record("task", &t_live)
-        .expect("get_plane_record")
-        .expect(
-            "an in-flight task must survive the unload/reload over the plugin ABI; got None back, \
-             which is exactly the accept-and-keep-nothing shape of the trait default",
-        );
-    assert_eq!(
-        got, interrupted.body,
-        "the body must round-trip byte-for-byte, and it must be the SECOND write: the upsert keys \
-         on (kind, id)"
-    );
-    assert!(
-        store
-            .get_plane_record("task", &format!("task_abi_nonexistent_{stamp}"))
-            .expect("a point-read of an unknown id is not an error")
-            .is_none(),
-        "an unknown task id reads back None, not an error"
-    );
-
-    let mut mine: Vec<String> = store
-        .list_plane_records("task", &PlaneSelector::All)
-        .expect("list_plane_records")
-        .iter()
-        .map(|b| {
-            plane_decode(b)["task_id"]
-                .as_str()
-                .unwrap_or("")
-                .to_string()
-        })
-        .filter(|id| *id == t_live || *id == t_done)
-        .collect();
-    mine.sort();
-    assert_eq!(
-        mine,
-        vec![t_done.clone(), t_live.clone()],
-        "the listing is UNFILTERED — the terminal row is returned too — and the upserted task \
-         appears exactly ONCE"
-    );
-
-    let chain = events(&store, &t_live);
-    assert_eq!(
-        chain
-            .iter()
-            .map(|e| e["seq"].as_u64().unwrap())
-            .collect::<Vec<_>>(),
-        vec![1, 2, 3],
-        "the per-task provenance chain must survive the reload, oldest-first by seq"
-    );
-    for w in chain.windows(2) {
-        assert_eq!(w[1]["prev_hash"], w[0]["hash"], "the chain must still link");
-    }
-    assert_eq!(chain[2]["content"]["request_id"], "req-3");
-    assert_eq!(
-        events(&store, &t_done).len(),
-        1,
-        "one task's chain must not carry another's events"
-    );
-
-    store
-        .append_plane_record(event(&t_live, 3, "task.working", "h2", "h3").view())
-        .expect("an identical replay is Ok");
-    assert!(store
-        .append_plane_record(event(&t_live, 3, "task.working", "h2", "rewritten").view())
-        .is_err());
-    assert_eq!(events(&store, &t_live).len(), 3, "no 4th event");
-
-    assert_eq!(
-        store
-            .purge_plane_records("task", BASE_TS + 100, busbar_contract::records::Retention::TerminalOnly)
-            .expect("purge_plane_records_before"),
-        1,
-        "only the TERMINAL row older than the cutoff goes; an active task is never swept no matter \
-         how old"
-    );
-    assert!(store
-        .get_plane_record("task", &t_done)
-        .expect("get_plane_record")
-        .is_none());
-    assert!(store
-        .get_plane_record("task", &t_live)
-        .expect("get_plane_record")
-        .is_some());
-    assert!(
-        events(&store, &t_done).is_empty(),
-        "a swept task's chain must go with it or it is unbounded forever"
-    );
+    assert!(matches!(
+        common::commit(
+            &store,
+            7,
+            vec![],
+            vec![common::put(
+                common::address(34, &1u64.to_be_bytes()),
+                b"done event"
+            )]
+        ),
+        Decision::Applied(_)
+    ));
     drop(store);
-
-    let direct_task = RecordStore::get_plane_record(&direct, "task", &t_live)
-        .expect("get_plane_record via the direct connection")
-        .expect("the task must be physically present in Postgres, not just cached in-process");
-    let direct_task = plane_decode(&direct_task);
-    assert_eq!(direct_task["artifact_cursor"], 9);
-    assert_eq!(direct_task["state"], "input-required");
-    assert_eq!(events(&direct, &t_live).len(), 3);
-
-    RecordStore::upsert_plane_record(
-        &direct,
-        task(
-            &t_live,
-            "canceled",
-            BASE_TS + 20,
+    let store = common::dropped(&settings).unwrap();
+    assert!(common::present(&store, live.clone()));
+    assert!(!common::present(&store, common::address(32, b"unknown")));
+    assert_eq!(common::raw_value(&url, &live).unwrap(), interrupted);
+    assert_eq!(page(&store, 32).rows.len(), 2);
+    assert_eq!(page(&store, 33).rows.len(), 3);
+    assert_eq!(page(&store, 34).rows.len(), 1);
+    let events: Vec<_> = (1u64..=3)
+        .map(|seq| raw_json(&url, &common::address(33, &seq.to_be_bytes())))
+        .collect();
+    for pair in events.windows(2) {
+        assert_eq!(pair[1]["prev_hash"], pair[0]["hash"]);
+    }
+    assert_eq!(events[2]["content"]["request_id"], "req-3");
+    // Core supplies the terminal selection and atomic cascade; the backend sees only these effects.
+    assert!(matches!(
+        common::commit(
+            &store,
+            8,
+            vec![],
+            vec![
+                Mutation::Delete(done.clone()),
+                Mutation::DeleteRange {
+                    namespace: NamespaceId([34; 16]),
+                    prefix: vec![],
+                    exact_key_length: 8
+                }
+            ]
+        ),
+        Decision::Applied(_)
+    ));
+    assert!(common::present(&store, live.clone()));
+    assert!(!common::present(&store, done));
+    assert!(page(&store, 34).rows.is_empty());
+    assert!(matches!(
+        common::commit(
+            &store,
             9,
-            PlaneDisposition::Terminal,
-        )
-        .view(),
-    )
-    .expect("clean up this run's task");
-    assert_eq!(
-        RecordStore::purge_plane_records_before(&direct, "task", i64::MAX as u64)
-            .expect("clean up this run's rows"),
-        1,
-        "exactly the surviving task is swept"
-    );
-    assert!(
-        events(&direct, &t_live).is_empty(),
-        "the remaining chain is cascaded too"
-    );
+            vec![],
+            vec![
+                Mutation::Delete(live.clone()),
+                Mutation::DeleteRange {
+                    namespace: NamespaceId([33; 16]),
+                    prefix: vec![],
+                    exact_key_length: 8
+                }
+            ]
+        ),
+        Decision::Applied(_)
+    ));
+    let direct = common::linked(&settings).unwrap();
+    assert!(!common::present(&direct, live));
+    assert!(page(&direct, 33).rows.is_empty());
 }
-
-/// THE DURABILITY PROOF FOR THE TRUST STATE — the `demotion` kind and the single-use `ask` token
-/// ledger — OVER THE REAL PLUGIN PATH.
 #[test]
 fn trust_state_survives_an_unload_and_reload_over_the_real_plugin_abi() {
-    use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
-
-    let path = plugin_path();
-    let url = std::env::var("BUSBAR_TEST_POSTGRES_URL").unwrap_or_else(|_| {
-        panic!(
-            "BUSBAR_TEST_POSTGRES_URL is unset, and this case must not skip: it is the only \
-             over-the-ABI proof that a demotion and a spent approval survive a restart on this \
-             backend, and both fail SILENTLY when unrelayed"
-        )
-    });
-    let cfg = cfg(&url);
-
-    let stamp = format!(
-        "{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let srv_demoted = format!("srv_abi_demoted_{stamp}");
-    let srv_cleared = format!("srv_abi_cleared_{stamp}");
-    let nonce_restart = format!("nonce_abi_restart_{stamp}");
-    let nonce_fleet = format!("nonce_abi_fleet_{stamp}");
-    let nonce_fresh = format!("nonce_abi_fresh_{stamp}");
-    const NOW: u64 = 4_000_000_000;
-
-    let ask_kind = format!("ask_abi_{stamp}");
-
-    let demotion = |server: &str, reason: &str, at: u64| PlaneRecord {
-        kind: "demotion".into(),
-        id: server.into(),
-        parent: None,
-        seq: 0,
-        ts: at,
-        disposition: PlaneDisposition::Active,
-        body: plane_body(serde_json::json!({
-            "server": server, "reason": reason, "recorded_at": at,
-        })),
-    };
-    let demotions = |store: &dyn RecordStore| -> Vec<(String, String)> {
-        store
-            .list_plane_records("demotion", &PlaneSelector::All)
-            .expect("list_plane_records")
-            .iter()
-            .map(|b| plane_decode(b))
-            .map(|v| {
-                (
-                    v["server"].as_str().unwrap_or("").to_string(),
-                    v["reason"].as_str().unwrap_or("").to_string(),
-                )
-            })
-            .collect()
-    };
-
-    {
-        let store = common::dropped_at(&path, &cfg)
-            .expect("the postgres plugin must load over the real ABI");
-        store
-            .upsert_plane_record(demotion(&srv_demoted, "tool-drift", NOW).view())
-            .expect("upsert_plane_record");
-        store
-            .upsert_plane_record(demotion(&srv_demoted, "digest-mismatch", NOW + 10).view())
-            .expect("upsert_plane_record");
-        store
-            .upsert_plane_record(demotion(&srv_cleared, "tool-drift", NOW + 20).view())
-            .expect("upsert_plane_record");
-        store
-            .delete_plane_record("demotion", &srv_cleared)
-            .expect("a later agreeing observation clears the quarantine");
-        assert!(
-            store
-                .redeem_plane_token(&ask_kind, &nonce_restart, u64::MAX, NOW)
-                .expect("redeem_plane_token"),
-            "the FIRST redemption must be answered `true`, or nothing below is about single use"
-        );
-        drop(store);
-    }
-
-    let store = common::dropped_at(&path, &cfg)
-        .expect("the postgres plugin must load again over the real ABI");
-
-    let mine: Vec<(String, String)> = demotions(&store)
-        .into_iter()
-        .filter(|(s, _)| *s == srv_demoted || *s == srv_cleared)
-        .collect();
+    let Some(admin) = postgres_url() else { return };
+    let database = TempDb::create(&admin, "spg_trust");
+    let url = database.url();
+    let settings = cfg(&url);
+    let store = common::dropped(&settings).unwrap();
+    common::initialize(&store);
+    let demoted = common::address(35, b"demoted");
+    let cleared = common::address(35, b"cleared");
+    let nonce = common::address(36, b"restart");
+    assert!(matches!(
+        common::commit(
+            &store,
+            2,
+            vec![],
+            vec![
+                common::put(demoted.clone(), b"tool-drift"),
+                common::put(cleared.clone(), b"tool-drift")
+            ]
+        ),
+        Decision::Applied(_)
+    ));
+    assert!(matches!(
+        common::commit(
+            &store,
+            3,
+            vec![],
+            vec![
+                common::put(demoted.clone(), b"digest-mismatch"),
+                Mutation::Delete(cleared.clone())
+            ]
+        ),
+        Decision::Applied(_)
+    ));
+    assert!(matches!(
+        common::commit(
+            &store,
+            4,
+            vec![Predicate {
+                address: nonce.clone(),
+                expected: ExpectedValue::Absent
+            }],
+            vec![common::put(nonce.clone(), b"spent")]
+        ),
+        Decision::Applied(_)
+    ));
+    drop(store);
+    let store = common::dropped(&settings).unwrap();
+    assert_eq!(page(&store, 35).rows.len(), 1);
     assert_eq!(
-        mine,
-        vec![(srv_demoted.clone(), "digest-mismatch".to_string())],
-        "the boot read must put the recorded quarantine back in force — at its LATEST reason, and \
-         without the one a later agreeing observation cleared"
+        common::raw_value(&url, &demoted).unwrap(),
+        b"digest-mismatch"
     );
-
-    assert!(
-        !store
-            .redeem_plane_token(&ask_kind, &nonce_restart, u64::MAX, NOW + 1)
-            .expect("redeem_plane_token"),
-        "a restart handed a spent approval back over the plugin ABI"
-    );
-
-    let node_b = common::dropped_at(&path, &cfg)
-        .expect("a second node loads the same plugin against the same database");
-    assert!(store
-        .redeem_plane_token(&ask_kind, &nonce_fleet, u64::MAX, NOW + 2)
-        .expect("redeem_plane_token"));
-    assert!(
-        !node_b
-            .redeem_plane_token(&ask_kind, &nonce_fleet, u64::MAX, NOW + 3)
-            .expect("redeem_plane_token"),
-        "a second node redeemed an approval the first already spent"
-    );
-
-    assert!(
-        node_b
-            .redeem_plane_token(&ask_kind, &nonce_fresh, u64::MAX, NOW + 4)
-            .expect("redeem_plane_token"),
-        "a freshly minted approval is not the one that was spent"
-    );
-
-    let direct = common::linked(&cfg).expect("connect directly to verify and clean up");
-    assert!(
-        demotions(&direct)
-            .iter()
-            .any(|(s, r)| *s == srv_demoted && r == "digest-mismatch"),
-        "the demotion must be physically present in Postgres, not merely cached in the plugin"
-    );
-    assert!(
-        !RecordStore::redeem_plane_token(&direct, &ask_kind, &nonce_restart, u64::MAX, NOW + 5)
-            .expect("redeem_plane_token via the direct connection"),
-        "the spent-token row must be physically present in Postgres"
-    );
-
-    RecordStore::delete_plane_record(&direct, "demotion", &srv_demoted)
-        .expect("clean up this run's demotion");
+    assert!(!common::present(&store, cleared));
+    assert!(matches!(
+        common::commit(
+            &store,
+            5,
+            vec![Predicate {
+                address: nonce.clone(),
+                expected: ExpectedValue::Absent
+            }],
+            vec![common::put(nonce.clone(), b"spent")]
+        ),
+        Decision::ConditionConflict
+    ));
+    let node_b = common::dropped(&settings).unwrap();
+    let fleet = common::address(36, b"fleet");
+    assert!(matches!(
+        common::commit(
+            &store,
+            6,
+            vec![Predicate {
+                address: fleet.clone(),
+                expected: ExpectedValue::Absent
+            }],
+            vec![common::put(fleet.clone(), b"spent")]
+        ),
+        Decision::Applied(_)
+    ));
+    assert!(matches!(
+        common::commit(
+            &node_b,
+            7,
+            vec![Predicate {
+                address: fleet.clone(),
+                expected: ExpectedValue::Absent
+            }],
+            vec![common::put(fleet, b"spent")]
+        ),
+        Decision::ConditionConflict
+    ));
+    assert!(matches!(
+        common::commit(
+            &node_b,
+            8,
+            vec![Predicate {
+                address: common::address(36, b"fresh"),
+                expected: ExpectedValue::Absent
+            }],
+            vec![common::put(common::address(36, b"fresh"), b"spent")]
+        ),
+        Decision::Applied(_)
+    ));
+    let direct = common::linked(&settings).unwrap();
+    assert!(common::present(&direct, demoted));
+    assert!(common::present(&direct, nonce));
 }

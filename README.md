@@ -449,3 +449,65 @@ secret forms are refused instead of being silently interpreted as empty values.
 
 The plane-record, replay-token, conditional-record and usage-correction behavior
 described above belongs to the new 1.6 interfaces, not a changed 1.5.5 contract.
+
+### Staged primitive Store v4
+
+`busbar_store_postgres::v4::door` exposes the four primitive operations separately
+from the existing v3 door. It uses the same host connector, TLS and asynchronous
+PostgreSQL client; opening v4 never invokes the v3 migration path.
+
+The canonical physical format is version 1 in `busbar_persistence_v4`. Admission
+creates it transactionally only in a database with no existing user relations,
+or validates the existing canonical tables, constraints, indexes and persistent
+metadata. Legacy, unmarked and partial formats require explicit offline migration.
+PostgreSQL must provide `gen_random_uuid()` for initial identity creation.
+
+Durability is **Local**, verified with a writable primary, `fsync=on`,
+`full_page_writes=on` and transaction-local `synchronous_commit=on`. This does not
+assert replica or quorum acknowledgement. Every operation verifies the persistent
+identity. Transaction-scoped advisory locks admit reads and commits before their
+clock observation: reads take shared namespace locks, while commits exclusively
+lock mutated namespaces and share locks on predicate-only namespaces. Sorted,
+deduplicated lock IDs promote collisions to exclusive access. Generation-address
+reads lock their owning namespace. A shared global gate allows ordinary operations
+to proceed concurrently; physical initialization and scans of all generation
+metadata take it exclusively. READ COMMITTED statements then observe current values
+held stable through the authoritative clock observation and transaction completion.
+Mutations also retain shared row locks on dataset and writer fences through commit;
+retirement updates wait for admitted writers. Conditions, binary-key ranges,
+namespace generations and receipts share the native transaction. A lost commit
+response is Unknown.
+
+Logical addresses retain complete binary namespace/key bytes. Only their fixed
+SHA-256 locator is indexed; point operations validate the complete address and
+refuse collisions. Scans sort full raw keys and use exclusive continuation keys.
+Epochs, generations and receipt timestamps are exact eight-byte little-endian
+unsigned integers, never narrowed to SQL signed integers. Receipt maintenance
+observes durably retired floors and waits the SDK's process-monotonic 24-hour
+horizon; restarting starts a fresh grace period. Maintenance runs after Applied
+and cannot change that decision.
+
+The URL-only settings retain the native addressable allocation admission limit
+(`isize::MAX` bytes); actual allocation failures remain refusals. This imposes no
+new aggregate batch or item ceiling on previously accepted typed operations.
+
+Four explicit native qualification tests passed on an isolated PostgreSQL 17.11
+(Homebrew) cluster through the actual v4 door, loader and Host/TCP connector. They
+cover persistent identity/reopen, atomic range changes, replay, stale scans, large
+binary keys, unsigned epochs, collision-triggered rollback, admission/time guards,
+absence races, retirement barriers, and the real core identity mint/hydrate/revoke
+path. This verifies those cases on that server version; the path remains staged
+pending the full native failure/deployment CI witnesses before cutover.
+
+The native cases require an explicitly supplied disposable administrator endpoint
+in libpq keyword form, with permission to create isolated test databases. They are
+marked ignored for ordinary unit runs, and never silently skip after invocation:
+
+```sh
+BUSBAR_TEST_POSTGRES_V4_URL='host=127.0.0.1 port=5432 user=test dbname=postgres sslmode=disable' \
+  cargo test -p busbar-store-postgres --lib v4::native_tests -- --ignored --test-threads=1
+```
+
+Native CI must invoke this target explicitly; an ordinary unit-test run does not
+count as native qualification. The core identity crossing uses a test-only kernel
+dependency at the same core pin as the existing loader and contract dependencies.

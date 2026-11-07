@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use busbar_contract::secret_fields::resolve_declared_fields;
-use busbar_plugin_loader::dispatch::kinds::store::Store;
+use busbar_plugin_loader::dispatch::kinds::store_v4::StoreV4 as Store;
 use busbar_plugin_loader::dispatch::{
     load_linked, Bind, ConnTable, DispatchConfig, Dispatcher, LinkedRow, NoSink, Plugin,
 };
@@ -22,7 +22,10 @@ fn linked() -> (Plugin<Store>, Arc<Dispatcher>) {
         dispatcher: d.adopter(),
         conns: ConnTable::Probe,
     };
-    let row = LinkedRow::of(busbar_store_postgres::door).expect("the row renders");
+    let row = LinkedRow::of_kind::<Store>(
+        busbar_store_postgres::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+    )
+    .expect("the row renders");
     (load_linked::<Store>(&row, bind).expect("the door loads"), d)
 }
 

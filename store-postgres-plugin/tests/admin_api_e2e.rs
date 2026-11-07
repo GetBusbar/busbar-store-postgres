@@ -1,47 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-//! THE prod-ready end-to-end bar for this plugin, driven the way a real OPERATOR installs and uses
-//! it in production — never a file dropped onto disk before boot (see `e2e.rs` for that path, still
-//! real and still kept as its own proof), but the REAL admin HTTP API:
-//!
-//!   1. Boot a real `busbar` process (no `--validate`) with its admin listener up and the compiled-in
-//!      `memory` store active (`store: {module: memory}`: busbar 1.6.0 requires the block and names
-//!      the RAM store this way).
-//!   2. `POST /api/v1/admin/plugins` with the REAL built cdylib, base64-encoded, guarded by a real
-//!      `x-admin-token` — the exact wire shape `crates/busbar/src/admin/v1/json/handlers.rs`'s
-//!      `install_plugin` and its own admin test (`test_admin_v1_plugin_install_list_reload_remove`
-//!      in `crates/busbar/src/admin/tests/tests.rs`) use, mirrored here against a REAL cdylib rather
-//!      than that in-process test's own never-dlopened junk bytes.
-//!   3. `GET /api/v1/admin/plugins?type=store` confirms the install landed in the real catalog.
-//!
-//! Installing over the admin API does NOT hot-swap the ACTIVE store — confirmed against
-//! `crates/busbar/src/admin/v1/json/handlers.rs`'s own `reload_plugins` doc comment ("the
-//! governance/store instance is REUSED across the swap") and `PUT /config/settings`'s handler,
-//! which puts `store` on its own `restart_required` list. There is no admin endpoint that hot-swaps
-//! the active store; a fresh process boot is the only real mechanism, so this test uses one — same
-//! as a real operator editing `store: module: postgres` into `config.yaml` and restarting after an
-//! admin-API install:
-//!
-//!   4. Stop that process. Rewrite `config.yaml` on disk (same `plugins.dir`, now containing the
-//!      tarball the ADMIN API itself wrote there in step 2 — never touched directly by this test) to
-//!      point `store: module: postgres` at the real Postgres.
-//!   5. Boot a SECOND real `busbar` process against that config. Busbar's own first-boot store
-//!      resolution (`plugin_registry.open_store`, called synchronously during construction, before
-//!      the listener ever binds) dlopens the plugin that landed on disk via the admin API in step 2.
-//!      Poll — via a RAW independent `postgres::Client`, never the store itself — for the
-//!      `keys` table to appear, proving the real dlopen + `Store::connect`/`migrate()` path executed.
-//!   6. `POST /api/v1/admin/keys` (with `issue_aws_credential: true`) against this SECOND process —
-//!      REAL WORK: mint a virtual key AND a credential through the running instance, over the same
-//!      real admin API.
-//!   7. Independently verify — a fresh RAW `postgres::Client`, bypassing the plugin/ABI/admin-API
-//!      entirely — that both the `keys` row and the `credentials` row actually landed.
-//!
-//! Together: real admin-API install -> real (admin-API-driven) plugin load -> real admin-API write
-//! -> real, independently-verified Postgres persistence.
-
-//! These development fixtures permit unsigned plugins; they verify manifest and archive
-//! integrity and loading, not production release-signature trust policy.
+//! Real admin HTTP install and key/credential issuance against the native PostgreSQL door.
+//! HTTP asserts core semantics; an independent native-record read witnesses persistence.
 
 mod common;
 use common::temp_db::TempDb;
@@ -127,26 +88,13 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Removes the work directory and the minted key on drop, including when an assertion panics.
+/// The disposable database owns all records; this guard removes only test files.
 struct RunCleanup {
-    url: String,
-    work: std::path::PathBuf,
-    minted_id: Option<String>,
+    work: PathBuf,
 }
-
 impl Drop for RunCleanup {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.work);
-        if let Some(id) = &self.minted_id {
-            cleanup(&self.url, id);
-        }
-    }
-}
-
-fn cleanup(url: &str, id: &str) {
-    if let Ok(mut client) = postgres::Client::connect(url, postgres::NoTls) {
-        let _ = client.execute("DELETE FROM credentials WHERE key_id=$1", &[&id]);
-        let _ = client.execute("DELETE FROM keys WHERE id=$1", &[&id]);
     }
 }
 
@@ -211,11 +159,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
             .unwrap()
             .as_nanos()
     ));
-    let mut run_cleanup = RunCleanup {
-        url: url.clone(),
-        work: work.clone(),
-        minted_id: None,
-    };
+    let _run_cleanup = RunCleanup { work: work.clone() };
     let plugins_dir = work.join("plugins");
     std::fs::create_dir_all(&plugins_dir).unwrap();
 
@@ -422,7 +366,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     let booted = loop {
         if let Ok(mut raw) = postgres::Client::connect(&url, postgres::NoTls) {
             if let Ok(row) = raw.query_one(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='keys')",
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='busbar_persistence_v4' AND table_name='metadata')",
                 &[],
             ) {
                 let exists: bool = row.get(0);
@@ -446,7 +390,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     assert!(
         booted,
         "boot #2, restarted onto the admin-installed postgres plugin, must reach a migrated \
-         `keys` table within 15s\n\
+         native metadata table within 15s\n\
          --- boot #2 output ---\n{}",
         guard2.output()
     );
@@ -474,7 +418,6 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         .as_str()
         .expect("minted key response has an id")
         .to_string();
-    run_cleanup.minted_id = Some(minted_id.clone());
     let access_key_id = mint_json["aws_access_key_id"]
         .as_str()
         .expect("issue_aws_credential:true must return an aws_access_key_id")
@@ -484,33 +427,67 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         "issue_aws_credential:true must also return an aws_secret_access_key: {mint_json}"
     );
 
-    let mut raw = postgres::Client::connect(&url, postgres::NoTls)
-        .expect("connect directly to confirm persistence, bypassing the plugin entirely");
-    let key_row = raw
-        .query_opt("SELECT name, enabled FROM keys WHERE id=$1", &[&minted_id])
-        .unwrap();
-    let key_row = key_row.expect("the minted key must be a real row in the real keys table");
-    let stored_name: String = key_row.get(0);
-    let stored_enabled: bool = key_row.get(1);
-    assert_eq!(stored_name, "spg-adminapi-e2e-key");
-    assert!(stored_enabled);
-
-    let cred_row = raw
-        .query_opt(
-            "SELECT kind, public_id FROM credentials WHERE key_id=$1",
-            &[&minted_id],
-        )
-        .unwrap();
-    let cred_row = cred_row
-        .expect("the minted AWS credential must be a real row in the real credentials table");
-    let stored_kind: String = cred_row.get(0);
-    let stored_public_id: String = cred_row.get(1);
-    assert_eq!(stored_kind, "sigv4");
-    assert_eq!(
-        stored_public_id, access_key_id,
-        "the credential row's public_id must be the SAME access key id the admin API returned"
-    );
-
     drop(guard2);
+    let mut guard3 = spawn_busbar(
+        Command::new(&busbar_bin)
+            .env("BUSBAR_CONFIG", &config2)
+            .env("BUSBAR_PROVIDERS", &providers)
+            .env("BUSBAR_ADMIN_TOKEN", admin_token)
+            .env("BUSBAR_SIGNING_KEY", TEST_SIGNING_KEY)
+            .env(
+                "MOCK_KEY",
+                "0000000000000000000000000000000000000000000000000000000000000001",
+            )
+            .env("BUSBAR_STATE_FILE", ""),
+        work.join("boot3.log"),
+        "boot #3 (reopen issued identity)",
+    );
+    wait_for_admin_listener(&client, &admin_base, admin_token, &mut guard3, "boot #3");
+    let response = client
+        .get(format!("{admin_base}/keys/{minted_id}"))
+        .header("x-admin-token", admin_token)
+        .send()
+        .unwrap();
+    assert!(response.status().is_success());
+    let key: serde_json::Value = response.json().unwrap();
+    assert_eq!(key["name"], "spg-adminapi-e2e-key");
+    assert_eq!(key["enabled"], true);
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls)
+        .expect("independent native persistence witness");
+    // Exact canonical schema from kernel governance/persistence/identity.rs:
+    // identity namespace v1; keys::framed tags K/C; JSON {version:1,record:...}.
+    // Confidential namespace rows remain opaque and are never parsed.
+    let namespace = b"busbar.identity1".as_slice();
+    let framed = |tag: u8, id: &str| {
+        let mut key = vec![tag];
+        key.extend_from_slice(&(id.len() as u32).to_be_bytes());
+        key.extend_from_slice(id.as_bytes());
+        key
+    };
+    let stored_key: Vec<u8> = raw
+        .query_one(
+            "SELECT value FROM busbar_persistence_v4.records WHERE namespace=$1 AND key=$2",
+            &[&namespace, &framed(b'K', &minted_id)],
+        )
+        .unwrap()
+        .get(0);
+    let stored_key: serde_json::Value =
+        serde_json::from_slice(&stored_key).expect("canonical key JSON");
+    assert_eq!(stored_key["version"], 1);
+    assert_eq!(stored_key["record"]["id"], minted_id);
+    assert_eq!(stored_key["record"]["name"], "spg-adminapi-e2e-key");
+    assert_eq!(stored_key["record"]["enabled"], true);
+    let credentials:Vec<serde_json::Value>=raw.query("SELECT key,value FROM busbar_persistence_v4.records WHERE namespace=$1 AND substring(key FROM 1 FOR 1)=$2",&[&namespace]).unwrap().into_iter().map(|row| {
+        let key:Vec<u8>=row.get(0);let bytes:Vec<u8>=row.get(1);
+        let value:serde_json::Value=serde_json::from_slice(&bytes).expect("canonical credential metadata JSON");
+        assert_eq!(value["version"],1);
+        assert_eq!(key,framed(b'C',value["record"]["id"].as_str().unwrap()));
+        value
+    }).collect();
+    assert_eq!(credentials.len(), 1);
+    assert_eq!(credentials[0]["record"]["key_id"], minted_id);
+    assert_eq!(credentials[0]["record"]["kind"], "sigv4");
+    assert_eq!(credentials[0]["record"]["public_id"], access_key_id);
+    drop(guard3);
     drop(raw);
 }

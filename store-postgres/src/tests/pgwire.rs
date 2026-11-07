@@ -213,11 +213,9 @@ fn socket_options_accept_only_effective_settings() {
             assert!(!text.contains("has no effect"), "{dsn}: {text}");
 
             let settings = serde_json::json!({ "url": dsn }).to_string();
-            let error =
-                <crate::PostgresStore as busbar_contract::abi::sdk::store::StoreSlots>::validate(
-                    settings.as_bytes(),
-                )
-                .expect_err("the Store lifecycle must reject the same unsupported settings");
+            let error = crate::settings::parse(settings.as_bytes(), &[])
+                .err()
+                .expect("the native lifecycle must reject the same unsupported settings");
             assert!(
                 error.contains("invalid postgres plugin config: url:"),
                 "{error}"
@@ -398,23 +396,13 @@ fn a_data_row_short_of_its_columns_is_an_error_not_a_panic() {
 }
 
 #[test]
-fn a_snapshot_transaction_begins_repeatable_read() {
+fn a_primitive_transaction_pins_isolation_and_timeouts() {
     assert_eq!(
-        begin_sql(Some(IsolationLevel::RepeatableRead)),
-        "BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL lock_timeout = '30s'; \
-         SET LOCAL idle_in_transaction_session_timeout = '60s'"
-    );
-    assert_eq!(
-        begin_sql(None),
-        "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = '30s'; \
-         SET LOCAL idle_in_transaction_session_timeout = '60s'",
-        "a DSN's default_transaction_isolation must not change the store's reasoning"
+        begin_sql(),
+        "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = '30s'; SET LOCAL idle_in_transaction_session_timeout = '60s'"
     );
 }
 
-/// The connection's prepared statements stay bounded: past `STATEMENTS_KEPT` the least recently
-/// run is dropped and its Close queued for the next Parse; a stale statement is dropped the same
-/// way, and `26000` (the session's statements deallocated) drops them all.
 #[test]
 fn prepared_statements_drop_the_least_recently_run_past_the_bound() {
     use std::sync::Arc;
@@ -716,4 +704,41 @@ fn a_long_row_description_keeps_the_data_ceiling_after_authentication() {
     // exceed the 30,000-byte control cap.
     assert_eq!(message_limit(b'T', true), MAX_MESSAGE_LEN);
     assert_eq!(message_limit(b'T', false), MAX_CONTROL_MESSAGE_LEN);
+}
+
+#[test]
+fn native_row_debug_does_not_expose_cell_bytes() {
+    let mut frame = vec![b'D'];
+    let secret = b"private-native-row";
+    frame.extend_from_slice(&(10u32 + secret.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&1u16.to_be_bytes());
+    frame.extend_from_slice(&(secret.len() as i32).to_be_bytes());
+    frame.extend_from_slice(secret);
+    let mut buffer = receive::ReceiveBuffer::default();
+    buffer.append(&frame);
+    let Message::DataRow(body) = buffer.message().unwrap().unwrap() else {
+        panic!("row");
+    };
+    let ranges = body.ranges().collect().unwrap();
+    let row = Row {
+        columns: Arc::from([Column {
+            name: "secret".into(),
+            type_: Type::TEXT,
+        }]),
+        body,
+        ranges,
+    };
+    assert_eq!(row.try_get::<_, &str>(0).unwrap(), "private-native-row");
+    assert!(!format!("{row:?}").contains("private-native-row"));
+}
+
+#[test]
+fn native_database_error_debug_redacts_source_values() {
+    let error = Error::server("23514", "private-source-value");
+    assert!(!format!("{error:?}").contains("private-source"));
+    assert_eq!(
+        error.as_db_error().unwrap().message(),
+        "private-source-value"
+    );
+    assert_eq!(error.code().unwrap().code(), "23514");
 }

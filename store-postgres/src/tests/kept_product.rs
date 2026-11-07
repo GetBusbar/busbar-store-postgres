@@ -6,13 +6,19 @@
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use busbar_contract::records::RecordStore;
+use busbar_contract::persistence::*;
 
-use super::{connect_client_with_retry, harness::open_loaded, live_url, TempDb};
+use super::native_tests::{
+    address, assert_applied, candidate, open, page, put, read, run, Fixture,
+};
 
 fn tagged_url(url: &str, tag: &str) -> String {
-    let separator = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{separator}application_name={tag}")
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{separator}application_name={tag}")
+    } else {
+        format!("{url} application_name={tag}")
+    }
 }
 
 fn backends(raw: &mut postgres::Client, tag: &str) -> Vec<i32> {
@@ -27,17 +33,16 @@ fn backends(raw: &mut postgres::Client, tag: &str) -> Vec<i32> {
 }
 
 #[test]
+#[ignore = "requires explicit disposable BUSBAR_TEST_POSTGRES_V4_URL; native qualification"]
 fn concurrent_product_ops_wait_beyond_the_actual_kept_connection_bound() {
-    let Some(url) = live_url() else { return };
-    let database = TempDb::create(&url, "spg_wire_bound");
-    let url = database.url();
+    let fixture = Fixture::fresh();
+    let url = fixture.url.clone();
     let tag = format!("bb_wire_bound_{}", std::process::id());
-    let settings = serde_json::json!({"url": tagged_url(&url, &tag)}).to_string();
-    let store = Arc::new(open_loaded(&settings).expect("the actual store opens"));
-    let mut raw = connect_client_with_retry(&url);
+    let store = open(&tagged_url(&url, &tag));
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     let mut blocker = raw.transaction().expect("begin the real table lock");
     blocker
-        .batch_execute("LOCK TABLE denylist IN ACCESS EXCLUSIVE MODE")
+        .batch_execute("LOCK TABLE busbar_persistence_v4.records IN ACCESS EXCLUSIVE MODE")
         .expect("hold all product reads at the real database");
     let operations = crate::KEPT_CONNECTIONS + 4;
     let start = Arc::new(Barrier::new(operations + 1));
@@ -47,12 +52,12 @@ fn concurrent_product_ops_wait_beyond_the_actual_kept_connection_bound() {
             let start = Arc::clone(&start);
             std::thread::spawn(move || {
                 start.wait();
-                RecordStore::list_denylist(&*store)
+                page(&store, 80, None, None, 100)
             })
         })
         .collect();
     start.wait();
-    let mut observer = connect_client_with_retry(&url);
+    let mut observer = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
     let held = loop {
         let held = backends(&mut observer, &tag);
@@ -88,14 +93,13 @@ fn concurrent_product_ops_wait_beyond_the_actual_kept_connection_bound() {
 }
 
 #[test]
+#[ignore = "requires explicit disposable BUSBAR_TEST_POSTGRES_V4_URL; native qualification"]
 fn a_closed_product_connection_fails_its_write_and_the_next_op_connects_fresh() {
-    let Some(url) = live_url() else { return };
-    let database = TempDb::create(&url, "spg_wire_eof");
-    let url = database.url();
+    let fixture = Fixture::fresh();
+    let url = fixture.url.clone();
     let tag = format!("bb_wire_eof_{}", std::process::id());
-    let settings = serde_json::json!({"url": tagged_url(&url, &tag)}).to_string();
-    let store = open_loaded(&settings).expect("the actual store opens");
-    let mut raw = connect_client_with_retry(&url);
+    let store = open(&tagged_url(&url, &tag));
+    let mut raw = postgres::Client::connect(&url, postgres::NoTls).unwrap();
     let before = backends(&mut raw, &tag);
     assert_eq!(before.len(), 1, "opening leaves exactly one kept backend");
     let terminated: bool = raw
@@ -108,26 +112,39 @@ fn a_closed_product_connection_fails_its_write_and_the_next_op_connects_fresh() 
         assert!(Instant::now() < deadline, "the old backend exits");
         std::thread::sleep(Duration::from_millis(10));
     }
-    let failed_key = format!("{tag}-failed");
-    assert!(
-        RecordStore::add_denylist(&store, &failed_key, "closed").is_err(),
-        "a write on the terminated kept connection reports the actual EOF/refusal"
+    let failed_key = address(80, b"failed-eof");
+    let original = candidate(
+        &store,
+        2,
+        1,
+        vec![],
+        vec![put(failed_key.clone(), b"closed")],
+        None,
     );
-    let fresh_key = format!("{tag}-fresh");
-    RecordStore::add_denylist(&store, &fresh_key, "fresh")
-        .expect("the next product operation connects afresh");
+    assert!(
+        run(store.commit(original)).is_err(),
+        "the write on the terminated kept connection reports EOF/unknown"
+    );
+    let fresh_key = address(80, b"fresh-eof");
+    assert_applied(run(store.commit(candidate(
+        &store,
+        3,
+        1,
+        vec![],
+        vec![put(fresh_key.clone(), b"fresh")],
+        None,
+    ))));
     let after = backends(&mut raw, &tag);
     assert_eq!(after.len(), 1, "the new connection is kept");
-    assert_ne!(
-        after, before,
-        "the fresh operation runs on a different real backend"
+    assert_ne!(after, before, "the next operation connects afresh");
+    let ReadResult::Values { values, .. } =
+        read(&store, vec![failed_key, fresh_key], None).unwrap()
+    else {
+        panic!("native read values")
+    };
+    assert!(
+        values[0].is_none(),
+        "the EOF attempt had no effects in this terminated-connection fixture"
     );
-    assert!(RecordStore::list_denylist(&store)
-        .expect("the fresh read")
-        .contains(&fresh_key));
-    assert!(!RecordStore::list_denylist(&store)
-        .expect("the failed write left no row")
-        .contains(&failed_key));
-    raw.execute("DELETE FROM denylist WHERE sub=$1", &[&fresh_key])
-        .expect("remove the owning test row");
+    assert!(values[1].is_some(), "the fresh native commit is readable");
 }

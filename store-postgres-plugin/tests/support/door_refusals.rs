@@ -13,7 +13,7 @@ extern "C" fn mutated() -> *const Door {
     MUTATED.load(Ordering::SeqCst)
 }
 extern "C" fn real() -> *const Door {
-    busbar_store_postgres::door()
+    busbar_store_postgres::v4::door()
 }
 // Used by one sequential test only. The real table and all newly allocated metadata remain static.
 fn restate(parts: DoorParts) {
@@ -33,7 +33,7 @@ fn incompatible_metadata_is_refused_before_any_store_slot_runs() {
     drop(honest);
     drop(d);
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
-    let original = busbar_store_postgres::door().parts();
+    let original = busbar_store_postgres::v4::door().parts();
     let kind = KindCode::Store;
     let abi = kind.abi_version();
     assert_eq!(original.kind_abi, abi);
@@ -142,7 +142,10 @@ fn incompatible_metadata_is_refused_before_any_store_slot_runs() {
 fn wrong<K: Kind>() {
     let lib = cdylib();
     let stated = packed_rendering(&lib);
-    let row = LinkedRow::of(busbar_store_postgres::door).unwrap();
+    let row = LinkedRow::of_kind::<Store>(
+        busbar_store_postgres::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+    )
+    .unwrap();
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let want = Some(LoadError::ManifestKind {
         stated: KindCode::Store,
@@ -170,7 +173,10 @@ fn every_other_kind_refuses_the_actual_store_in_both_deliveries() {
 fn networked_store_requires_a_connection_table_and_can_be_probed() {
     let lib = cdylib();
     let stated = packed_rendering(&lib);
-    let row = LinkedRow::of(busbar_store_postgres::door).unwrap();
+    let row = LinkedRow::of_kind::<Store>(
+        busbar_store_postgres::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+    )
+    .unwrap();
     let facts = rendering::read(&stated).unwrap();
     let expected = LoadError::NoConnectionTable {
         plugin: facts.name.clone(),

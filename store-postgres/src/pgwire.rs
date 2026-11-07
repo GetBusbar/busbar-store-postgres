@@ -134,6 +134,7 @@ impl Config {
 
     /// Parse a libpq connection string: `postgres[ql]://user:pass@host:port/db?key=value&...` or
     /// `host=... port=... user=... password=... dbname=... sslmode=...`.
+    #[cfg(test)]
     pub fn parse(s: &str) -> Result<Self, Error> {
         Self::captured(CredUrl::parse_postgres(s).map_err(config_err)?)
     }
@@ -514,7 +515,7 @@ pub(super) fn keywords(s: &str) -> Result<Vec<(String, String)>, Error> {
             loop {
                 match it.next() {
                     None => {
-                        return Err(config_err("unterminated quoted connection parameter value"))
+                        return Err(config_err("unterminated quoted connection parameter value"));
                     }
                     Some('\'') => break,
                     Some('\\') => match it.next() {
@@ -522,7 +523,7 @@ pub(super) fn keywords(s: &str) -> Result<Vec<(String, String)>, Error> {
                         None => {
                             return Err(config_err(
                                 "unterminated quoted connection parameter value",
-                            ))
+                            ));
                         }
                     },
                     Some(c) => value.push(c),
@@ -561,12 +562,29 @@ impl SqlState {
 }
 
 /// A server-side failure (an `ErrorResponse`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DbError {
     severity: String,
     code: SqlState,
     message: String,
     constraint: Option<String>,
+}
+
+impl fmt::Debug for DbError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DbError")
+            .field("code", &self.code)
+            .finish_non_exhaustive()
+    }
+}
+impl Drop for DbError {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.severity.zeroize();
+        self.code.0.zeroize();
+        self.message.zeroize();
+        self.constraint.zeroize();
+    }
 }
 
 impl DbError {
@@ -580,15 +598,26 @@ impl DbError {
         let mut has_message = false;
         let mut fields = body.fields();
         while let Some(f) = fields.next().map_err(parse_err)? {
-            let v = String::from_utf8_lossy(f.value_bytes()).into_owned();
+            let mut v =
+                zeroize::Zeroizing::new(String::from_utf8_lossy(f.value_bytes()).into_owned());
             match f.type_() {
-                b'S' => e.severity = v,
-                b'C' => e.code = SqlState(v),
+                b'S' => {
+                    zeroize::Zeroize::zeroize(&mut e.severity);
+                    e.severity = std::mem::take(&mut *v);
+                }
+                b'C' => {
+                    zeroize::Zeroize::zeroize(&mut e.code.0);
+                    e.code = SqlState(std::mem::take(&mut *v));
+                }
                 b'M' => {
                     has_message = true;
-                    e.message = v;
+                    zeroize::Zeroize::zeroize(&mut e.message);
+                    e.message = std::mem::take(&mut *v);
                 }
-                b'n' => e.constraint = Some(v),
+                b'n' => {
+                    zeroize::Zeroize::zeroize(&mut e.constraint);
+                    e.constraint = Some(std::mem::take(&mut *v));
+                }
                 _ => {}
             }
         }
@@ -735,12 +764,19 @@ impl RowIndex for &str {
     }
 }
 
-/// One result row.
-#[derive(Debug)]
+/// One result row. Its receive allocation is wiped after the final row lease.
 pub struct Row {
     columns: Arc<[Column]>,
     body: DataRowBody,
     ranges: Vec<Option<Range<usize>>>,
+}
+
+impl fmt::Debug for Row {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Row")
+            .field("columns", &self.columns.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Row {
@@ -796,6 +832,7 @@ const STATEMENTS_KEPT: usize = 256;
 /// across a rolled-back transaction (a prepared statement is not transactional).
 #[derive(Default)]
 struct Cache {
+    backend_pid: Option<i32>,
     by_sql: HashMap<String, (Arc<Statement>, u64)>,
     /// The use clock (least recently run goes first) and the next statement's number.
     tick: u64,
@@ -1201,17 +1238,21 @@ impl Client {
                 _ => {
                     return Err(Error::new(Kind_::Authentication(
                         "unsupported authentication method".to_string(),
-                    )))
+                    )));
                 }
             }
         }
         loop {
             match self.read().await? {
                 Message::ReadyForQuery(_) => return Ok(()),
+                Message::BackendKeyData(body) => self.cache().backend_pid = Some(body.process_id()),
                 Message::ErrorResponse(e) => return Err(self.response(&e)),
                 _ => {}
             }
         }
+    }
+    pub(crate) fn native_pid(&self) -> Option<i32> {
+        self.cache().backend_pid
     }
 
     /// An authentication message, a server failure answered as one.
@@ -1572,19 +1613,11 @@ impl Client {
 
     /// Begin a READ COMMITTED transaction.
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
-        self.batch_execute(begin_sql(None)).await?;
+        self.batch_execute(begin_sql()).await?;
         Ok(Transaction {
             client: self,
             done: false,
         })
-    }
-
-    /// A transaction with options.
-    pub fn build_transaction(&mut self) -> TransactionBuilder<'_> {
-        TransactionBuilder {
-            client: self,
-            isolation: None,
-        }
     }
 }
 
@@ -1593,54 +1626,10 @@ fn type_of(oid: u32) -> Type {
         .unwrap_or_else(|| Type::new(format!("{oid}"), oid, Kind::Simple, String::new()))
 }
 
-/// A transaction's isolation level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IsolationLevel {
-    RepeatableRead,
-}
-
-/// The one simple-query batch that begins a transaction at `isolation` (`None` = READ COMMITTED,
-/// stated, so a DSN's `default_transaction_isolation` cannot change what the store's statements
-/// assume).
+/// Begin with an explicit isolation level and operation timeouts, independent of DSN defaults.
 #[must_use]
-pub fn begin_sql(isolation: Option<IsolationLevel>) -> &'static str {
-    match isolation {
-        None => {
-            "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = '30s'; \
-             SET LOCAL idle_in_transaction_session_timeout = '60s'"
-        }
-        Some(IsolationLevel::RepeatableRead) => {
-            "BEGIN ISOLATION LEVEL REPEATABLE READ; SET LOCAL lock_timeout = '30s'; \
-             SET LOCAL idle_in_transaction_session_timeout = '60s'"
-        }
-    }
-}
-
-/// A Bind frame counts parameters in an unsigned 16-bit field.
-pub(crate) const MAX_BIND_PARAMETERS: usize = u16::MAX as usize;
-
-/// [`Client::build_transaction`].
-pub struct TransactionBuilder<'a> {
-    client: &'a mut Client,
-    isolation: Option<IsolationLevel>,
-}
-
-impl<'a> TransactionBuilder<'a> {
-    /// The isolation level.
-    #[must_use]
-    pub fn isolation_level(mut self, level: IsolationLevel) -> Self {
-        self.isolation = Some(level);
-        self
-    }
-
-    /// Begin it.
-    pub async fn start(self) -> Result<Transaction<'a>, Error> {
-        self.client.batch_execute(begin_sql(self.isolation)).await?;
-        Ok(Transaction {
-            client: self.client,
-            done: false,
-        })
-    }
+fn begin_sql() -> &'static str {
+    "BEGIN ISOLATION LEVEL READ COMMITTED; SET LOCAL lock_timeout = '30s'; SET LOCAL idle_in_transaction_session_timeout = '60s'"
 }
 
 /// A transaction; rolled back unless committed.
@@ -1658,17 +1647,14 @@ impl Drop for Transaction<'_> {
 }
 
 impl Transaction<'_> {
+    pub(crate) fn client(&mut self) -> &mut Client {
+        self.client
+    }
+
     /// Commit.
     pub async fn commit(mut self) -> Result<(), Error> {
         self.done = true;
         self.client.batch_execute("COMMIT").await
-    }
-
-    /// Roll back, awaiting the server's completion before releasing this transaction's locks.
-    pub async fn rollback(mut self) -> Result<(), Error> {
-        self.client.batch_execute("ROLLBACK").await?;
-        self.done = true;
-        Ok(())
     }
 
     /// [`Client::batch_execute`] inside the transaction.

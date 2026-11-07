@@ -12,12 +12,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use busbar_plugin_loader::dispatch::kinds::store::Store;
+use busbar_contract::persistence::*;
+use busbar_plugin_loader::dispatch::kinds::store_v4::StoreV4 as Store;
 use busbar_plugin_loader::dispatch::{
     load_dropped, load_linked, rendering_of, Bind, ConnTable, DispatchConfig, Dispatcher,
     LinkedRow, NoSink,
 };
-use busbar_plugin_loader::store_v3::LoadedStore;
+use busbar_plugin_loader::store_v4::{Limits, LoadedPersistence};
 #[path = "../../../store-postgres/tests-support/postgres_io.rs"]
 pub mod postgres_io;
 
@@ -30,25 +31,7 @@ pub fn cdylib() -> PathBuf {
 /// The Statement rendering the signed manifest states: the linked door's own (the cdylib is the
 /// same crate).
 pub fn stated() -> Vec<u8> {
-    rendering_of(busbar_store_postgres::door).expect("the store renders its Statement")
-}
-
-/// A fresh `op_id` for every bridge write: a node half no other open (in this run or an earlier
-/// one) used.
-pub fn mint() -> busbar_contract::abi::store::OpId {
-    static NODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let node = *NODE.get_or_init(|| {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        nanos ^ (u64::from(std::process::id()) << 40)
-    });
-    busbar_contract::abi::store::OpId::from_parts(
-        node,
-        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
-    )
+    rendering_of(busbar_store_postgres::v4::door).expect("the store renders its Statement")
 }
 
 /// The instance's binding: its connections over the loader's test connection table (plain TCP),
@@ -64,23 +47,26 @@ pub fn bind(d: &Dispatcher) -> Bind {
 }
 
 /// The store through its COMPILED-IN door, opened on `settings`.
-pub fn linked(settings: &str) -> Result<LoadedStore, String> {
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
-    let row = LinkedRow::of(busbar_store_postgres::door).map_err(|e| e.to_string())?;
+pub fn linked(settings: &str) -> Result<LoadedPersistence, String> {
+    let d = dispatcher();
+    let row = LinkedRow::of_kind::<Store>(
+        busbar_store_postgres::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+    )
+    .map_err(|e| e.to_string())?;
     let p = load_linked::<Store>(&row, bind(&d)).map_err(|e| e.to_string())?;
-    LoadedStore::open(p, d, settings.as_bytes(), mint)
+    run(LoadedPersistence::open(p, d, settings.as_bytes(), limits()))
 }
 
 /// The library at `path` through the DROPPED-IN door, admitted against [`stated`] and opened on
 /// `settings`.
-pub fn dropped_at(path: &Path, settings: &str) -> Result<LoadedStore, String> {
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+pub fn dropped_at(path: &Path, settings: &str) -> Result<LoadedPersistence, String> {
+    let d = dispatcher();
     let p = load_dropped::<Store>(path, &stated(), bind(&d)).map_err(|e| e.to_string())?;
-    LoadedStore::open(p, d, settings.as_bytes(), mint)
+    run(LoadedPersistence::open(p, d, settings.as_bytes(), limits()))
 }
 
 /// This crate's cdylib through the DROPPED-IN door.
-pub fn dropped(settings: &str) -> Result<LoadedStore, String> {
+pub fn dropped(settings: &str) -> Result<LoadedPersistence, String> {
     dropped_at(&cdylib(), settings)
 }
 
@@ -144,6 +130,19 @@ pub fn busbar_root() -> PathBuf {
 /// stub, the exact binaries a real release ships.
 pub fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
+    if let (Some(busbar), Some(pack)) = (
+        std::env::var_os("BUSBAR_E2E_BINARY"),
+        std::env::var_os("BUSBAR_PLUGIN_PACK_BINARY"),
+    ) {
+        let paths = (PathBuf::from(busbar), PathBuf::from(pack));
+        assert!(
+            paths.0.is_file() && paths.1.is_file(),
+            "explicit real binaries must exist"
+        );
+        return paths;
+    }
+    let output = std::env::temp_dir().join("postgres-real-binaries");
+    std::fs::create_dir_all(&output).unwrap();
 
     for args in [
         &[
@@ -152,8 +151,6 @@ pub fn build_real_binaries() -> (PathBuf, PathBuf) {
             "--locked",
             "--manifest-path",
             "dist/default/Cargo.toml",
-            "--target-dir",
-            "target",
             "--bin",
             "busbar",
         ][..],
@@ -176,7 +173,7 @@ pub fn build_real_binaries() -> (PathBuf, PathBuf) {
             )
             .args(args)
             .env("BUSBAR_RELEASE_PUBKEY", E2E_RELEASE_PUBKEY)
-            .env_remove("CARGO_TARGET_DIR")
+            .env("CARGO_TARGET_DIR", &output)
             .current_dir(&root)
             .status()
             .expect("run cargo build for busbar + busbar-plugin-pack");
@@ -185,7 +182,7 @@ pub fn build_real_binaries() -> (PathBuf, PathBuf) {
             "building the real busbar + busbar-plugin-pack binaries must succeed ({args:?})"
         );
     }
-    let release = root.join("target").join("release");
+    let release = output.join("release");
     (release.join("busbar"), release.join("busbar-plugin-pack"))
 }
 
@@ -197,3 +194,153 @@ pub const E2E_RELEASE_PRIVKEY: &str =
 
 #[allow(dead_code)]
 pub(crate) mod temp_db;
+
+#[path = "../../../store-postgres/tests-support/postgres_clock.rs"]
+mod postgres_clock;
+pub fn dispatcher() -> Arc<Dispatcher> {
+    Arc::new(Dispatcher::with_services(
+        DispatchConfig::default(),
+        Arc::new(postgres_clock::PostgresClock),
+    ))
+}
+pub fn limits() -> Limits {
+    Limits {
+        descriptor_bytes: 16 << 20,
+        output_items: 4096,
+        output_bytes: 16 << 20,
+        decode_bytes: 32 << 20,
+    }
+}
+pub fn run<F: std::future::Future>(future: F) -> F::Output {
+    struct Wake(std::thread::Thread);
+    impl std::task::Wake for Wake {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Wake(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(answer) => return answer,
+            std::task::Poll::Pending => std::thread::park(),
+        }
+    }
+}
+pub const WRITER: [u8; 16] = [2; 16];
+pub fn address(namespace: u8, key: &[u8]) -> Address {
+    Address {
+        namespace: [namespace; 16],
+        key: key.to_vec(),
+    }
+}
+pub fn put(address: Address, bytes: &[u8]) -> Mutation {
+    Mutation::Put {
+        address,
+        value: busbar_contract::Secret::new(bytes.to_vec()),
+    }
+}
+pub fn prepare(
+    store: &LoadedPersistence,
+    operation: u128,
+    predicates: Vec<Predicate>,
+    mutations: Vec<Mutation>,
+) -> PreparedCandidate {
+    PreparedCandidate::new(Candidate {
+        id: AttemptId {
+            dataset: store.info().dataset,
+            writer_epoch: 1,
+            writer: WRITER,
+            execution_epoch: 1,
+            operation: operation.to_le_bytes(),
+        },
+        codec: CANDIDATE_VERSION,
+        predicates,
+        mutations,
+        time: None,
+        result: busbar_contract::Secret::new(b"original result".to_vec()),
+    })
+    .unwrap()
+}
+pub fn initialize(store: &LoadedPersistence) {
+    let root = Address {
+        namespace: control::NAMESPACE.0,
+        key: control::DATASET_KEY.to_vec(),
+    };
+    let writer = Address {
+        namespace: control::NAMESPACE.0,
+        key: control::writer_key(WRITER).to_vec(),
+    };
+    let candidate = prepare(
+        store,
+        1,
+        vec![
+            Predicate {
+                address: root.clone(),
+                expected: ExpectedValue::Absent,
+            },
+            Predicate {
+                address: writer.clone(),
+                expected: ExpectedValue::Absent,
+            },
+        ],
+        vec![
+            put(
+                root,
+                &control::Dataset {
+                    id: store.info().dataset,
+                    writer_epoch: 1,
+                }
+                .encode()
+                .unwrap(),
+            ),
+            put(
+                writer,
+                &control::Writer {
+                    retired_through: 0,
+                    admitted_through: 1,
+                }
+                .encode()
+                .unwrap(),
+            ),
+        ],
+    );
+    assert!(matches!(
+        run(store.commit(candidate)).unwrap(),
+        Decision::Applied(_)
+    ));
+}
+pub fn commit(
+    store: &LoadedPersistence,
+    operation: u128,
+    predicates: Vec<Predicate>,
+    mutations: Vec<Mutation>,
+) -> Decision {
+    run(store.commit(prepare(store, operation, predicates, mutations))).unwrap()
+}
+pub fn present(store: &LoadedPersistence, at: Address) -> bool {
+    match run(store.read(Arc::new(Read {
+        dataset: store.info().dataset,
+        addresses: vec![at],
+        time: None,
+    })))
+    .unwrap()
+    {
+        ReadResult::Values { mut values, .. } => values.pop().unwrap().is_some(),
+        _ => panic!("unconditional read has no time refusal"),
+    }
+}
+pub fn raw_value(url: &str, at: &Address) -> Option<Vec<u8>> {
+    postgres::Client::connect(url, postgres::NoTls)
+        .unwrap()
+        .query_opt(
+            "SELECT value FROM busbar_persistence_v4.records WHERE namespace=$1 AND key=$2",
+            &[&at.namespace.as_slice(), &at.key],
+        )
+        .unwrap()
+        .map(|row| row.get(0))
+}

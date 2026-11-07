@@ -11,8 +11,8 @@ impl HostServices for PostgresClock {
             mono_ns: busbar_plugin_loader::dispatch::now_ns(),
         }
     }
-    fn snapshot_read(&self, _caller: &Caller, _scope: u32) -> Snapshot {
-        Snapshot::Refused(UNSERVED)
+    fn snapshot_read(&self, _caller: &Caller, _scope: u32, _later: Later) -> Ran {
+        Ran::Now(Stored::refused(UNSERVED))
     }
     fn dest_judge(&self, dest: &str, class: u32, flags: u32, later: Option<Later>) -> Ran {
         Ran::Now(Stored::refused(UNSERVED))
@@ -48,8 +48,9 @@ impl HostServices for PostgresClock {
         counterparty: &str,
         item: &str,
         digest: &str,
-    ) -> Stored {
-        Stored::refused(UNSERVED)
+        _later: Later,
+    ) -> Ran {
+        Ran::Now(Stored::refused(UNSERVED))
     }
     fn trust_decide(
         &self,
@@ -57,8 +58,9 @@ impl HostServices for PostgresClock {
         key: TrustKeyRef<'_>,
         expected: Option<&str>,
         approve: bool,
-    ) -> Stored {
-        Stored::refused(UNSERVED)
+        _later: Later,
+    ) -> Ran {
+        Ran::Now(Stored::refused(UNSERVED))
     }
     fn trust_state(&self, caller: &Caller, counterparty: &str) -> Stored {
         Stored::refused(UNSERVED)
@@ -96,8 +98,9 @@ impl HostServices for PostgresClock {
         unit: Option<u64>,
         ttl_secs: u64,
         record: &[u8],
-    ) -> Stored {
-        Stored::refused(UNSERVED)
+        _later: Later,
+    ) -> Ran {
+        Ran::Now(Stored::refused(UNSERVED))
     }
     fn ticket_take(&self, caller: &Caller, unit: Option<u64>) -> Stored {
         Stored::refused(UNSERVED)

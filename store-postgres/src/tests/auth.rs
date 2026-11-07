@@ -15,8 +15,8 @@ use busbar_contract::conn::{
 };
 use busbar_contract::transport::ConnFacts;
 
+use super::open_loaded_over;
 use super::{fake_server, fatal, msg, read_frontend, read_startup, settings_of};
-use crate::tests::harness::open_loaded_over;
 use std::io::{Read, Write};
 use std::time::Duration;
 
@@ -176,7 +176,12 @@ fn loaded(settings: &str, fault: bool) -> (String, Arc<Counts>) {
             fault,
         })
     })
-    .expect_err("the scripted peer ends the connect with a refusal");
+    .err()
+    .expect("the scripted peer ends the connect with a refusal");
+    assert!(
+        error.contains("postgres v4 connection unavailable"),
+        "native errors remain content-free: {error}"
+    );
     (error, counts)
 }
 
@@ -205,9 +210,11 @@ fn cleartext_and_md5_frames_survive_partial_and_pending_host_writes() {
                 .write_all(&fatal("57P03", "authentication-complete"))
                 .unwrap();
         });
-        let settings = settings_of(&format!("host=127.0.0.1 port={port} user=wire-user password=sealed-wire-secret require_auth={method} connect_timeout=3"));
+        let settings = settings_of(&format!(
+            "host=127.0.0.1 port={port} user=wire-user password=sealed-wire-secret require_auth={method} connect_timeout=3"
+        ));
         let (error, counts) = loaded(&settings, false);
-        assert!(error.contains("57P03: authentication-complete"), "{error}");
+        assert!(!error.is_empty());
         assert!(!error.contains("sealed-wire-secret"));
         let (tag, body) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let mut expected = if method == "password" {
@@ -245,7 +252,7 @@ fn the_signed_default_floor_refuses_cleartext_and_md5_before_a_password_write() 
             "postgres://wire-user:sealed-wire-secret@127.0.0.1:{port}/db?connect_timeout=3"
         ));
         let (error, counts) = loaded(&settings, false);
-        assert!(error.contains("require_auth"), "{error}");
+        assert!(!error.is_empty());
         assert!(!error.contains("sealed-wire-secret"));
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
         assert_eq!(counts.pending.load(Ordering::Relaxed), 0);
@@ -267,13 +274,12 @@ fn a_partial_authentication_write_failure_discards_the_connection() {
         socket.read_to_end(&mut prefix).unwrap();
         tx.send(prefix).unwrap();
     });
-    let settings = settings_of(&format!("host=127.0.0.1 port={port} user=u password=sealed-wire-secret require_auth=password connect_timeout=3"));
+    let settings = settings_of(&format!(
+        "host=127.0.0.1 port={port} user=u password=sealed-wire-secret require_auth=password connect_timeout=3"
+    ));
     for _ in 0..2 {
         let (error, counts) = loaded(&settings, true);
-        assert!(
-            error.contains("error communicating with the server"),
-            "{error}"
-        );
+        assert!(!error.is_empty());
         assert!(counts.closed.load(Ordering::Relaxed) > 0);
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -331,7 +337,7 @@ fn scram_uses_a_fresh_nonce_and_rejects_an_invalid_server_verifier() {
     let mut nonces = Vec::new();
     for _ in 0..2 {
         let (error, counts) = loaded(&settings, false);
-        assert!(error.contains("SCRAM verification error"), "{error}");
+        assert!(!error.is_empty());
         assert!(!error.contains("must-not-be-reached"));
         assert!(counts.pending.load(Ordering::Relaxed) >= 2);
         assert!(counts.closed.load(Ordering::Relaxed) > 0);
@@ -376,10 +382,7 @@ fn malformed_scram_continue_and_wrong_authentication_stage_write_no_proof() {
             )),
             false,
         );
-        assert!(
-            error.contains("SCRAM") || error.contains("unexpected message during SASL"),
-            "{error}"
-        );
+        assert!(!error.is_empty());
         assert!(!error.contains("sealed-wire-secret"));
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
     }
@@ -419,10 +422,7 @@ fn valid_legacy_scram_iteration_counts_reach_the_proof_write() {
             )),
             false,
         );
-        assert!(
-            error.contains("the server refused SCRAM authentication"),
-            "{error}"
-        );
+        assert!(!error.is_empty());
         assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap());
     }
 }
@@ -447,7 +447,7 @@ fn startup_parameters_keep_their_public_wire_encoding_and_order() {
         "host=127.0.0.1 port={port} user=wire-user password=sealed-wire-secret dbname=db application_name=wire-app options='-c statement_timeout=7' connect_timeout=3"
     ));
     let (error, _) = loaded(&settings, false);
-    assert!(error.contains("57P03: startup-observed"), "{error}");
+    assert!(!error.is_empty());
     assert_eq!(
         rx.recv_timeout(Duration::from_secs(5)).unwrap(),
         b"\0\x03\0\0client_encoding\0UTF8\0user\0wire-user\0database\0db\0options\0-c statement_timeout=7\0application_name\0wire-app\0\0"
@@ -472,7 +472,7 @@ fn a_nul_password_is_refused_before_a_cleartext_frame_is_written() {
         )),
         false,
     );
-    assert!(error.contains("NUL"), "{error}");
+    assert!(!error.is_empty());
     assert!(!error.contains("before") && !error.contains("after"));
     assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 0);
 }
@@ -489,8 +489,5 @@ fn an_explicit_authentication_floor_can_refuse_an_unauthenticated_server() {
         )),
         false,
     );
-    assert!(
-        error.contains("require_auth does not allow authentication method none"),
-        "{error}"
-    );
+    assert!(!error.is_empty());
 }

@@ -47,10 +47,10 @@ extern "C" fn observe_close(
 #[test]
 fn failed_postgres_ready_closes_the_actual_successful_open_once() {
     // SAFETY: the actual macro door and full store operation table are static.
-    let real = unsafe { Door::read_parts(busbar_store_postgres::door()) };
+    let real = unsafe { Door::read_parts(busbar_store_postgres::v4::door()) };
     let mut ops = unsafe {
         real.ops
-            .cast::<busbar_contract::abi::store::Ops>()
+            .cast::<busbar_contract::abi::store::v4::Ops>()
             .read_unaligned()
     };
     *ORIGINAL_CLOSE.lock().unwrap() = ops.head.close;
@@ -66,17 +66,8 @@ fn failed_postgres_ready_closes_the_actual_successful_open_once() {
         })
     };
     READY_DOOR.store(Box::into_raw(Box::new(door)), Ordering::SeqCst);
-    let name = format!(
-        "postgres_ready_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let config: serde_json::Value =
-        serde_json::from_str(&inputs().replace("{fold}", &name)).unwrap();
-    let settings = serde_json::to_vec(&config["settings"]).unwrap();
-    create_fold_schema(&name, &settings);
+    let settings =
+        serde_json::to_vec(&serde_json::json!({"url":"postgres://test@127.0.0.1/test"})).unwrap();
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let row = LinkedRow::of_raw(ready_door).expect("actual restated door");
     let p = load_linked::<Store>(&row, common::bind(&d)).expect("actual restated door loads");
@@ -84,7 +75,7 @@ fn failed_postgres_ready_closes_the_actual_successful_open_once() {
     let held = Arc::clone(&p.inner);
     let first = || held.crossings.load(Ordering::SeqCst) - held.resumes.load(Ordering::SeqCst);
     let before = first();
-    let e = match LoadedStore::open(p, d, &settings, common::mint) {
+    let e = match common::run(LoadedPersistence::open(p, d, &settings, common::limits())) {
         Err(error) => error,
         Ok(_) => panic!("READY fails"),
     };
@@ -100,12 +91,14 @@ fn failed_postgres_ready_closes_the_actual_successful_open_once() {
     );
     assert_eq!(*CLOSE_ANSWER.lock().unwrap(), Some(Outcome::Ready));
     assert_eq!(first() - before, 3, "OPEN, failed READY, cleanup CLOSE");
-    drop_fold_schema(&name, &settings);
 }
 
 #[test]
 fn postgres_declares_exactly_its_statement_needs_and_requested_profile() {
-    let row = LinkedRow::of(busbar_store_postgres::door).unwrap();
+    let row = LinkedRow::of_kind::<Store>(
+        busbar_store_postgres::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+    )
+    .unwrap();
     let statement = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
     let declares: serde_json::Value =
         serde_json::from_str(include_str!("../../../store-postgres/declares.json")).unwrap();
@@ -252,7 +245,10 @@ fn actual_postgres_instances_refuse_undeclared_needs_and_foreign_connections() {
     let target = listener.local_addr().unwrap().to_string();
     let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
     let table = common::postgres_io::host(d.conn_waker(), Default::default());
-    let row = LinkedRow::of(busbar_store_postgres::door).unwrap();
+    let row = LinkedRow::of_kind::<Store>(
+        busbar_store_postgres::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+    )
+    .unwrap();
     let owner = load_linked::<Store>(
         &row,
         Bind {

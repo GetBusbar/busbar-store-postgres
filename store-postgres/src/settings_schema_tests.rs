@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Busbar Inc and contributors
 
-use busbar_contract::abi::sdk::store::StoreSlots;
-
 #[test]
 fn settings_schema_matches_lifecycle_shapes() {
     let schema: serde_json::Value =
@@ -29,12 +27,12 @@ fn settings_schema_matches_lifecycle_shapes() {
         let value: serde_json::Value = serde_json::from_str(text).expect("case JSON");
         assert_eq!(validator.is_valid(&value), accepted, "schema: {text}");
         assert_eq!(
-            <crate::PostgresStore as StoreSlots>::validate(text.as_bytes()).is_ok(),
+            crate::settings::parse(text.as_bytes(), &[]).is_ok(),
             accepted,
             "lifecycle: {text}"
         );
     }
-    assert!(!<crate::PostgresStore as StoreSlots>::validate(b"").is_ok());
+    assert!(!crate::settings::parse(b"", &[]).is_ok());
     // The schema describes the settings shape; the lifecycle also judges libpq semantics.
     for settings in [
         &br#"{"url":"postgres://localhost/busbar"}"#[..],
@@ -42,7 +40,7 @@ fn settings_schema_matches_lifecycle_shapes() {
         &br#"{"url":"postgres://schema_user@localhost/busbar?sslmode=bogus"}"#[..],
         &br#"{"url":"not a connection string"}"#[..],
     ] {
-        assert!(<crate::PostgresStore as StoreSlots>::validate(settings).is_err());
+        assert!(crate::settings::parse(settings, &[]).is_err());
     }
 }
 

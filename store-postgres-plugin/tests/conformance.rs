@@ -1,230 +1,132 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (C) 2026 Busbar Inc and contributors
-
-//! **ONE POSTGRES STORE, BOTH DOORS, ONE TABLE** — the store's linked + dropped-in conformance on
-//! the store kind's door (THE DESIGN §11), run against the busbar rev this repo pins
-//! (`.busbar-ref`).
-
+//! Native persistence conformance through the actual linked and dropped PostgreSQL doors.
 mod common;
-
 #[path = "support/door_refusals.rs"]
 mod door_refusals;
 #[path = "support/host_boundaries.rs"]
 mod host_boundaries;
 #[path = "support/store_contract.rs"]
 mod store_contract;
-
-/// The live server a fold's filled settings name, on a connection of the `postgres` driver's own.
-fn fold_client(settings: &[u8]) -> postgres::Client {
-    let v: serde_json::Value =
-        serde_json::from_slice(settings).expect("conformance.json's settings are JSON");
-    let url = v["url"]
-        .as_str()
-        .expect("conformance.json's settings name a url");
-
-    let url = url.replace("sslmode=require", "sslmode=disable");
-    postgres::Client::connect(&url, postgres::NoTls)
-        .expect("the live Postgres accepts the test client")
-}
-
-fn stamp_newer_schema(_: &str, settings: &[u8]) {
-    fold_client(settings)
-        .execute(
-            "INSERT INTO busbar_schema (version) VALUES ($1)",
-            &[&i64::MAX],
-        )
-        .expect("stamp a newer schema in the fold's private schema");
-}
-
-/// The suite's namespace hook: the fold's schema, made before its open.
-fn create_fold_schema(namespace: &str, settings: &[u8]) {
-    fold_client(settings)
-        .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{namespace}\""))
-        .expect("the fold's schema is created");
-}
-
-/// The suite's namespace hook: the fold's schema and everything the store made in it, dropped after
-/// the fold.
-fn drop_fold_schema(namespace: &str, settings: &[u8]) {
-    fold_client(settings)
-        .batch_execute(&format!("DROP SCHEMA IF EXISTS \"{namespace}\" CASCADE"))
-        .expect("the fold's schema is dropped");
-}
-
-use busbar_contract::records::{PlaneDisposition, PlaneRecord, PlaneSelector, RecordStore};
-use busbar_contract::store_calls::StoreCalls;
-use busbar_plugin_loader::dispatch::kinds::secret::Secret;
+use busbar_contract::persistence::*;
+use busbar_plugin_loader::dispatch::kinds::{secret::Secret, store_v4::StoreV4 as Store};
 use busbar_plugin_loader::dispatch::{
     load_dropped, load_linked, rendering_of_library, Bind, ConnTable, DispatchConfig, Dispatcher,
     LinkedRow, NoSink, Plugin,
 };
-use busbar_plugin_loader::store_v3::LoadedStore;
+use busbar_plugin_loader::store_v4::LoadedPersistence;
 use std::sync::Arc;
-
-/// The live Postgres, by this repo's one gate: set → `Some`; unset under CI → a FAILURE (the
-/// service container must provision it); unset locally → `None` (the durable scenario is skipped,
-/// everything else still runs).
-fn live_url() -> Option<String> {
-    match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
-        Ok(url) => Some(url),
-        Err(_) if std::env::var_os("CI").is_some() => panic!(
-            "BUSBAR_TEST_POSTGRES_URL is unset under CI: the Postgres service container must \
-             provision it. Refusing to skip the durable half of the both-doors conformance."
-        ),
-        Err(_) => {
-            eprintln!("skip (durable scenario only): set BUSBAR_TEST_POSTGRES_URL");
-            None
-        }
-    }
+type Loaded = (Plugin<Store>, Arc<Dispatcher>);
+fn linked() -> Loaded {
+    let d = common::dispatcher();
+    let row = LinkedRow::of_kind::<Store>(
+        busbar_store_postgres::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+    )
+    .unwrap();
+    (load_linked::<Store>(&row, common::bind(&d)).unwrap(), d)
 }
-
-/// One durable scenario through `store`, every id namespaced by `ns` so the two doors (and
-/// concurrent runs) never read each other's rows; the transcript names ids WITHOUT the namespace.
-fn scenario(store: &dyn RecordStore, ns: &str) -> serde_json::Value {
-    let kind = "conformance_task";
-    let child = "conformance_event";
-    let id = format!("{ns}-task");
-    let rec = |kind: &str, id: String, parent: Option<String>, seq: u64, body: &str| PlaneRecord {
-        kind: kind.into(),
-        id,
-        parent,
-        seq,
-        ts: 1_700_000_000 + seq,
-        disposition: PlaneDisposition::Active,
-        body: body.as_bytes().to_vec(),
+fn dropped(lib: &std::path::Path, stated: &[u8]) -> Loaded {
+    let d = common::dispatcher();
+    (
+        load_dropped::<Store>(lib, stated, common::bind(&d)).unwrap(),
+        d,
+    )
+}
+fn cdylib() -> std::path::PathBuf {
+    common::plugin_path()
+}
+fn packed_rendering(lib: &std::path::Path) -> Vec<u8> {
+    rendering_of_library(lib).unwrap().unwrap()
+}
+fn open(load: Loaded, settings: &[u8]) -> Result<LoadedPersistence, String> {
+    common::run(LoadedPersistence::open(
+        load.0,
+        load.1,
+        settings,
+        common::limits(),
+    ))
+}
+fn scenario(store: &LoadedPersistence, url: &str) -> serde_json::Value {
+    common::initialize(store);
+    let at = common::address(9, b"opaque-value");
+    assert!(matches!(
+        common::commit(store, 2, vec![], vec![common::put(at.clone(), b"v1")]),
+        Decision::Applied(_)
+    ));
+    let exact = Predicate {
+        address: at.clone(),
+        expected: ExpectedValue::Exact(busbar_contract::Secret::new(b"v1".to_vec())),
     };
-    let text = |b: Option<Vec<u8>>| b.map(|b| String::from_utf8_lossy(&b).into_owned());
-    store
-        .upsert_plane_record(rec(kind, id.clone(), None, 0, "v1").view())
-        .expect("upsert");
-    store
-        .upsert_plane_record(rec(kind, id.clone(), None, 0, "v2").view())
-        .expect("upsert over");
-    let got = text(store.get_plane_record(kind, &id).expect("get"));
-    for seq in 1..=2 {
-        store
-            .append_plane_record(
-                rec(
-                    child,
-                    format!("{ns}-e{seq}"),
-                    Some(id.clone()),
-                    seq,
-                    &format!("event {seq}"),
-                )
-                .view(),
-            )
-            .expect("append");
-    }
-    let chain: Vec<String> = store
-        .list_plane_records(child, &PlaneSelector::Parent(id.clone().into()))
-        .expect("list")
-        .into_iter()
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .collect();
-    let token = format!("{ns}-token");
-    let first = store
-        .redeem_plane_token("conformance_token", &token, u64::MAX, 1_900_000_000)
-        .expect("redeem");
-    let second = store
-        .redeem_plane_token("conformance_token", &token, u64::MAX, 1_900_000_000)
-        .expect("redeem again");
-    store.delete_plane_record(kind, &id).expect("delete");
-
-    store
-        .delete_plane_record(child, &id)
-        .expect("delete the event chain");
-    let gone = text(store.get_plane_record(kind, &id).expect("get after delete"));
-    serde_json::json!({
-        "after_upsert": got,
-        "chain": chain,
-        "redeemed": [first, second],
-        "after_delete": gone,
-    })
+    assert!(matches!(
+        common::commit(store, 3, vec![exact], vec![common::put(at.clone(), b"v2")]),
+        Decision::Applied(_)
+    ));
+    assert!(common::present(store, at.clone()));
+    let raw = common::raw_value(url, &at).unwrap();
+    let scanned = common::run(store.scan(Arc::new(Scan {
+        dataset: store.info().dataset,
+        namespace: NamespaceId(at.namespace),
+        prefix: vec![],
+        after: None,
+        generation: None,
+        max_items: 10,
+        max_bytes: 4096,
+        allow_change: true,
+    })))
+    .unwrap();
+    assert_eq!(scanned.rows.len(), 1);
+    assert!(scanned.next.is_none());
+    let first = common::commit(
+        store,
+        4,
+        vec![Predicate {
+            address: common::address(9, b"once"),
+            expected: ExpectedValue::Absent,
+        }],
+        vec![common::put(common::address(9, b"once"), b"spent")],
+    );
+    let second = common::commit(
+        store,
+        5,
+        vec![Predicate {
+            address: common::address(9, b"once"),
+            expected: ExpectedValue::Absent,
+        }],
+        vec![common::put(common::address(9, b"once"), b"spent")],
+    );
+    assert!(matches!(first, Decision::Applied(_)));
+    assert!(matches!(second, Decision::ConditionConflict));
+    assert!(matches!(
+        common::commit(store, 6, vec![], vec![Mutation::Delete(at.clone())]),
+        Decision::Applied(_)
+    ));
+    assert!(!common::present(store, at));
+    serde_json::json!({"after_upsert":String::from_utf8(raw).unwrap(),"first_claim":true,"second_claim":false,"after_delete":null,"scan_rows":scanned.rows.len()})
 }
-
-/// What one door does with the store, as one comparable transcript.
 fn transcript(
-    tag: &str,
-    open: &dyn Fn(&str) -> Result<LoadedStore, String>,
+    open: &dyn Fn(&str) -> Result<LoadedPersistence, String>,
     live: Option<&str>,
 ) -> serde_json::Value {
-    let refusals: Vec<String> = [
-        "",
-        "{}",
-        "{ not json",
-        r#"{"url": 5}"#,
-        r#"{"url": "host=127.0.0.1 port=1 user=conf password=s3cret-conf dbname=x connect_timeout=2"}"#,
-    ]
-    .iter()
-    .map(|cfg| match open(cfg) {
-        Ok(_) => format!("opened with {cfg:?}"),
-        Err(e) => e,
-    })
-    .collect();
+    let refusals:Vec<_>=["","{}","{ not json",r#"{"url":5}"#,r#"{"url":"host=127.0.0.1 port=1 user=conf password=s3cret-conf dbname=x connect_timeout=2"}"#].iter().map(|s|open(s).expect_err("invalid settings refused")).collect();
+    assert!(refusals[..4]
+        .iter()
+        .all(|s| s.contains("invalid postgres plugin config")));
+    assert!(!refusals[4].contains("s3cret-conf"));
     let durable = live.map(|url| {
-        let cfg = serde_json::json!({ "url": url }).to_string();
-        let store = open(&cfg).expect("the store opens");
-        let ns = format!("conf-{}-{tag}", std::process::id());
-        scenario(&store, &ns)
+        let database = common::temp_db::TempDb::create(url, "pg_transcript");
+        let url = database.url();
+        let store = open(&serde_json::json!({"url":url}).to_string()).unwrap();
+        scenario(&store, &url)
     });
-    serde_json::json!({
-        "refusals": refusals,
-        "durable": durable,
-    })
+    serde_json::json!({"refusals":refusals,"durable":durable})
 }
-
-/// The Postgres store behaves as ONE store through either door; the RED arms below show the
-/// comparison is not vacuous.
 #[test]
 fn the_linked_and_the_dropped_in_postgres_store_are_one_store() {
-    let live = live_url();
-
-    let linked = transcript("linked", &common::linked, live.as_deref());
-    let dropped_in = transcript("dropped", &common::dropped, live.as_deref());
-    assert_eq!(linked, dropped_in, "the two doors are not one store");
-
-    let refusals = linked["refusals"].as_array().unwrap();
+    let live = common::postgres_url();
     assert_eq!(
-        refusals[0],
-        "plugin 'busbar-store-postgres' open failed: invalid postgres plugin config: `url` is \
-         required (a libpq connection string)"
+        transcript(&common::linked, live.as_deref()),
+        transcript(&common::dropped, live.as_deref())
     );
-    assert_eq!(refusals[1], refusals[0]);
-    assert!(
-        refusals[2].as_str().unwrap().starts_with(
-            "plugin 'busbar-store-postgres' open failed: invalid postgres plugin config:"
-        ),
-        "{refusals:?}"
-    );
-    assert_eq!(
-        refusals[3],
-        "plugin 'busbar-store-postgres' open failed: invalid postgres plugin config: url: \
-         settings: invalid type: integer `***`, expected a string",
-        "a present non-string url says so"
-    );
-    let unreachable = refusals[4].as_str().unwrap();
-    assert!(
-        unreachable.contains("postgres store: failed to connect: ")
-            && unreachable.contains("error connecting to server"),
-        "the unreachable server is refused as a connect failure: {unreachable}"
-    );
-    assert!(
-        !unreachable.contains("s3cret-conf"),
-        "the refusal never echoes the DSN password: {unreachable}"
-    );
-    if live.is_some() {
-        assert_eq!(
-            linked["durable"],
-            serde_json::json!({
-                "after_upsert": "v2",
-                "chain": ["event 1", "event 2"],
-                "redeemed": [true, false],
-                "after_delete": null,
-            })
-        );
-    }
 }
-
 /// RED: DIFFERENT bytes (the object's magic broken) are not the store. The foreign image is
 /// written under its own directory, so the loader `dlopen`s a path no good image was ever loaded
 /// from, whatever order the tests in this target run in.
@@ -267,93 +169,23 @@ fn the_postgres_store_library_loaded_as_another_kind_is_refused() {
     );
 }
 
-use busbar_contract::abi::store::OpId;
-use busbar_contract::kinds::RecordBytes;
-use busbar_contract::records::{UsageDelta, VirtualKey};
-use busbar_plugin_loader::dispatch::kinds::store::Store;
-type Loaded = (Plugin<Store>, Arc<Dispatcher>);
-fn linked() -> Loaded {
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
-    let row = LinkedRow::of(busbar_store_postgres::door).expect("Postgres statement");
-    let p = load_linked::<Store>(&row, common::bind(&d)).expect("linked Postgres loads");
-    (p, d)
-}
-fn dropped(lib: &std::path::Path, stated: &[u8]) -> Loaded {
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
-    let p = load_dropped::<Store>(lib, stated, common::bind(&d)).expect("dropped Postgres loads");
-    (p, d)
-}
-fn cdylib() -> std::path::PathBuf {
-    common::plugin_path()
-}
-fn packed_rendering(lib: &std::path::Path) -> Vec<u8> {
-    rendering_of_library(lib)
-        .expect("library rendering")
-        .expect("door exists")
-}
-fn inputs() -> String {
-    let url = match std::env::var("BUSBAR_TEST_POSTGRES_URL") {
-        Ok(url) => url,
-        Err(_) if std::env::var_os("CI").is_some() => {
-            panic!("BUSBAR_TEST_POSTGRES_URL must name CI's provisioned Postgres service")
-        }
-        Err(_) => "postgres://busbar:busbar@localhost:5432/busbar_test".into(),
-    };
-    let separator = if url.contains('?') { '&' } else { '?' };
-    let mut config: serde_json::Value =
-        serde_json::from_str(include_str!("conformance.json")).unwrap();
-    config["settings"]["url"] = serde_json::json!(format!(
-        "{url}{separator}options=-c%20search_path%3D{{fold}}"
-    ));
-    config.to_string()
-}
-
-/// A mandatory live fixture and the actual own-image path exercise only the lifecycle,
-/// independently of the full semantic transcript.
 #[test]
 fn fresh_linked_and_dropped_images_open_ready_read_and_close() {
-    let url = std::env::var("BUSBAR_TEST_POSTGRES_URL")
-        .expect("BUSBAR_TEST_POSTGRES_URL must name the owned live Postgres fixture; no skip");
-    assert!(
-        !url.trim().is_empty(),
-        "the owned Postgres fixture URL is empty"
-    );
-    let image = common::plugin_path();
-    let stated = common::stated();
-    let settings = serde_json::json!({ "url": url }).to_string();
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("host clock")
-        .as_nanos();
-    let runtime = tokio::runtime::Runtime::new().expect("lifecycle read runtime");
-    for door in ["linked", "dropped"] {
-        let (plugin, dispatcher) = if door == "linked" {
-            linked()
-        } else {
-            dropped(&image, &stated)
-        };
-        let store = LoadedStore::open(
-            plugin,
-            Arc::clone(&dispatcher),
-            settings.as_bytes(),
-            common::mint,
+    let admin = common::postgres_url().expect("owned live PostgreSQL fixture required");
+    for use_dropped in [false, true] {
+        let database = common::temp_db::TempDb::create(&admin, "pg_lifecycle");
+        let settings = serde_json::to_vec(&serde_json::json!({"url":database.url()})).unwrap();
+        let store = open(
+            if use_dropped {
+                dropped(&cdylib(), &common::stated())
+            } else {
+                linked()
+            },
+            &settings,
         )
-        .expect("actual Postgres image opens on the owned live fixture");
-        store
-            .plugin()
-            .ready(&dispatcher, std::time::Duration::from_secs(30))
-            .expect("actual Postgres image becomes ready");
-        let namespace = format!("lifecycle-{}-{nonce}-{door}", std::process::id());
-        assert_eq!(
-            runtime
-                .block_on(store.record_get(&namespace, b"absent"))
-                .expect("one benign read"),
-            None,
-            "a new lifecycle namespace has no record"
-        );
-        // LoadedStore::drop invokes the loader's close lifecycle slot while the
-        // dispatcher and the actual library remain alive.
+        .unwrap();
+        common::run(store.clock(store.info().dataset)).unwrap();
+        assert!(!common::present(&store, common::address(9, b"absent")));
         drop(store);
-        drop(dispatcher);
     }
 }
