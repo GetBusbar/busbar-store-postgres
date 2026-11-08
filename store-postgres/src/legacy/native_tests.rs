@@ -34,7 +34,9 @@ impl Backend for Probe {
     fn open(
         settings: &[u8],
         _: &[&[u8]],
-        _: Option<busbar_contract::abi::sdk::conn::Host>,
+        _: Option<
+            busbar_contract::abi::sdk::conn::Host<busbar_contract::plugin::markers::StoreKind>,
+        >,
     ) -> Result<Self, String> {
         Ok(Self {
             settings: Zeroizing::new(settings.to_vec()),
@@ -158,7 +160,7 @@ impl Backend for Probe {
                         if table.name == "store_records" {
                             assert_eq!(decoded.cells().nth(2), Some(Cell::Blob(&[0, 255, 0])));
                         }
-                        observed.push((row.table, row.ordinal));
+                        observed.push((row.table, row._ordinal));
                     }
                     pages += 1;
                     if page.exhausted {
@@ -228,6 +230,7 @@ fn probe(url: &str, case: &str) {
     let dispatcher = Arc::new(Dispatcher::with_services(
         DispatchConfig::default(),
         Arc::new(crate::tests::postgres_clock::PostgresClock),
+        busbar_contract::services::test_caller_binding(),
     ));
     let conns = crate::tests::postgres_io::host(dispatcher.conn_waker(), Default::default());
     let row = LinkedRow::of_kind::<StoreV4>(door as busbar_contract::abi::mechanism::door::DoorFn)

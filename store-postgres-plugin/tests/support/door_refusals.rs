@@ -13,7 +13,7 @@ extern "C" fn mutated() -> *const Door {
     MUTATED.load(Ordering::SeqCst)
 }
 extern "C" fn real() -> *const Door {
-    busbar_store_postgres::v4::door()
+    busbar_store_postgres::door()
 }
 // Used by one sequential test only. The real table and all newly allocated metadata remain static.
 fn restate(parts: DoorParts) {
@@ -32,8 +32,11 @@ fn incompatible_metadata_is_refused_before_any_store_slot_runs() {
     let (honest, d) = dropped(&lib, &stated);
     drop(honest);
     drop(d);
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
-    let original = busbar_store_postgres::v4::door().parts();
+    let d = Arc::new(Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    ));
+    let original = busbar_store_postgres::door().parts();
     let kind = KindCode::Store;
     let abi = kind.abi_version();
     assert_eq!(original.kind_abi, abi);
@@ -143,10 +146,13 @@ fn wrong<K: Kind>() {
     let lib = cdylib();
     let stated = packed_rendering(&lib);
     let row = LinkedRow::of_kind::<Store>(
-        busbar_store_postgres::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+        busbar_store_postgres::door as busbar_contract::abi::mechanism::door::DoorFn,
     )
     .unwrap();
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let d = Arc::new(Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    ));
     let want = Some(LoadError::ManifestKind {
         stated: KindCode::Store,
         want: K::CODE,
@@ -174,7 +180,7 @@ fn networked_store_requires_a_connection_table_and_can_be_probed() {
     let lib = cdylib();
     let stated = packed_rendering(&lib);
     let row = LinkedRow::of_kind::<Store>(
-        busbar_store_postgres::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+        busbar_store_postgres::door as busbar_contract::abi::mechanism::door::DoorFn,
     )
     .unwrap();
     let facts = rendering::read(&stated).unwrap();
@@ -182,7 +188,10 @@ fn networked_store_requires_a_connection_table_and_can_be_probed() {
         plugin: facts.name.clone(),
         needs: facts.needs.len(),
     };
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let d = Arc::new(Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    ));
     let bind = || Bind {
         conns: ConnTable::NoNeeds,
         ..common::bind(&d)

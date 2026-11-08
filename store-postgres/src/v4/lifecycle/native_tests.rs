@@ -19,6 +19,7 @@ fn prepared(url: &str) -> LoadedPrepared {
     let dispatcher = Arc::new(Dispatcher::with_services(
         DispatchConfig::default(),
         Arc::new(postgres_clock::PostgresClock),
+        busbar_contract::services::test_caller_binding(),
     ));
     let conns = postgres_io::host(dispatcher.conn_waker(), Default::default());
     let row = LinkedRow::of_kind::<StoreV4>(

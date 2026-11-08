@@ -6,6 +6,7 @@
 //! must discard its connection, never continue this reader on a replacement.
 
 use crate::{pgwire, Session};
+#[cfg(test)]
 use busbar_contract::abi::sdk::store::wire::Wire;
 use busbar_contract::persistence::legacy_row::{self, Cell};
 use busbar_contract::redacted::{OwnerSeal, Secret};
@@ -87,6 +88,7 @@ pub struct Catalogue {
 
 /// A position is valid only in the owning live reader; it is never a restart
 /// cursor. Restart requires a newly verified source snapshot and coordinator plan.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cursor {
     pub table: usize,
@@ -95,16 +97,17 @@ pub struct Cursor {
 #[derive(Debug)]
 pub struct SourceRow<O> {
     pub table: usize,
-    pub ordinal: u64,
+    pub _ordinal: u64,
     /// Exact native heap tuple identity, scoped by table and live snapshot.
     pub native_key: Vec<u8>,
     pub bytes: Secret<Vec<u8>, O>,
     encoded_len: usize,
 }
+#[cfg(test)]
 #[derive(Debug)]
 pub struct Page<O> {
     pub rows: Vec<SourceRow<O>>,
-    pub next: Cursor,
+    pub _next: Cursor,
     pub exhausted: bool,
 }
 
@@ -113,15 +116,20 @@ pub struct Page<O> {
 pub struct Reader<O: OwnerSeal> {
     session: Option<Session>,
     catalogue: Catalogue,
+    #[cfg(test)]
     limits: Limits,
+    #[cfg(test)]
     cursor: Cursor,
+    #[cfg(test)]
     declared: bool,
+    #[cfg(test)]
     exhausted: bool,
     pending: Option<SourceRow<O>>,
 }
 impl<O: OwnerSeal> Reader<O> {
     /// Parse connection settings without invoking normal OPEN/migrate. The wire
     /// must be provided by the host's existing declared connection machinery.
+    #[cfg(test)]
     pub async fn open(
         wire: Wire,
         settings: &[u8],
@@ -150,9 +158,13 @@ impl<O: OwnerSeal> Reader<O> {
         Ok(Self {
             session: Some(session),
             catalogue,
+            #[cfg(test)]
             limits,
+            #[cfg(test)]
             cursor: Cursor { table: 0, row: 0 },
+            #[cfg(test)]
             declared: false,
+            #[cfg(test)]
             exhausted: false,
             pending: None,
         })
@@ -165,15 +177,19 @@ impl<O: OwnerSeal> Reader<O> {
         identity: Vec<u8>,
         guard: Option<u32>,
     ) -> Result<Self, Error> {
-        let limits = limits.validate()?;
+        limits.validate()?;
         session.client().batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL search_path=pg_catalog; SET LOCAL statement_timeout='30s'; SET LOCAL lock_timeout='5s'; SET LOCAL row_security=off; SET LOCAL max_parallel_workers_per_gather=0; SET LOCAL work_mem='1MB'").await.map_err(db)?;
         let catalogue = identify_native(&mut session, Some(identity), guard).await?;
         Ok(Self {
             session: Some(session),
             catalogue,
+            #[cfg(test)]
             limits,
+            #[cfg(test)]
             cursor: Cursor { table: 0, row: 0 },
+            #[cfg(test)]
             declared: false,
+            #[cfg(test)]
             exhausted: false,
             pending: None,
         })
@@ -194,16 +210,18 @@ impl<O: OwnerSeal> Reader<O> {
     pub fn catalogue(&self) -> &Catalogue {
         &self.catalogue
     }
+    #[cfg(test)]
     pub fn cursor(&self) -> Cursor {
         self.pending.as_ref().map_or(self.cursor, |row| Cursor {
             table: row.table,
-            row: row.ordinal,
+            row: row._ordinal,
         })
     }
 
     /// Return bounded rows in table-name / native cursor order. Physical
     /// order is stable within this held snapshot, including duplicate logical
     /// metering identities in historical schemas without a primary key.
+    #[cfg(test)]
     pub async fn page(&mut self) -> Result<Page<O>, Error> {
         if self.session.is_none() {
             return Err(Error::Closed);
@@ -218,6 +236,7 @@ impl<O: OwnerSeal> Reader<O> {
         }
         result
     }
+    #[cfg(test)]
     async fn page_inner(&mut self) -> Result<Page<O>, Error> {
         let mut rows = Vec::new();
         let mut size = 0usize;
@@ -240,10 +259,11 @@ impl<O: OwnerSeal> Reader<O> {
         }
         Ok(Page {
             rows,
-            next: self.cursor(),
+            _next: self.cursor(),
             exhausted: self.exhausted && self.pending.is_none(),
         })
     }
+    #[cfg(test)]
     async fn fetch(&mut self) -> Result<Option<SourceRow<O>>, Error> {
         while self.cursor.table < self.catalogue.tables.len() {
             let table = &self.catalogue.tables[self.cursor.table];
@@ -356,6 +376,7 @@ impl<O: OwnerSeal> Reader<O> {
         Ok((rows, exhausted))
     }
     /// Release snapshot and host connection. No source mutation is performed.
+    #[cfg(test)]
     pub async fn close(mut self) -> Result<(), Error> {
         self.pending = None;
         if let Some(mut session) = self.session.take() {
@@ -405,7 +426,7 @@ fn decode_native_row<O: OwnerSeal>(
         + native_key.len();
     Ok(SourceRow {
         table: table_index,
-        ordinal,
+        _ordinal: ordinal,
         native_key,
         bytes,
         encoded_len,
@@ -622,6 +643,7 @@ fn expected(version: i64, upgraded: bool) -> Vec<Table> {
         .collect()
 }
 
+#[cfg(test)]
 async fn identify(session: &mut Session) -> Result<Catalogue, Error> {
     identify_native(session, None, None).await
 }

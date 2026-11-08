@@ -19,7 +19,7 @@ type Loaded = (Plugin<Store>, Arc<Dispatcher>);
 fn linked() -> Loaded {
     let d = common::dispatcher();
     let row = LinkedRow::of_kind::<Store>(
-        busbar_store_postgres::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+        busbar_store_postgres::door as busbar_contract::abi::mechanism::door::DoorFn,
     )
     .unwrap();
     (load_linked::<Store>(&row, common::bind(&d)).unwrap(), d)
@@ -155,7 +155,10 @@ fn foreign_bytes_dropped_in_are_not_the_postgres_store() {
 #[test]
 fn the_postgres_store_library_loaded_as_another_kind_is_refused() {
     let lib = common::plugin_path();
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let d = Arc::new(Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    ));
     let bind = Bind {
         instance: Arc::from("store-postgres-as-secret"),
         max_inflight_cap: 64,

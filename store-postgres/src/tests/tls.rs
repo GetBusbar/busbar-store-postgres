@@ -497,8 +497,7 @@ fn startup_options(dsn_query: &str) -> String {
     let e = open_loaded(&settings_of(&format!(
         "postgres://u:zq9pw@127.0.0.1:{port}/d{dsn_query}"
     )))
-    .err()
-    .expect("the fake server refuses the startup");
+    .expect_err("the fake server refuses the startup");
     assert!(e.contains("3D000"), "{e}");
     let got = seen.lock().unwrap().clone();
     got
@@ -535,8 +534,7 @@ fn plaintext_after_the_servers_s_is_refused_before_the_upgrade() {
     let e = open_loaded_over(&settings, |d| {
         trusting_host(d.conn_waker(), &ca_der, None, false)
     })
-    .err()
-    .expect("a server that injects plaintext is refused");
+    .expect_err("a server that injects plaintext is refused");
     assert!(!e.is_empty());
 }
 
@@ -556,8 +554,7 @@ fn a_server_that_declines_tls_fails_the_open() {
     let e = open_loaded(&settings_of(&format!(
         "postgres://u:zq9pw@127.0.0.1:{port}/d?sslmode=require"
     )))
-    .err()
-    .expect("no TLS, no connection");
+    .expect_err("no TLS, no connection");
     assert!(!e.is_empty());
 }
 
@@ -575,8 +572,7 @@ fn prefer_continues_in_plaintext_when_the_server_answers_n() {
     let e = open_loaded(&settings_of(&format!(
         "postgres://u:zq9pw@127.0.0.1:{port}/d?sslmode=prefer"
     )))
-    .err()
-    .expect("the fake server refuses the startup");
+    .expect_err("the fake server refuses the startup");
     assert!(!e.is_empty());
 }
 
@@ -597,8 +593,7 @@ fn allow_sends_no_sslrequest() {
     let e = open_loaded(&settings_of(&format!(
         "postgres://u:zq9pw@127.0.0.1:{port}/d?sslmode=allow"
     )))
-    .err()
-    .expect("the fake server refuses the startup");
+    .expect_err("the fake server refuses the startup");
     assert!(!e.is_empty());
     assert_eq!(
         first.load(Ordering::SeqCst),
@@ -635,8 +630,7 @@ fn an_oversized_declared_message_length_is_refused() {
         Duration::from_secs(4),
     )
     .expect("the open returned promptly")
-    .err()
-    .expect("not a Postgres server");
+    .expect_err("not a Postgres server");
     assert!(!e.is_empty());
     assert!(started.elapsed() < Duration::from_secs(4));
 }
@@ -656,8 +650,7 @@ fn an_oversized_authentication_frame_is_refused_at_its_header() {
         Duration::from_secs(1),
     )
     .expect("header rejected promptly")
-    .err()
-    .expect("oversized auth frame");
+    .expect_err("oversized auth frame");
     assert!(!error.is_empty());
 }
 
@@ -670,9 +663,7 @@ fn a_quoted_password_with_an_escaped_quote_is_scrubbed_whole() {
     });
     let dsn =
         format!("host=127.0.0.1 port={port} user=u dbname=d password='it\\'s tail-of-secret'");
-    let e = open_loaded(&settings_of(&dsn))
-        .err()
-        .expect("the server refuses");
+    let e = open_loaded(&settings_of(&dsn)).expect_err("the server refuses");
     assert!(!e.is_empty());
     assert!(
         !e.contains("tail-of-secret") && !e.contains("it's"),
@@ -689,9 +680,7 @@ fn connect_timeout_bounds_a_server_that_never_answers() {
     ));
     let got = open_within(settings, Duration::from_secs(20))
         .expect("the open returned: connect_timeout bounds the handshake");
-    let e = got
-        .err()
-        .expect("a silent server never completes the handshake");
+    let e = got.expect_err("a silent server never completes the handshake");
     let took = started.elapsed();
     assert!(!e.is_empty());
     assert!(
@@ -716,8 +705,7 @@ fn a_fatal_then_eof_on_a_simple_query_refuses_the_native_open() {
     let e = open_loaded(&settings_of(&format!(
         "postgres://u:zq9pw@127.0.0.1:{port}/d"
     )))
-    .err()
-    .expect("the server shut the session down");
+    .expect_err("the server shut the session down");
     assert!(!e.is_empty());
 }
 
@@ -750,8 +738,7 @@ fn a_fatal_then_eof_on_a_parse_refuses_the_native_open() {
     let e = open_loaded(&settings_of(&format!(
         "postgres://u:zq9pw@127.0.0.1:{port}/d"
     )))
-    .err()
-    .expect("the server shut the session down");
+    .expect_err("the server shut the session down");
     assert!(!e.is_empty());
 }
 
@@ -788,8 +775,7 @@ fn the_oracle_url_options_cell_preserves_startup_bytes_and_refuses() {
     );
     let e = open_within(settings_of(&url), Duration::from_secs(20))
         .expect("the open finished")
-        .err()
-        .expect("the server refused the startup");
+        .expect_err("the server refused the startup");
     assert!(!e.is_empty());
     let want: Vec<(String, String)> = [
         ("client_encoding", "UTF8"),
@@ -822,8 +808,7 @@ fn an_oversized_parameter_description_is_refused_at_its_header() {
         Duration::from_secs(1),
     )
     .expect("header rejected promptly")
-    .err()
-    .expect("oversized parameter description");
+    .expect_err("oversized parameter description");
     assert!(!error.is_empty());
 }
 

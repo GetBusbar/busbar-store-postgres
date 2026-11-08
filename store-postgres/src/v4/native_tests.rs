@@ -46,6 +46,7 @@ pub(super) fn open_over(
     let dispatcher = Arc::new(Dispatcher::with_services(
         DispatchConfig::default(),
         Arc::new(postgres_clock::PostgresClock),
+        busbar_contract::services::test_caller_binding(),
     ));
     let conns = host(&dispatcher);
     let row =

@@ -47,7 +47,7 @@ extern "C" fn observe_close(
 #[test]
 fn failed_postgres_ready_closes_the_actual_successful_open_once() {
     // SAFETY: the actual macro door and full store operation table are static.
-    let real = unsafe { Door::read_parts(busbar_store_postgres::v4::door()) };
+    let real = busbar_store_postgres::door().parts();
     let mut ops = unsafe {
         real.ops
             .cast::<busbar_contract::abi::store::v4::Ops>()
@@ -68,12 +68,18 @@ fn failed_postgres_ready_closes_the_actual_successful_open_once() {
     READY_DOOR.store(Box::into_raw(Box::new(door)), Ordering::SeqCst);
     let settings =
         serde_json::to_vec(&serde_json::json!({"url":"postgres://test@127.0.0.1/test"})).unwrap();
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let d = Arc::new(Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    ));
     let row = LinkedRow::of_raw(ready_door).expect("actual restated door");
     let p = load_linked::<Store>(&row, common::bind(&d)).expect("actual restated door loads");
     let plugin_name = p.name().to_string();
-    let held = Arc::clone(&p.inner);
-    let first = || held.crossings.load(Ordering::SeqCst) - held.resumes.load(Ordering::SeqCst);
+    let held = p.test_invocation_probe();
+    let first = || {
+        let (crossings, resumes) = held();
+        crossings - resumes
+    };
     let before = first();
     let e = match common::run(LoadedPersistence::open(p, d, &settings, common::limits())) {
         Err(error) => error,
@@ -96,7 +102,7 @@ fn failed_postgres_ready_closes_the_actual_successful_open_once() {
 #[test]
 fn postgres_declares_exactly_its_statement_needs_and_requested_profile() {
     let row = LinkedRow::of_kind::<Store>(
-        busbar_store_postgres::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+        busbar_store_postgres::door as busbar_contract::abi::mechanism::door::DoorFn,
     )
     .unwrap();
     let statement = busbar_contract::abi::mechanism::rendering::read(&row.statement).unwrap();
@@ -182,7 +188,7 @@ fn establish(p: &Plugin<Store>, need: u32, target: &str) -> (Outcome, u64, Strin
     // SAFETY: the local input, exclusive output, nested buffers and strings live through this crossing.
     let raw = unsafe {
         f(
-            p.inner.ctx(),
+            p.test_host_context(),
             std::ptr::from_ref(&i).cast::<c_void>(),
             &mut o,
         )
@@ -209,7 +215,7 @@ fn io(p: &Plugin<Store>, stream: u64, write: bool) -> (Outcome, u64, String) {
     loop {
         let raw = unsafe {
             f.expect("the host offers READ and WRITE")(
-                p.inner.ctx(),
+                p.test_host_context(),
                 std::ptr::from_ref(&i).cast::<c_void>(),
                 &mut o,
             )
@@ -231,7 +237,7 @@ fn close_stream(p: &Plugin<Store>, stream: u64) -> (Outcome, u64, String) {
     // SAFETY: the local input, exclusive output, nested buffers and strings live through this crossing.
     let raw = unsafe {
         CONN_SLOTS.close.expect("the host offers CLOSE")(
-            p.inner.ctx(),
+            p.test_host_context(),
             std::ptr::from_ref(&i).cast::<c_void>(),
             &mut o,
         )
@@ -243,10 +249,13 @@ fn close_stream(p: &Plugin<Store>, stream: u64) -> (Outcome, u64, String) {
 fn actual_postgres_instances_refuse_undeclared_needs_and_foreign_connections() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let target = listener.local_addr().unwrap().to_string();
-    let d = Arc::new(Dispatcher::new(DispatchConfig::default()));
+    let d = Arc::new(Dispatcher::new(
+        DispatchConfig::default(),
+        busbar_contract::services::test_caller_binding(),
+    ));
     let table = common::postgres_io::host(d.conn_waker(), Default::default());
     let row = LinkedRow::of_kind::<Store>(
-        busbar_store_postgres::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+        busbar_store_postgres::door as busbar_contract::abi::mechanism::door::DoorFn,
     )
     .unwrap();
     let owner = load_linked::<Store>(

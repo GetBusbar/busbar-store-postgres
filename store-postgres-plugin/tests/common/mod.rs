@@ -31,7 +31,7 @@ pub fn cdylib() -> PathBuf {
 /// The Statement rendering the signed manifest states: the linked door's own (the cdylib is the
 /// same crate).
 pub fn stated() -> Vec<u8> {
-    rendering_of(busbar_store_postgres::v4::door).expect("the store renders its Statement")
+    rendering_of(busbar_store_postgres::door).expect("the store renders its Statement")
 }
 
 /// The instance's binding: its connections over the loader's test connection table (plain TCP),
@@ -50,7 +50,7 @@ pub fn bind(d: &Dispatcher) -> Bind {
 pub fn linked(settings: &str) -> Result<LoadedPersistence, String> {
     let d = dispatcher();
     let row = LinkedRow::of_kind::<Store>(
-        busbar_store_postgres::v4::door as busbar_contract::abi::mechanism::door::DoorFn,
+        busbar_store_postgres::door as busbar_contract::abi::mechanism::door::DoorFn,
     )
     .map_err(|e| e.to_string())?;
     let p = load_linked::<Store>(&row, bind(&d)).map_err(|e| e.to_string())?;
@@ -201,6 +201,7 @@ pub fn dispatcher() -> Arc<Dispatcher> {
     Arc::new(Dispatcher::with_services(
         DispatchConfig::default(),
         Arc::new(postgres_clock::PostgresClock),
+        busbar_contract::services::test_caller_binding(),
     ))
 }
 pub fn limits() -> Limits {

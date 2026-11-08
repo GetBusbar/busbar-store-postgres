@@ -55,6 +55,7 @@ impl HostServices for PostgresClock {
     fn trust_decide(
         &self,
         caller: &Caller,
+        _ticket: busbar_contract::abi::mechanism::ticket::Ticket,
         key: TrustKeyRef<'_>,
         expected: Option<&str>,
         approve: bool,

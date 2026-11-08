@@ -6,7 +6,7 @@
 
 #![deny(unsafe_code)]
 
-pub use busbar_store_postgres::*;
+pub use busbar_store_postgres::{door, MACRO_DOOR};
 
 /// The dropped-in door. Allowed unsafe code: the exported symbol is `#[unsafe(no_mangle)]`.
 #[allow(unsafe_code)]

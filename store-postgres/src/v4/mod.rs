@@ -53,7 +53,9 @@ impl NativeBackend for Backend {
     fn open(
         settings: &[u8],
         secrets: &[&[u8]],
-        _: Option<busbar_contract::abi::sdk::conn::Host>,
+        _: Option<
+            busbar_contract::abi::sdk::conn::Host<busbar_contract::plugin::markers::StoreKind>,
+        >,
     ) -> Result<Self, String> {
         Ok(Self {
             store: crate::settings::parse(settings, secrets)?,

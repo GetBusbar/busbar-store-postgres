@@ -31,8 +31,8 @@ busbar-contract = { workspace = true }
 # The conformance and end-to-end tests load the built cdylib over the REAL loader (sign, pack, scan,
 # open) and the linked row through the same registry — dev-only, never in the shipped artifact. Same
 # pinned rev as the logic crate's busbar-contract, so one busbar source resolves.
-busbar-plugin-loader = { workspace = true }
-busbar-contract = { workspace = true }
+busbar-plugin-loader = { workspace = true , features = ["test-support"] }
+busbar-contract = { workspace = true , features = ["test-seal"] }
 serde_json = { workspace = true }
 postgres = { workspace = true }
 # For admin_api_e2e.rs: drives the real busbar admin HTTP API (install/mint) against an

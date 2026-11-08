@@ -4,10 +4,10 @@
 //! PostgreSQL primitive persistence over the host connector, with a separate historical reader.
 #![forbid(unsafe_code)]
 
-pub mod legacy;
+pub(crate) mod legacy;
 mod pgwire;
 mod settings;
-pub mod v4;
+pub(crate) mod v4;
 
 use pgwire::Client;
 
@@ -43,7 +43,7 @@ struct ConnectionSettings {
 }
 
 /// How many connections an instance keeps: at most eight (1.5.5 kept one).
-pub const KEPT_CONNECTIONS: usize = 8;
+pub(crate) const KEPT_CONNECTIONS: usize = 8;
 
 /// What every op of one instance shares.
 pub(crate) struct Shared {
@@ -125,7 +125,7 @@ impl Session {
     }
 }
 
-pub use v4::door;
+pub use v4::{door, MACRO_DOOR};
 pub const NAME: &str = "busbar-store-postgres";
 
 #[cfg(test)]
