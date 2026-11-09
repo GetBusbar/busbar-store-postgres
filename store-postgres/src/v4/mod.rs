@@ -260,7 +260,11 @@ impl NativeBackend for Backend {
         .await)
     }
 }
+busbar_contract::statement_extensions!(EXTENSIONS: [
+    (busbar_contract::abi::mechanism::extensions::EXT_REFERENCE_FIELDS, br#"["url"]"#),
+]);
 busbar_contract::store_v4_door!(Backend, crate::NAME, env!("CARGO_PKG_VERSION"), 64, needs: crate::settings::NEEDS,
+    extensions: EXTENSIONS,
     settings_schema: busbar_contract::abi::mechanism::call::Blob::json(include_bytes!("../settings.schema.json")));
 fn held(bytes: Vec<u8>) -> Secret<Vec<u8>, Own> {
     let mut bytes = Zeroizing::new(bytes);

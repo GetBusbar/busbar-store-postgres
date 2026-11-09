@@ -10,6 +10,8 @@ use std::sync::{
     Mutex,
 };
 static READY_DOOR: AtomicPtr<Door> = AtomicPtr::new(std::ptr::null_mut());
+static OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
+static ORIGINAL_OPEN: Mutex<Option<Op>> = Mutex::new(None);
 static READY_COUNT: AtomicU64 = AtomicU64::new(0);
 static CLOSE_COUNT: AtomicU64 = AtomicU64::new(0);
 static ORIGINAL_CLOSE: Mutex<Option<Op>> = Mutex::new(None);
@@ -32,6 +34,20 @@ extern "C" fn fail_ready(
     }
     result
 }
+extern "C" fn observe_open(
+    instance: *mut std::ffi::c_void,
+    input: *const std::ffi::c_void,
+    out: *mut std::ffi::c_void,
+) -> RawOutcome {
+    // SAFETY: OPEN lends a full input beginning with InHead; forwarding preserves it.
+    let head = unsafe { &*input.cast::<busbar_contract::abi::mechanism::call::InHead>() };
+    if head.flags & busbar_contract::abi::mechanism::call::FLAG_RESUME == 0 {
+        OPEN_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+    let open = ORIGINAL_OPEN.lock().unwrap().unwrap();
+    // SAFETY: forwards matching OPEN frames to the real product, including resumes.
+    unsafe { open(instance, input, out) }
+}
 extern "C" fn observe_close(
     instance: *mut std::ffi::c_void,
     input: *const std::ffi::c_void,
@@ -53,10 +69,12 @@ fn failed_postgres_ready_closes_the_actual_successful_open_once() {
             .cast::<busbar_contract::abi::store::v4::Ops>()
             .read_unaligned()
     };
+    *ORIGINAL_OPEN.lock().unwrap() = ops.head.open;
+    ops.head.open = Some(observe_open);
     *ORIGINAL_CLOSE.lock().unwrap() = ops.head.close;
     ops.head.close = Some(observe_close);
     let ops = Box::leak(Box::new(ops));
-    // Only READY fails and CLOSE observes; every store operation remains the real product's.
+    // Only READY fails; OPEN and CLOSE observe and forward the real product unchanged.
     let door = unsafe {
         Door::__from_parts(busbar_contract::abi::mechanism::door::DoorParts {
             size: std::mem::size_of::<Door>() as u32,
@@ -66,29 +84,21 @@ fn failed_postgres_ready_closes_the_actual_successful_open_once() {
         })
     };
     READY_DOOR.store(Box::into_raw(Box::new(door)), Ordering::SeqCst);
-    let settings =
-        serde_json::to_vec(&serde_json::json!({"url":"postgres://test@127.0.0.1/test"})).unwrap();
+    let admin =
+        common::postgres_url().expect("owned PostgreSQL fixture required for successful OPEN");
+    let database = common::temp_db::TempDb::create(&admin, "pg_failed_ready");
+    let settings = serde_json::to_vec(&serde_json::json!({"url":database.url()})).unwrap();
     let d = Arc::new(Dispatcher::new(
         DispatchConfig::default(),
         busbar_contract::services::test_caller_binding(),
     ));
     let row = LinkedRow::of_raw(ready_door).expect("actual restated door");
     let p = load_linked::<Store>(&row, common::bind(&d)).expect("actual restated door loads");
-    let plugin_name = p.name().to_string();
-    let held = p.test_invocation_probe();
-    let first = || {
-        let (crossings, resumes) = held();
-        crossings - resumes
-    };
-    let before = first();
     let e = match common::run(LoadedPersistence::open(p, d, &settings, common::limits())) {
         Err(error) => error,
         Ok(_) => panic!("READY fails"),
     };
-    assert_eq!(
-        e,
-        format!("plugin '{plugin_name}' ready failed: postgres discovery refused")
-    );
+    assert_eq!(e, "primitive store ready failed");
     assert_eq!(READY_COUNT.load(Ordering::SeqCst), 1, "READY never retried");
     assert_eq!(
         CLOSE_COUNT.load(Ordering::SeqCst),
@@ -96,7 +106,8 @@ fn failed_postgres_ready_closes_the_actual_successful_open_once() {
         "successful OPEN closed exactly once"
     );
     assert_eq!(*CLOSE_ANSWER.lock().unwrap(), Some(Outcome::Ready));
-    assert_eq!(first() - before, 3, "OPEN, failed READY, cleanup CLOSE");
+    // Connection DRIVE crossings during OPEN are independent of lifecycle invocation counts.
+    assert_eq!(OPEN_COUNT.load(Ordering::SeqCst), 1, "OPEN never retried");
 }
 
 #[test]

@@ -75,7 +75,6 @@ pub(super) fn open_over(
         },
     ))
     .map(Arc::new)
-    .map_err(|error| format!("{error:?}"))
 }
 pub(super) struct Fixture {
     pub(super) url: String,

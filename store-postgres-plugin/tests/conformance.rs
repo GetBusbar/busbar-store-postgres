@@ -109,7 +109,7 @@ fn transcript(
     let refusals:Vec<_>=["","{}","{ not json",r#"{"url":5}"#,r#"{"url":"host=127.0.0.1 port=1 user=conf password=s3cret-conf dbname=x connect_timeout=2"}"#].iter().map(|s|open(s).expect_err("invalid settings refused")).collect();
     assert!(refusals[..4]
         .iter()
-        .all(|s| s.contains("invalid postgres plugin config")));
+        .all(|s| s == "primitive store open failed"));
     assert!(!refusals[4].contains("s3cret-conf"));
     let durable = live.map(|url| {
         let database = common::temp_db::TempDb::create(url, "pg_transcript");

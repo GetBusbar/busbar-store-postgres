@@ -178,7 +178,7 @@ fn loaded(settings: &str, fault: bool) -> (String, Arc<Counts>) {
     })
     .expect_err("the scripted peer ends the connect with a refusal");
     assert!(
-        error.contains("postgres v4 connection unavailable"),
+        error == "primitive store open failed",
         "native errors remain content-free: {error}"
     );
     (error, counts)

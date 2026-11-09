@@ -498,7 +498,7 @@ fn startup_options(dsn_query: &str) -> String {
         "postgres://u:zq9pw@127.0.0.1:{port}/d{dsn_query}"
     )))
     .expect_err("the fake server refuses the startup");
-    assert!(e.contains("3D000"), "{e}");
+    assert_eq!(e, "primitive store open failed");
     let got = seen.lock().unwrap().clone();
     got
 }

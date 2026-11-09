@@ -276,10 +276,24 @@ pub fn initialize(store: &LoadedPersistence) {
         namespace: control::NAMESPACE.0,
         key: control::writer_key(WRITER).to_vec(),
     };
-    let candidate = prepare(
-        store,
-        1,
-        vec![
+    let admission = Address {
+        namespace: lifecycle::ADMISSION_NAMESPACE,
+        key: lifecycle::ADMISSION_KEY.to_vec(),
+    };
+    let candidate = PreparedCandidate::new(Candidate {
+        id: AttemptId {
+            dataset: store.info().dataset,
+            writer_epoch: 1,
+            writer: WRITER,
+            execution_epoch: 1,
+            operation: 1u128.to_le_bytes(),
+        },
+        codec: CANDIDATE_VERSION,
+        predicates: vec![
+            Predicate {
+                address: admission.clone(),
+                expected: ExpectedValue::Absent,
+            },
             Predicate {
                 address: root.clone(),
                 expected: ExpectedValue::Absent,
@@ -289,7 +303,8 @@ pub fn initialize(store: &LoadedPersistence) {
                 expected: ExpectedValue::Absent,
             },
         ],
-        vec![
+        mutations: vec![
+            put(admission, b"opaque-native-qualification-marker"),
             put(
                 root,
                 &control::Dataset {
@@ -309,7 +324,15 @@ pub fn initialize(store: &LoadedPersistence) {
                 .unwrap(),
             ),
         ],
-    );
+        time: None,
+        // Logical initialization grants authority and cannot carry an operation result.
+        result: busbar_contract::Secret::new(Vec::new()),
+    })
+    .unwrap();
+    assert!(control::initialization(
+        candidate.candidate(),
+        store.info().dataset
+    ));
     assert!(matches!(
         run(store.commit(candidate)).unwrap(),
         Decision::Applied(_)
