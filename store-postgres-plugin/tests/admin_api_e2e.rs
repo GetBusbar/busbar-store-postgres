@@ -477,7 +477,7 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
     assert_eq!(stored_key["record"]["id"], minted_id);
     assert_eq!(stored_key["record"]["name"], "spg-adminapi-e2e-key");
     assert_eq!(stored_key["record"]["enabled"], true);
-    let credentials:Vec<serde_json::Value>=raw.query("SELECT key,value FROM busbar_persistence_v4.records WHERE namespace=$1 AND substring(key FROM 1 FOR 1)=$2",&[&namespace]).unwrap().into_iter().map(|row| {
+    let credentials:Vec<serde_json::Value>=raw.query("SELECT key,value FROM busbar_persistence_v4.records WHERE namespace=$1 AND substring(key FROM 1 FOR 1)=$2",&[&namespace, &b"C".as_slice()]).unwrap().into_iter().map(|row| {
         let key:Vec<u8>=row.get(0);let bytes:Vec<u8>=row.get(1);
         let value:serde_json::Value=serde_json::from_slice(&bytes).expect("canonical credential metadata JSON");
         assert_eq!(value["version"],1);
