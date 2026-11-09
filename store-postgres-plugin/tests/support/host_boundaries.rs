@@ -274,34 +274,36 @@ fn actual_postgres_instances_refuse_undeclared_needs_and_foreign_connections() {
         },
     )
     .unwrap();
-    let (outcome, stream, text) = establish(&owner, 0, &target);
-    let _accepted = listener
-        .accept()
-        .expect("actual TCP carrier reaches the listener");
-    assert_eq!(outcome, Outcome::Ready, "declared need opens: {text}");
-    for need in [1, u32::MAX] {
-        let (answer, _, text) = establish(&owner, need, &target);
+    owner.test_in_host_operation(|| {
+        let (outcome, stream, text) = establish(&owner, 0, &target);
+        assert_eq!(outcome, Outcome::Ready, "declared need opens: {text}");
+        let _accepted = listener
+            .accept()
+            .expect("actual TCP carrier reaches the listener");
+        for need in [1, u32::MAX] {
+            let (answer, _, text) = establish(&owner, need, &target);
+            assert_eq!(
+                (answer, text.as_str()),
+                (Outcome::Refused, ConnError::UndeclaredNeed.text())
+            );
+        }
+        assert_eq!(io(&owner, stream, true).0, Outcome::Ready, "owner writes");
+        for (what, (answer, _, text)) in [
+            ("write", io(&other, stream, true)),
+            ("read", io(&other, stream, false)),
+            ("close", close_stream(&other, stream)),
+        ] {
+            assert_eq!(
+                (answer, text.as_str()),
+                (Outcome::Refused, ConnError::NotOwner.text()),
+                "foreign {what}"
+            );
+        }
         assert_eq!(
-            (answer, text.as_str()),
-            (Outcome::Refused, ConnError::UndeclaredNeed.text())
+            io(&owner, stream, true).0,
+            Outcome::Ready,
+            "owner connection untouched"
         );
-    }
-    assert_eq!(io(&owner, stream, true).0, Outcome::Ready, "owner writes");
-    for (what, (answer, _, text)) in [
-        ("write", io(&other, stream, true)),
-        ("read", io(&other, stream, false)),
-        ("close", close_stream(&other, stream)),
-    ] {
-        assert_eq!(
-            (answer, text.as_str()),
-            (Outcome::Refused, ConnError::NotOwner.text()),
-            "foreign {what}"
-        );
-    }
-    assert_eq!(
-        io(&owner, stream, true).0,
-        Outcome::Ready,
-        "owner connection untouched"
-    );
-    assert_eq!(close_stream(&owner, stream).0, Outcome::Ready);
+        assert_eq!(close_stream(&owner, stream).0, Outcome::Ready);
+    });
 }
