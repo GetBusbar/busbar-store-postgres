@@ -135,5 +135,3 @@ mod settings_schema_tests;
 mod tests;
 
 mod source_interpretation;
-
-include!(concat!(env!("OUT_DIR"), "/context_test_source.rs"));
