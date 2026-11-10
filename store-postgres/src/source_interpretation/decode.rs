@@ -561,14 +561,7 @@ pub fn decode<'a>(
         }
         "busbar_schema" => {
             let version = c.uint("version")?;
-            if version
-                != match profile {
-                    Profile::Released6 => 6,
-                    Profile::Dev7 => 7,
-                    Profile::Dev8 => 8,
-                    Profile::Dev9 => 9,
-                }
-            {
+            if !(6..=9).contains(&version) {
                 return Err(Error::Unsupported);
             }
             HistoricalRow::Schema(version)

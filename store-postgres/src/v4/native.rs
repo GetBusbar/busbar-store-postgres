@@ -106,7 +106,7 @@ pub(super) async fn connect(s: &mut Session, allow_legacy: bool) -> Result<Backe
     locks(&mut tx, true, &LockPlan::default()).await?;
     let exists: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname='busbar_persistence_v4')", &[]).await.map_err(db)?.try_get(0).map_err(db)?;
     if !exists {
-        let nonempty: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname <> 'information_schema' AND c.relkind IN ('r','p','v','m','f','S'))", &[]).await.map_err(db)?.try_get(0).map_err(db)?;
+        let nonempty: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE left(n.nspname,3)<>'pg_' AND n.nspname<>'information_schema' AND c.relkind IN ('r','p','v','m','f','S'))", &[]).await.map_err(db)?.try_get(0).map_err(db)?;
         if nonempty {
             return Err(Failure::Refused);
         }
@@ -127,7 +127,7 @@ pub(super) async fn connect(s: &mut Session, allow_legacy: bool) -> Result<Backe
         .await
         .map_err(db)?;
     }
-    let foreign: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname NOT IN ('information_schema','busbar_persistence_v4') AND c.relkind IN ('r','p','v','m','f','S'))", &[]).await.map_err(db)?.try_get(0).map_err(db)?;
+    let foreign: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE left(n.nspname,3)<>'pg_' AND n.nspname NOT IN ('information_schema','busbar_persistence_v4') AND c.relkind IN ('r','p','v','m','f','S'))", &[]).await.map_err(db)?.try_get(0).map_err(db)?;
     if foreign && !allow_legacy {
         return Err(Failure::Refused);
     }
