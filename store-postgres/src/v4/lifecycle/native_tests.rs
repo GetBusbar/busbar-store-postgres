@@ -37,6 +37,7 @@ fn prepared(url: &str) -> LoadedPrepared {
                 busbar_contract::conn::admissions::AdmissionAuthority::issue(
                     &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
                     conns,
+                    Default::default(),
                 ),
             ),
         },

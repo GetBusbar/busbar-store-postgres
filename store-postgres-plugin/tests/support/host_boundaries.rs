@@ -265,6 +265,11 @@ fn actual_postgres_instances_refuse_undeclared_needs_and_foreign_connections() {
         busbar_contract::services::test_caller_binding(),
     ));
     let table = common::postgres_io::host(d.conn_waker(), Default::default());
+    let admissions = busbar_contract::conn::admissions::AdmissionAuthority::issue(
+        &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
+        table,
+        Default::default(),
+    );
     let row = LinkedRow::of_kind::<Store>(
         busbar_store_postgres::door as busbar_contract::abi::mechanism::door::DoorFn,
     )
@@ -272,7 +277,7 @@ fn actual_postgres_instances_refuse_undeclared_needs_and_foreign_connections() {
     let owner = load_linked::<Store>(
         &row,
         Bind {
-            conns: ConnTable::Host(table.clone()),
+            conns: ConnTable::Host(admissions.clone()),
             ..common::bind(&d)
         },
     )
@@ -280,7 +285,7 @@ fn actual_postgres_instances_refuse_undeclared_needs_and_foreign_connections() {
     let other = load_linked::<Store>(
         &row,
         Bind {
-            conns: ConnTable::Host(table),
+            conns: ConnTable::Host(admissions),
             ..common::bind(&d)
         },
     )

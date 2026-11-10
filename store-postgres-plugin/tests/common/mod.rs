@@ -42,7 +42,13 @@ pub fn bind(d: &Dispatcher) -> Bind {
         max_inflight_cap: 64,
         sink: Arc::new(NoSink),
         dispatcher: d.adopter(),
-        conns: ConnTable::Host(postgres_io::host(d.conn_waker(), Default::default())),
+        conns: ConnTable::Host(
+            busbar_contract::conn::admissions::AdmissionAuthority::issue(
+                &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
+                postgres_io::host(d.conn_waker(), Default::default()),
+                Default::default(),
+            ),
+        ),
     }
 }
 
