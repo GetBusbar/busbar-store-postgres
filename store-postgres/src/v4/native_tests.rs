@@ -59,7 +59,12 @@ pub(super) fn open_over(
             max_inflight_cap: 64,
             sink: Arc::new(NoSink),
             dispatcher: dispatcher.adopter(),
-            conns: ConnTable::Host(conns),
+            conns: ConnTable::Host(
+                busbar_contract::conn::admissions::AdmissionAuthority::issue(
+                    &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
+                    conns,
+                ),
+            ),
         },
     )
     .map_err(|error| format!("{error:?}"))?;
@@ -352,7 +357,7 @@ fn core_identity_crossing() {
             revoke_reason: None,
             revision: 0,
         },
-        secret: "v1:aead:opaque:native:envelope".into(),
+        secret: "v1:aead:opaque:native:envelope".to_owned().into(),
     };
     run(core.identity().put_key_with_credential(&key, &credential)).unwrap();
     let hydrated = run(core.identity().list_credentials_since(0)).unwrap();

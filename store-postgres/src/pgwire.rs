@@ -18,8 +18,9 @@ use postgres_protocol::message::backend::{DataRowBody, ErrorResponseBody, Messag
 use postgres_protocol::message::frontend;
 use postgres_types::{FromSql, Kind, ToSql, Type};
 
-use busbar_contract::abi::sdk::chip::pg_scram_nonce;
-use busbar_contract::abi::sdk::cred::{CredUrl, PgAuth, RequireAuth, Seal};
+use crate::credentials::pg_scram_nonce;
+use crate::credentials::{CredUrl, PgAuth, RequireAuth};
+use busbar_contract::abi::sdk::cred::Seal;
 use busbar_contract::abi::sdk::store::wire::Wire;
 
 mod receive;
@@ -1173,7 +1174,7 @@ impl Client {
         loop {
             match self.read().await? {
                 Message::AuthenticationOk => {
-                    if !authenticated && !cfg.credentials.floor().pg().allows(PgAuth::None) {
+                    if !authenticated && !cfg.credentials.floor().allows(PgAuth::None) {
                         return Err(auth_err(
                             "require_auth does not allow authentication method none",
                         ));
@@ -1202,7 +1203,7 @@ impl Client {
                         return Err(auth_err("unsupported SASL mechanism"));
                     }
                     let password = password()?;
-                    if !password.floor().pg().allows(PgAuth::ScramSha256) {
+                    if !password.floor().allows(PgAuth::ScramSha256) {
                         return Err(auth_err("require_auth does not allow SCRAM-SHA-256"));
                     }
 

@@ -12,6 +12,11 @@ description = "PostgreSQL primitive persistence over the host connector, with au
 workspace = true
 
 [dependencies]
+# Owner-side credential normalization and SCRAM public framing.
+base64 = { workspace = true }
+getrandom = { workspace = true }
+stringprep = { workspace = true }
+unicode-normalization = { workspace = true }
 serde = { workspace = true }
 # The ONE busbar crate this plugin names (#40: contract only; DECISIONS #84 merged the plugin SDK
 # into it as `busbar_contract::abi::sdk`). Pinned by git rev to the busbar commit in `.busbar-ref`;
@@ -32,6 +37,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# Independent SCRAM oracle for the transferred protocol vectors.
+ring = { workspace = true }
 # Real core identity ownership crossing over the staged native door (test-only).
 busbar-kernel = { workspace = true }
 jsonschema = { workspace = true }

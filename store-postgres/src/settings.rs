@@ -38,7 +38,8 @@ pub const NEEDS: &[Need] = &[Need {
 }];
 
 pub(crate) fn parse(settings: &[u8], secrets: &[&[u8]]) -> Result<ConnectionSettings, String> {
-    use busbar_contract::abi::sdk::cred::{settings_lent, PostgresUrl, SettingsError};
+    use crate::credentials::PostgresUrl;
+    use busbar_contract::abi::sdk::cred::{settings_lent, SettingsError};
 
     const BAD: &str = "invalid postgres plugin config";
     let settings = if settings.trim_ascii().is_empty() {

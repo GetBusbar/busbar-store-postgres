@@ -102,7 +102,7 @@ impl LiveIdentity {
             native_anchor: anchor,
             dataset: DatasetId(dataset),
             format: Some(Format {
-                owner: POSTGRES_SOURCE_OWNER,
+                owner: crate::source_interpretation::SOURCE_OWNER,
                 physical: catalogue.schema_version as u32,
                 logical: 0,
                 codec: 1,
@@ -506,7 +506,9 @@ impl State {
                 state: if current {
                     InspectionState::Current
                 } else {
-                    InspectionState::InProgress
+                    InspectionState::InProgress(crate::source_interpretation::descriptor(
+                        source.format.ok_or(Error::Corrupt)?.physical,
+                    )?)
                 },
                 source: Some(source),
                 admission_marker: marker,
@@ -577,7 +579,9 @@ impl State {
         self.inspected = Some(source.clone());
         self.live = Some(live);
         Ok(Inspection {
-            state: InspectionState::Legacy,
+            state: InspectionState::Legacy(crate::source_interpretation::descriptor(
+                source.format.ok_or(Error::Corrupt)?.physical,
+            )?),
             source: Some(source),
             admission_marker: None,
             catalogue: tables,
@@ -826,6 +830,23 @@ impl State {
         cursor: Option<&Secret<Vec<u8>, Own>>,
         limit: Bounds,
     ) -> Result<SourcePage<Own>, Error> {
+        if let SourceSelector::Interpret {
+            reader,
+            bounds: interpretation,
+        } = selector
+        {
+            return self
+                .interpreted_page(
+                    reference,
+                    snapshot,
+                    family,
+                    cursor,
+                    limit,
+                    *reader,
+                    *interpretation,
+                )
+                .await;
+        }
         self.check(reference).await?;
         let limits = bounds(limit)?;
         let record = self.record.as_ref().ok_or(Error::Refused)?;
@@ -837,7 +858,9 @@ impl State {
             SourceSelector::Exact { table, key } => {
                 (*table, Some(key.expose_own(&Own::here()).as_slice()))
             }
-            SourceSelector::IndexPrefix { .. } => return Err(Error::MissingCapability),
+            SourceSelector::IndexPrefix { .. } | SourceSelector::Interpret { .. } => {
+                return Err(Error::MissingCapability);
+            }
         };
         if exact.is_some() && cursor.is_some() {
             return Err(Error::SourceChanged);
@@ -1464,3 +1487,184 @@ async fn verify_current_marker(
 
 #[cfg(test)]
 mod native_tests;
+
+impl State {
+    #[allow(clippy::too_many_arguments)]
+    async fn interpreted_page(
+        &mut self,
+        upgrade: &UpgradeRef<Own>,
+        snapshot: Id,
+        family: Id,
+        cursor: Option<&Secret<Vec<u8>, Own>>,
+        limit: Bounds,
+        reader: SourceReader,
+        interpretation: InterpretationBounds,
+    ) -> Result<SourcePage<Own>, Error> {
+        use busbar_contract::persistence::lifecycle as l;
+        let owner = &Own::here();
+        let bounds = &limit;
+        let snapshot = &snapshot;
+        let family = &family;
+        let map = |error| error;
+        interpretation.validate()?;
+        self.check(upgrade).await?;
+        if *family != l::INTERPRETED_SOURCE || bounds.items == 0 || bounds.bytes == 0 {
+            return Err(Error::Refused);
+        }
+        let retained = self.record.as_ref().ok_or(Error::Refused)?;
+        if *snapshot != retained.snapshot {
+            return Err(Error::SourceChanged);
+        }
+        let physical = retained
+            .source
+            .identity()
+            .format
+            .ok_or(Error::Corrupt)?
+            .physical;
+        let source_digest = source_digest(retained)?;
+        let tables = catalogue(&retained.catalogue);
+        if crate::source_interpretation::descriptor(physical).map_err(map)? != reader {
+            return Err(Error::SourceChanged);
+        }
+        crate::source_interpretation::validate_catalogue(physical, &tables).map_err(map)?;
+        let charge = tables.iter().try_fold(
+            tables
+                .len()
+                .checked_mul(std::mem::size_of::<
+                    busbar_contract::persistence::archive::Table,
+                >())
+                .ok_or(Error::Bounds)?,
+            |total, table| {
+                total
+                    .checked_add(table.name.capacity())
+                    .and_then(|n| n.checked_add(table.native_layout.capacity()))
+                    .and_then(|n| {
+                        table.columns.iter().try_fold(n, |n, c| {
+                            n.checked_add(c.capacity() + std::mem::size_of::<String>())
+                        })
+                    })
+                    .ok_or(Error::Bounds)
+            },
+        )?;
+        if charge > interpretation.index_bytes as usize {
+            return Err(Error::Bounds);
+        }
+        let (mut table, mut position): (u32, Option<Secret<Vec<u8>, Own>>) = if let Some(cursor) =
+            cursor
+        {
+            let bytes = cursor.expose_own(owner);
+            if bytes.len() < 41 || bytes[0] != 1 || bytes[1..33] != reader.decoder_digest() {
+                return Err(Error::Refused);
+            }
+            let table = u32::from_le_bytes(bytes[33..37].try_into().map_err(|_| Error::Corrupt)?);
+            let length =
+                u32::from_le_bytes(bytes[37..41].try_into().map_err(|_| Error::Corrupt)?) as usize;
+            if bytes.len() != 41usize.checked_add(length).ok_or(Error::Bounds)? {
+                return Err(Error::Refused);
+            }
+            (
+                table,
+                (length != 0).then(|| Secret::held(bytes[41..].to_vec())),
+            )
+        } else {
+            (0, None)
+        };
+        while (table as usize) < tables.len() {
+            let raw = Box::pin(self.page(
+                upgrade,
+                *snapshot,
+                crate::source_interpretation::SOURCE_OWNER,
+                &l::SourceSelector::Scan { table },
+                position.as_ref(),
+                l::Bounds {
+                    items: 1,
+                    bytes: interpretation.semantic_bytes.min(512 * 1024 * 1024),
+                },
+            ))
+            .await?;
+            let selected = table;
+            position = raw.next;
+            if position.is_none() {
+                table = table.checked_add(1).ok_or(Error::Bounds)?;
+            }
+            if raw.rows.is_empty() {
+                if position.is_some() {
+                    return Err(Error::Corrupt);
+                }
+                continue;
+            }
+            if raw.rows.len() != 1 {
+                return Err(Error::Corrupt);
+            }
+            let chunk = crate::source_interpretation::interpret(
+                physical,
+                &tables[selected as usize],
+                &raw.rows[0],
+                interpretation.semantic_bytes as usize,
+                owner,
+            )
+            .map_err(map)?;
+            let value = l::codec::encode_source_chunk_owned(
+                &chunk,
+                l::Bounds {
+                    items: u32::MAX,
+                    bytes: bounds.bytes.checked_sub(256).ok_or(Error::Bounds)?,
+                },
+            )
+            .map_err(map)?;
+            let next = if table as usize == tables.len() {
+                None
+            } else {
+                let length = position.as_ref().map_or(0, |v| v.expose_own(owner).len());
+                let capacity = 41usize.checked_add(length).ok_or(Error::Bounds)?;
+                if capacity > bounds.bytes as usize {
+                    return Err(Error::Bounds);
+                }
+                let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(capacity));
+                bytes.push(1);
+                bytes.extend_from_slice(&reader.decoder_digest());
+                bytes.extend_from_slice(&table.to_le_bytes());
+                bytes.extend_from_slice(
+                    &u32::try_from(length)
+                        .map_err(|_| Error::Bounds)?
+                        .to_le_bytes(),
+                );
+                if let Some(position) = &position {
+                    bytes.extend_from_slice(position.expose_own(owner));
+                }
+                Some(Secret::held(std::mem::take(&mut *bytes)))
+            };
+            let mut coverage = busbar_contract::persistence::archive::Hasher::new();
+            coverage.update(&source_digest);
+            coverage.update(&reader.decoder_digest());
+            coverage.update(&raw.coverage_digest);
+            coverage.update(value.expose_own(owner));
+            return Ok(l::SourcePage {
+                snapshot: *snapshot,
+                family: *family,
+                rows: vec![l::SourceRow {
+                    table: 0,
+                    native_key: chunk.group,
+                    value,
+                }],
+                next,
+                source_digest,
+                coverage_digest: coverage.finish(),
+            });
+        }
+        if table as usize != tables.len() {
+            return Err(Error::Refused);
+        }
+        let mut coverage = busbar_contract::persistence::archive::Hasher::new();
+        coverage.update(&source_digest);
+        coverage.update(&reader.decoder_digest());
+        Ok(l::SourcePage {
+            snapshot: *snapshot,
+            family: *family,
+            rows: vec![],
+            next: None,
+            source_digest,
+            coverage_digest: coverage.finish(),
+        })
+    }
+}

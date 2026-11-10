@@ -4,6 +4,7 @@
 //! PostgreSQL primitive persistence over the host connector, with a separate historical reader.
 #![forbid(unsafe_code)]
 
+mod credentials;
 pub(crate) mod legacy;
 mod pgwire;
 mod settings;
@@ -78,7 +79,7 @@ impl ConnectionSettings {
         Ok(Self::configured(config))
     }
 
-    fn captured(captured: busbar_contract::abi::sdk::cred::CredUrl) -> Result<Self, String> {
+    fn captured(captured: crate::credentials::CredUrl) -> Result<Self, String> {
         let config = pgwire::Config::captured(captured).map_err(|e| e.to_string())?;
         Ok(Self::configured(config))
     }
@@ -132,3 +133,5 @@ pub const NAME: &str = "busbar-store-postgres";
 mod settings_schema_tests;
 #[cfg(test)]
 mod tests;
+
+mod source_interpretation;

@@ -530,30 +530,26 @@ fn captured_passwords_do_not_hide_invalid_options_or_invalid_encoding() {
 
 #[test]
 fn require_auth_is_validated_and_captured_without_relaxing_the_floor() {
-    use busbar_contract::abi::sdk::cred::PgAuth;
+    use crate::credentials::PgAuth;
     let strict = Config::parse("postgres://u:hidden@host/db").unwrap();
-    assert!(strict.credentials.floor().pg().allows(PgAuth::ScramSha256));
-    assert!(strict.credentials.floor().pg().allows(PgAuth::None));
-    assert!(!strict.credentials.floor().pg().allows(PgAuth::Password));
-    assert!(!strict.credentials.floor().pg().allows(PgAuth::Md5));
+    assert!(strict.credentials.floor().allows(PgAuth::ScramSha256));
+    assert!(strict.credentials.floor().allows(PgAuth::None));
+    assert!(!strict.credentials.floor().allows(PgAuth::Password));
+    assert!(!strict.credentials.floor().allows(PgAuth::Md5));
     let explicit =
         Config::parse("host=db user=u password=hidden require_auth=md5,password").unwrap();
-    assert!(explicit.credentials.floor().pg().allows(PgAuth::Password));
-    assert!(explicit.credentials.floor().pg().allows(PgAuth::Md5));
-    assert!(!explicit.credentials.floor().pg().allows(PgAuth::None));
-    assert!(!explicit
-        .credentials
-        .floor()
-        .pg()
-        .allows(PgAuth::ScramSha256));
+    assert!(explicit.credentials.floor().allows(PgAuth::Password));
+    assert!(explicit.credentials.floor().allows(PgAuth::Md5));
+    assert!(!explicit.credentials.floor().allows(PgAuth::None));
+    assert!(!explicit.credentials.floor().allows(PgAuth::ScramSha256));
     for dsn in [
         r"host=db user=u password=hidden require_auth=pass\word",
         "host=db user=u password=hidden require_auth = 'password'",
         "postgres://u:hidden@host/db?%72equire_auth=%70assword",
     ] {
         let config = Config::parse(dsn).unwrap();
-        assert!(config.credentials.floor().pg().allows(PgAuth::Password));
-        assert!(!config.credentials.floor().pg().allows(PgAuth::Md5));
+        assert!(config.credentials.floor().allows(PgAuth::Password));
+        assert!(!config.credentials.floor().allows(PgAuth::Md5));
     }
     let tls = Config::parse("postgres://u:hidden@host/db?sslmode=require").unwrap();
     assert!(tls.credentials.password().unwrap().secure_required());
@@ -617,7 +613,7 @@ fn captured_dsn_redaction_covers_raw_decoded_and_superseded_passwords() {
 }
 
 #[test]
-fn the_sdk_verifier_link_accepts_the_known_native_scram_exchange() {
+fn the_owner_verifier_link_accepts_the_known_native_scram_exchange() {
     let config = Config::parse("host=db user=u password=foobar").unwrap();
     let (_, link) = config
         .credentials

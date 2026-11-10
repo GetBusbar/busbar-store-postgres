@@ -33,7 +33,12 @@ fn prepared(url: &str) -> LoadedPrepared {
             max_inflight_cap: 64,
             sink: Arc::new(NoSink),
             dispatcher: dispatcher.adopter(),
-            conns: ConnTable::Host(conns),
+            conns: ConnTable::Host(
+                busbar_contract::conn::admissions::AdmissionAuthority::issue(
+                    &busbar_contract::caps::KernelSeal::acquire_for_kernel(),
+                    conns,
+                ),
+            ),
         },
     )
     .unwrap();
@@ -263,7 +268,7 @@ fn released_source_guards_pages_and_completion_restart() {
     let Response::Inspected(i) = inspected.as_ref() else {
         panic!()
     };
-    assert_eq!(i.state, InspectionState::Legacy);
+    assert!(matches!(i.state, InspectionState::Legacy(_)));
     assert!(!fixture
         .raw
         .query_one(
@@ -399,7 +404,7 @@ fn released_source_guards_pages_and_completion_restart() {
     let Response::Inspected(i) = inspected.as_ref() else {
         panic!()
     };
-    assert_eq!(i.state, InspectionState::InProgress);
+    assert!(matches!(i.state, InspectionState::InProgress(_)));
     let begun = begin(&resumed, i.source.as_ref().unwrap());
     let Response::Begun(up) = begun.as_ref() else {
         panic!()
