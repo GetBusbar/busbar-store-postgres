@@ -98,6 +98,54 @@ impl Drop for RunCleanup {
     }
 }
 
+/// Failure-only diagnostics: never expose SQL text, connection settings, or driver errors.
+/// The caller's wall-clock bound also covers authentication or a lost query response.
+fn postgres_activity(url: &str) -> String {
+    let url = url.to_owned();
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::Builder::new()
+        .name("postgres-readiness-diagnostic".into())
+        .spawn(move || {
+            let result = (|| -> Result<String, &'static str> {
+                let mut config: postgres::Config = url.parse().map_err(|_| "invalid DSN")?;
+                config
+                    .connect_timeout(Duration::from_secs(2))
+                    .options("-c statement_timeout=1000");
+                let mut client = config
+                    .connect(postgres::NoTls)
+                    .map_err(|_| "connection unavailable")?;
+                let rows = client.query(
+                    "SELECT pid, left(state,64) AS state, left(wait_event_type,64) AS wait_type, \
+                     left(wait_event,64) AS wait_event, \
+                     (EXTRACT(EPOCH FROM (clock_timestamp()-query_start))*1000)::bigint AS age_ms, \
+                     md5(query) AS query_fingerprint FROM pg_stat_activity \
+                     WHERE datname=current_database() AND pid<>pg_backend_pid() ORDER BY pid LIMIT 16",
+                    &[],
+                ).map_err(|_| "activity query unavailable")?;
+                let mut output = format!("{} session(s), maximum 16", rows.len());
+                for row in rows {
+                    let pid: i32 = row.try_get("pid").map_err(|_| "invalid activity row")?;
+                    let age: Option<i64> = row.try_get("age_ms").map_err(|_| "invalid activity row")?;
+                    output.push_str(&format!("\n  pid={pid} age_ms={age:?}"));
+                    for field in ["state", "wait_type", "wait_event", "query_fingerprint"] {
+                        let value: Option<&str> = row.try_get(field).map_err(|_| "invalid activity row")?;
+                        output.push_str(&format!(" {field}={:?}", value.unwrap_or("-")));
+                    }
+                }
+                Ok(output)
+            })();
+            let _ = send.send(result);
+        });
+    if worker.is_err() {
+        return "activity diagnostic unavailable: cannot start worker".into();
+    }
+    match receive.recv_timeout(Duration::from_secs(4)) {
+        Ok(Ok(output)) => output,
+        Ok(Err(reason)) => format!("activity diagnostic unavailable: {reason}"),
+        Err(_) => "activity diagnostic unavailable: worker did not answer within 4s".into(),
+    }
+}
+
 /// Poll `http://127.0.0.1:{port}/api/v1/admin/plugins` (any admin GET works — we just need a TCP
 /// accept + HTTP response) until the admin listener is up, or the child has already exited.
 fn wait_for_admin_listener(
@@ -106,6 +154,7 @@ fn wait_for_admin_listener(
     token: &str,
     guard: &mut ChildGuard,
     what: &str,
+    postgres_url: &str,
 ) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -127,8 +176,9 @@ fn wait_for_admin_listener(
         if Instant::now() >= deadline {
             panic!(
                 "{what}'s admin listener never came up within 15s\n\
-                 --- {what} output ---\n{}",
-                guard.output()
+                 --- {what} output ---\n{}\n--- postgres activity ---\n{}",
+                guard.output(),
+                postgres_activity(postgres_url)
             );
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -237,7 +287,14 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         work.join("boot1.log"),
         "boot #1 (memory store, admin listener up)",
     );
-    wait_for_admin_listener(&client, &admin_base, admin_token, &mut guard1, "boot #1");
+    wait_for_admin_listener(
+        &client,
+        &admin_base,
+        admin_token,
+        &mut guard1,
+        "boot #1",
+        &url,
+    );
 
     let install_body = serde_json::json!({
         "file": file,
@@ -391,10 +448,18 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         booted,
         "boot #2, restarted onto the admin-installed postgres plugin, must reach a migrated \
          native metadata table within 15s\n\
-         --- boot #2 output ---\n{}",
-        guard2.output()
+         --- boot #2 output ---\n{}\n--- postgres activity ---\n{}",
+        guard2.output(),
+        postgres_activity(&url)
     );
-    wait_for_admin_listener(&client, &admin_base, admin_token, &mut guard2, "boot #2");
+    wait_for_admin_listener(
+        &client,
+        &admin_base,
+        admin_token,
+        &mut guard2,
+        "boot #2",
+        &url,
+    );
 
     let mint_body = serde_json::json!({
         "name": "spg-adminapi-e2e-key",
@@ -442,7 +507,14 @@ fn install_over_admin_api_then_mint_a_key_and_verify_postgres_directly() {
         work.join("boot3.log"),
         "boot #3 (reopen issued identity)",
     );
-    wait_for_admin_listener(&client, &admin_base, admin_token, &mut guard3, "boot #3");
+    wait_for_admin_listener(
+        &client,
+        &admin_base,
+        admin_token,
+        &mut guard3,
+        "boot #3",
+        &url,
+    );
     let response = client
         .get(format!("{admin_base}/keys/{minted_id}"))
         .header("x-admin-token", admin_token)
