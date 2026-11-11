@@ -45,16 +45,29 @@ fn the_url_is_not_declared_secret() {
 #[test]
 fn a_reference_at_the_url_resolves_as_the_kernel_resolves_it() {
     let (p, _d) = linked();
-    let mut v = serde_json::json!({"url":{"env":"REFCAP_URL_FOR_TEST"}});
+    let mut v = serde_json::json!({"url":{
+        "module":"env", "settings":{"key":"REFCAP_URL_FOR_TEST"}
+    }});
+    let mut resolved = 0;
     resolve_declared_fields(
         &mut v,
         p.secret_refs(),
         p.reference_fields(),
         p.name(),
-        |_, _| Ok(URL.to_string()),
+        |field, reference| {
+            assert_eq!(field, "url");
+            let busbar_contract::secret_ref::SecretRef::Source(source) = reference else {
+                panic!("the URL names its admitted source");
+            };
+            assert_eq!(source.module, "env");
+            assert_eq!(source.settings.key_names(), ["key"]);
+            resolved += 1;
+            Ok(URL.to_string())
+        },
     )
     .expect("a reference at the url resolves");
     assert_eq!(v["url"], URL);
+    assert_eq!(resolved, 1);
 }
 
 #[test]

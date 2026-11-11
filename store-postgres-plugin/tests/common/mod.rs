@@ -125,71 +125,37 @@ pub fn busbar_root() -> PathBuf {
     root.canonicalize().unwrap_or_else(|e| {
         panic!(
             "no busbar checkout at {} ({e}): set BUSBAR_CHECKOUT to a checkout of GetBusbar/busbar \
-             at the .busbar-ref rev, or check it out beside this repo",
+             at the admitted host revision, or check it out beside this repo",
             root.display()
         )
     })
 }
 
-/// Build (once, cached by cargo) and return the path to the real `busbar` binary and the real
-/// `busbar-plugin-pack` binary, both from the sibling busbar checkout — never a fixture, never a
-/// stub, the exact binaries a real release ships.
+/// Build the admitted host and packer sources. Native CI prepares these before nextest;
+/// this invocation still asks Cargo to verify freshness before reusing either executable.
 pub fn build_real_binaries() -> (PathBuf, PathBuf) {
     let root = busbar_root();
-    if let (Some(busbar), Some(pack)) = (
-        std::env::var_os("BUSBAR_E2E_BINARY"),
-        std::env::var_os("BUSBAR_PLUGIN_PACK_BINARY"),
-    ) {
-        let paths = (PathBuf::from(busbar), PathBuf::from(pack));
-        assert!(
-            paths.0.is_file() && paths.1.is_file(),
-            "explicit real binaries must exist"
-        );
-        return paths;
-    }
-    let output = std::env::temp_dir().join("postgres-real-binaries");
-    std::fs::create_dir_all(&output).unwrap();
-
-    for args in [
-        &[
-            "build",
-            "--release",
-            "--locked",
-            "--manifest-path",
-            "dist/default/Cargo.toml",
-            "--bin",
-            "busbar",
-        ][..],
-        &[
-            "build",
-            "--release",
-            "--locked",
-            "-p",
-            "busbar-plugin-loader",
-            "--features",
-            "pack",
-            "--bin",
-            "busbar-plugin-pack",
-        ][..],
-    ] {
-        let status = Command::new("cargo")
-            .env(
-                "RUSTUP_TOOLCHAIN",
-                std::env::var_os("RUSTUP_TOOLCHAIN").unwrap_or_else(|| "1.98".into()),
-            )
-            .args(args)
-            .env("BUSBAR_RELEASE_PUBKEY", E2E_RELEASE_PUBKEY)
-            .env("CARGO_TARGET_DIR", &output)
-            .current_dir(&root)
-            .status()
-            .expect("run cargo build for busbar + busbar-plugin-pack");
-        assert!(
-            status.success(),
-            "building the real busbar + busbar-plugin-pack binaries must succeed ({args:?})"
-        );
-    }
-    let release = output.join("release");
-    (release.join("busbar"), release.join("busbar-plugin-pack"))
+    let target = PathBuf::from(
+        std::env::var_os("CARGO_TARGET_DIR")
+            .expect("CARGO_TARGET_DIR must name the assigned native target directory"),
+    );
+    let prepare = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("testing/native/prepare.sh");
+    let status = Command::new("bash")
+        .arg(prepare)
+        .env("BUSBAR_CHECKOUT", root)
+        .status()
+        .expect("run the owner preparation hook for the actual busbar binaries");
+    assert!(
+        status.success(),
+        "building the actual busbar binaries failed"
+    );
+    (
+        target.join("debug/busbar"),
+        target.join("debug/busbar-plugin-pack"),
+    )
 }
 
 /// THE TEST-ONLY FIRST-PARTY KEYPAIR (ed25519, `busbar-plugin-pack keygen`), never the release key.

@@ -178,7 +178,7 @@ fn loaded(settings: &str, fault: bool) -> (String, Arc<Counts>) {
     })
     .expect_err("the scripted peer ends the connect with a refusal");
     assert!(
-        error == "primitive store open failed",
+        error == "primitive store open failed: plugin answered unknown",
         "native errors remain content-free: {error}"
     );
     (error, counts)
