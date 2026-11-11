@@ -12,6 +12,7 @@ use std::sync::{
 static READY_DOOR: AtomicPtr<Door> = AtomicPtr::new(std::ptr::null_mut());
 static OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
 static ORIGINAL_OPEN: Mutex<Option<Op>> = Mutex::new(None);
+static READY_TICKET: Mutex<Option<Ticket>> = Mutex::new(None);
 static READY_COUNT: AtomicU64 = AtomicU64::new(0);
 static CLOSE_COUNT: AtomicU64 = AtomicU64::new(0);
 static ORIGINAL_CLOSE: Mutex<Option<Op>> = Mutex::new(None);
@@ -21,9 +22,15 @@ extern "C" fn ready_door() -> *const Door {
 }
 extern "C" fn fail_ready(
     _: *mut std::ffi::c_void,
-    _: *const std::ffi::c_void,
+    input: *const std::ffi::c_void,
     out: *mut std::ffi::c_void,
 ) -> RawOutcome {
+    // SAFETY: the loader supplies the complete READY input frame.
+    *READY_TICKET.lock().unwrap() = Some(unsafe {
+        (*input.cast::<busbar_contract::abi::mechanism::lifecycle::ReadyIn>())
+            .head
+            .ticket
+    });
     READY_COUNT.fetch_add(1, Ordering::SeqCst);
     let result = RawOutcome::of(Outcome::Failed);
     // SAFETY: READY lends a full writable OutHead; the error is process-static.
@@ -94,12 +101,28 @@ fn failed_postgres_ready_closes_the_actual_successful_open_once() {
     ));
     let row = LinkedRow::of_raw(ready_door).expect("actual restated door");
     let p = load_linked::<Store>(&row, common::bind(&d)).expect("actual restated door loads");
-    let e = match common::run(LoadedPersistence::open(p, d, &settings, common::limits())) {
+    let e = match common::run(LoadedPersistence::open(
+        p,
+        d.clone(),
+        &settings,
+        common::limits(),
+    )) {
         Err(error) => error,
         Ok(_) => panic!("READY fails"),
     };
     assert_eq!(e, "primitive store ready failed");
     assert_eq!(READY_COUNT.load(Ordering::SeqCst), 1, "READY never retried");
+    // READY publishes its answer before the worker releases its retained session.
+    // Drain that actual READY worker through its retirement acknowledgment before
+    // asserting teardown, including completion of the forwarded real CLOSE.
+    let ticket = READY_TICKET
+        .lock()
+        .unwrap()
+        .expect("READY recorded its ticket");
+    assert!(
+        d.retirement_barrier(ticket, std::time::Duration::from_secs(5)),
+        "READY worker did not retire its retained session"
+    );
     assert_eq!(
         CLOSE_COUNT.load(Ordering::SeqCst),
         1,
